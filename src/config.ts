@@ -4,10 +4,11 @@ export const ADVISOR_MODES = ['manual', 'escalate', 'continuous'] as const
 export type AdvisorMode = (typeof ADVISOR_MODES)[number]
 export const SEVERITIES = ['none', 'nit', 'concern', 'blocker'] as const
 export type AdvisorSeverity = (typeof SEVERITIES)[number]
-export const TOOL_PRESETS = ['none', 'inspect', 'research', 'edit', 'custom'] as const
-export type AdvisorToolPreset = (typeof TOOL_PRESETS)[number]
 export const WAIT_MODES = ['block', 'background'] as const
 export type AdvisorWaitMode = (typeof WAIT_MODES)[number]
+
+/** Conservative defaults: repository inspection is on; every other tool starts off. */
+export const DEFAULT_ENABLED_TOOLS = ['read', 'read_image', 'glob', 'grep'] as const
 
 export interface Config {
   enabled: boolean
@@ -15,8 +16,8 @@ export interface Config {
   provider: string
   model: string
   subagentProvider: string
-  defaultToolPreset: AdvisorToolPreset
-  defaultCustomTools: string[]
+  /** Exact tool names enabled by default for sessions that have no per-tool override. */
+  defaultEnabledTools: string[]
   escalationWait: AdvisorWaitMode
   continuousWait: AdvisorWaitMode
   maxInputBytes: number
@@ -42,8 +43,7 @@ export const Config = z.object({
   provider: z.string().default(''),
   model: z.string().default(''),
   subagentProvider: z.string().default('spawn'),
-  defaultToolPreset: z.union([...TOOL_PRESETS]).default('inspect'),
-  defaultCustomTools: z.array(String).default([]),
+  defaultEnabledTools: z.array(String).default([...DEFAULT_ENABLED_TOOLS]),
   escalationWait: z.union([...WAIT_MODES]).default('block'),
   continuousWait: z.union([...WAIT_MODES]).default('background'),
   maxInputBytes: z.number().step(1).min(4096).max(131072).default(24576),
