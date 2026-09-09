@@ -39,6 +39,7 @@ export interface EscalationDecision {
 const MUTATION_TOOL = /(apply[_-]?patch|edit|write|replace|delete|move|rename|create)/i
 const VALIDATION_TOOL = /(bash|pwsh|shell|exec|terminal|command)/i
 const VALIDATION_COMMAND = /(^|\s)(test|pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+test|gradle\w*\s+test|pnpm\s+(?:run\s+)?(?:test|lint|build|typecheck)|npm\s+(?:run\s+)?(?:test|lint|build|typecheck)|yarn\s+(?:test|lint|build|typecheck)|tsc\b)/i
+const NON_INTELLIGENCE_FAILURE = /(ABORT|CANCEL|DENIED|APPROVAL|PERMISSION)/i
 function hash(text: string): string { return createHash('sha256').update(text).digest('hex').slice(0, 20) }
 export function normalizeFailureText(text: string): string {
   return text.toLowerCase().replace(/\b0x[0-9a-f]+\b/g, '<hex>').replace(/\b[0-9a-f]{8,64}\b/g, '<id>').replace(/:\d+(?::\d+)?\b/g, ':#').replace(/\b\d{4}-\d{2}-\d{2}t[^\s]+/g, '<time>').replace(/\b\d{10,}\b/g, '<n>').replace(/\s+/g, ' ').trim().slice(0, 4000)
@@ -49,7 +50,7 @@ export function findExitCode(value: unknown, depth = 0): number | undefined {
   if (depth > 4) return undefined
   const record = recordOf(value)
   if (!record) return undefined
-  for (const key of ['exitCode', 'exit_code', 'code']) { const candidate = record[key]; if (typeof candidate === 'number' && Number.isInteger(candidate)) return candidate }
+  for (const key of ['exitCode', 'exit_code']) { const candidate = record[key]; if (typeof candidate === 'number' && Number.isInteger(candidate)) return candidate }
   for (const child of Object.values(record)) { const found = findExitCode(child, depth + 1); if (found !== undefined) return found }
   return undefined
 }
@@ -77,8 +78,8 @@ export class EscalationTracker {
   observe(sessionId: string, observed: ObservedToolResult, config: Config): void {
     if (observed.name === 'ask_advisor') return
     const state = this.state(sessionId), exitCode = findExitCode(observed.value)
-    if (observed.isError && observed.errorCode && /(ABORT|CANCEL|DENIED|APPROVAL|PERMISSION)/i.test(observed.errorCode)) return
     const failureText = observed.errorMessage || observed.contentText || JSON.stringify(observed.value ?? '')
+    if (observed.isError && ((observed.errorCode && NON_INTELLIGENCE_FAILURE.test(observed.errorCode)) || NON_INTELLIGENCE_FAILURE.test(failureText))) return
     if (observed.isError || (exitCode !== undefined && exitCode !== 0)) {
       const fingerprint = failureFingerprint(observed.name, failureText), baseWeight = observed.isError ? config.toolErrorWeight : config.nonZeroExitWeight
       this.addSignal(state, { kind: observed.isError ? 'tool-error' : 'nonzero-exit', weight: baseWeight, fingerprint, detail: `${observed.name}: ${normalizeFailureText(failureText).slice(0, 320)}` })
