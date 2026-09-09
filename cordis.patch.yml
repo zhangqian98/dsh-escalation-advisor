@@ -1,0 +1,22 @@
+- insert:
+    - id: escalation-advisor
+      name: dsh-escalation-advisor
+      config:
+        enabled: true
+        mode: !!js process.env.DSH_ADVISOR_MODE ?? 'escalate'
+        provider: !!js process.env.DSH_ADVISOR_PROVIDER ?? ''
+        model: !!js process.env.DSH_ADVISOR_MODEL ?? ''
+        maxInputBytes: 24576
+        maxOutputTokens: 2048
+        timeoutMs: 120000
+        scoreThreshold: 4
+        toolErrorWeight: 2
+        repeatedFailureWeight: 3
+        nonZeroExitWeight: 1
+        repeatedMutationWeight: 2
+        repeatedMutationCount: 3
+        maxAutoConsultsPerTurn: 1
+        maxAutoConsultsPerProblem: 1
+        cooldownTurns: 1
+        continuousMinSeverity: concern
+        injectNits: true
