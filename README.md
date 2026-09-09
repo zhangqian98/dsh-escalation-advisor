@@ -12,7 +12,7 @@ The plugin does **not** store a separate API key. `provider` + `model` are passe
 
 ## Status
 
-`0.1.0-alpha.1` is an implementation preview. The server-side plugin, three trigger modes, live DSH settings namespace, DSH model routing, escalation scoring, consultation deduplication/budgets, and unit tests are present. A dedicated Web provider/model picker is the next UI layer; until then the bundle can be seeded by environment variables or edited through DSH/composition settings.
+`0.1.0-alpha.1` is an implementation preview. The server plugin, three modes, live DSH settings namespace, Web model/mode settings card, DSH-native model routing, escalation scoring, consultation deduplication/budgets, secret redaction and unit tests are present.
 
 ## Install from Git
 
@@ -20,9 +20,9 @@ The plugin does **not** store a separate API key. `provider` + `model` are passe
 dsh plugin --profile web add git+https://github.com/zhangqian98/dsh-escalation-advisor.git
 ```
 
-## Configure
+Restart `dsh web`, then open **Settings → Plugins → DSH Escalation Advisor**. Pick an existing DSH model service and advisor model, choose a mode, and save. No extra API key is requested by this plugin.
 
-The bundle seeds the `escalation-advisor` settings namespace from these optional environment variables:
+The bundle can also seed the settings namespace from environment variables:
 
 ```bash
 export DSH_ADVISOR_PROVIDER='your-existing-dsh-provider'
@@ -32,7 +32,7 @@ export DSH_ADVISOR_MODE='escalate' # manual | escalate | continuous
 dsh web
 ```
 
-The namespace is registered with DSH settings using the bundle config as its base layer, so runtime reads are live rather than copied at startup. The selected provider/model must already work in DSH. Authentication remains owned by the DSH provider adapter and credential system.
+The `escalation-advisor` namespace is registered with DSH settings using the bundle config as its base layer, so runtime reads are live rather than copied at startup. The selected provider/model must already work in DSH. Authentication remains owned by the DSH provider adapter and credential system.
 
 ## Modes
 
@@ -104,7 +104,7 @@ npm run check
 npm run build
 ```
 
-The source is compiled against the published DSH `0.1.2-rc.1` API baseline; peer ranges also include the tested/current alpha lines listed in `package.json`.
+The source is compiled against the published DSH `0.1.2-rc.1` API baseline; peer ranges also include the current alpha lines listed in `package.json`.
 
 ## Prior art
 
