@@ -3,6 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { Config as ConfigSchema, routeConfigured, severityRank, type AdvisorSeverity, type Config as AdvisorConfig } from './config.js'
 import { recentSessionContext, textContent } from './context.js'
@@ -18,6 +19,8 @@ export { ConfigSchema as Config }
 export type PluginConfig = AdvisorConfig
 export const SETTINGS_NAMESPACE = 'escalation-advisor'
 export const ADVISOR_TOOL_NAME = 'consult_advisor'
+const ADVISOR_LABEL_PREFIX = 'Advisor · '
+const ADVISOR_INTERNAL_TOOLS = new Set(['structured_output', 'run_code'])
 
 interface AskAdvisorArgs { goal: string; question: string; attempts?: string; context?: string }
 interface AdvisorToolResult { status: 'ok' | 'unavailable' | 'error'; severity: AdvisorSeverity; summary: string; diagnosis: string; next_actions: string[]; confidence: number; child_session_id: string }
@@ -28,6 +31,17 @@ function adviceMessage(verdict: AdvisorVerdict, origin: 'automatic escalation' |
   return `[Strong advisor — ${origin}; severity=${verdict.severity}; child=${childSessionId}]\n${verdict.summary}\n\n${verdict.diagnosis}${actions}\n\nTreat this as an independent review, not ground truth. Verify it against repository evidence and tool results before making irreversible changes.`
 }
 function isRootAgent(agent: Agent): boolean { return agent.session.header.parentSession === undefined }
+function advisorChildParent(ctx: Context, agent: Agent): { advisor: false } | { advisor: true; parent?: Agent } {
+  const parentId = agent.session.header.parentSession
+  if (parentId === undefined) return { advisor: false }
+  const isAdvisor = agent.session.snapshotEvents().some(event =>
+    event.type === 'subagent/descriptor'
+    && event.data.mode === 'one-shot'
+    && event.data.label?.startsWith(ADVISOR_LABEL_PREFIX) === true)
+  if (!isAdvisor) return { advisor: false }
+  const parent = ctx.agents.get(parentId)
+  return parent === undefined ? { advisor: true } : { advisor: true, parent }
+}
 
 export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
   const logger = ctx.logger(name)
@@ -54,6 +68,21 @@ export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
       .catch(error => logger.warn(`background advisor failed: ${error instanceof Error ? error.message : String(error)}`))
       .finally(release)
   }
+
+  // ToolRestriction masks only inherited/global tools. This guard closes the
+  // remaining child-scoped surface: an Advisor child may call only the user's
+  // effective allowlist plus DSH's structured result tool and the reserved PTC
+  // transport. Nested PTC dispatches traverse this guard too.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (!exec.agent) return next()
+    const owner = advisorChildParent(ctx, exec.agent)
+    if (!owner.advisor) return next()
+    if (ADVISOR_INTERNAL_TOOLS.has(exec.name)) return next()
+    if (!owner.parent) return { kind: 'deny', reason: 'Advisor parent session is no longer live; external tools are disabled.' }
+    const allowed = effectiveAdvisorPolicy(currentConfig(), owner.parent.session).allowedTools
+    if (allowed.includes(exec.name)) return next()
+    return { kind: 'deny', reason: `Advisor tool "${exec.name}" is not allowed by this parent session's Advisor policy.` }
+  })
 
   ctx.systemPrompt.section({
     name: 'escalation-advisor-guidance',
