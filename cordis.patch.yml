@@ -7,8 +7,7 @@
         provider: !!js process.env.DSH_ADVISOR_PROVIDER ?? ''
         model: !!js process.env.DSH_ADVISOR_MODEL ?? ''
         subagentProvider: spawn
-        defaultToolPreset: inspect
-        defaultCustomTools: []
+        defaultEnabledTools: [read, read_image, glob, grep]
         escalationWait: block
         continuousWait: background
         maxInputBytes: 24576
