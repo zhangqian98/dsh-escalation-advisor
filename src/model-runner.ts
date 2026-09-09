@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { delegationDepthOf } from '@deepseek-ai/dsh-subagent'
+import type {} from '@deepseek-ai/dsh-subagent'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { Config } from './config.js'
 import type { EffectiveAdvisorPolicy } from './policy.js'
@@ -56,7 +56,6 @@ export async function callAdvisor(
   const callSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
   let run
   try {
-    const childDepth = delegationDepthOf(parent) + 1
     run = await subagents.start(config.subagentProvider.trim() || 'spawn', {
       label,
       prompt: [{ type: 'text', text: boundedPrompt }],
@@ -64,9 +63,10 @@ export async function callAdvisor(
       signal: callSignal,
       agentOptions: { provider: config.provider.trim(), model: config.model.trim(), maxTokens: config.maxOutputTokens },
       outputSchema: VERDICT_SCHEMA,
-      // Exact derived depth: supports Advisors below ordinary local subagents
-      // without opening an arbitrary recursive-delegation allowance here.
-      maxDepth: childDepth,
+      // Do not impose a fixed absolute maxDepth here: a requester can itself be
+      // a local subagent. Advisor recursion is prevented by this plugin's role
+      // guard; any ordinary subagent tool explicitly exposed to the Advisor
+      // continues to enforce its own DSH depth policy.
       toolFilter: { allow: allowedTools },
       persona: ADVISOR_SYSTEM_PROMPT,
     })
