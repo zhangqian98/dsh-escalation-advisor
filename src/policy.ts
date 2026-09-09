@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-commands'
 import type { AdvisorToolPreset, AdvisorWaitMode, Config } from './config.js'
@@ -84,48 +85,71 @@ function statusText(config: Config, session: Session): string {
   const tools = effective.allowedTools.length ? effective.allowedTools.join(', ') : '(none)'
   return [`Advisor permissions: ${effective.toolPreset} [${tools}]`, `Escalation: ${effective.escalationWait}`, `Continuous: ${effective.continuousWait}`, `Overrides: preset=${override.toolPreset}, escalation=${override.escalationWait}, continuous=${override.continuousWait}`].join('\n')
 }
+function requireRoot(agent: Agent): { kind: 'error'; text: string } | undefined {
+  return agent.session.header.parentSession === undefined ? undefined : { kind: 'error', text: 'Advisor policy is configured on the root parent session, not inside a child session.' }
+}
 
-/** Human-only per-session policy commands. Command input/results never enter model history. */
-export function installAdvisorPolicyCommand(ctx: Context, currentConfig: () => Config): void {
-  ctx.inject(['commands'], (commandCtx) => {
-    commandCtx.commands.register({
-      name: 'advisor', description: 'Show effective Advisor permissions and wait behavior for this session',
-      handler: ({ agent, rawInput }) => {
-        if (rawInput.trim() === 'reset') append(agent.session, { toolPreset: INHERIT, tools: [], escalationWait: INHERIT, continuousWait: INHERIT })
-        else if (rawInput.trim()) return { kind: 'error' as const, text: 'Use /advisor-permission, /advisor-tools, /advisor-escalation-wait, /advisor-continuous-wait, or /advisor reset.' }
-        return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
-      },
-    })
-    commandCtx.commands.register({
-      name: 'advisor-permission', description: 'Set the Advisor tool preset for this session', input: { hint: '<inherit|none|inspect|research|edit|custom>' },
-      handler: ({ agent, rawInput }) => {
-        const value = rawInput.trim()
-        if (!isToolPreset(value)) return { kind: 'error' as const, text: 'Expected inherit, none, inspect, research, edit, or custom.' }
-        const current = sessionPolicyOverride(agent.session)
-        append(agent.session, { ...current, toolPreset: value, ...(value === 'custom' ? {} : { tools: [] }) })
-        return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
-      },
-    })
-    commandCtx.commands.register({
-      name: 'advisor-tools', description: 'Set an exact custom Advisor tool allowlist for this session', input: { hint: '<tool1,tool2,...>' },
-      handler: ({ agent, rawInput }) => {
-        const tools = normalizeToolList(rawInput.trim().split(/[\s,]+/))
-        append(agent.session, { ...sessionPolicyOverride(agent.session), toolPreset: 'custom', tools })
-        return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
-      },
-    })
-    const waitCommand = (name: 'advisor-escalation-wait' | 'advisor-continuous-wait', field: 'escalationWait' | 'continuousWait', description: string): void => {
-      commandCtx.commands.register({
-        name, description, input: { hint: '<inherit|block|background>' },
-        handler: ({ agent, rawInput }) => {
-          const value = rawInput.trim()
-          if (!isWaitMode(value)) return { kind: 'error' as const, text: 'Expected inherit, block, or background.' }
-          append(agent.session, { ...sessionPolicyOverride(agent.session), [field]: value })
-          return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
-        },
-      })
-    }
-    waitCommand('advisor-escalation-wait', 'escalationWait', 'Choose whether automatic escalation pauses this session for Advisor review')
-    waitCommand('advisor-continuous-wait', 'continuousWait', 'Choose whether continuous review pauses this session for Advisor review')
+function registerPolicyCommands(commandCtx: Context, currentConfig: () => Config): void {
+  commandCtx.commands.register({
+    name: 'advisor', description: 'Show effective Advisor permissions and wait behavior for this session',
+    handler: ({ agent, rawInput }) => {
+      const rejected = requireRoot(agent); if (rejected) return rejected
+      if (rawInput.trim() === 'reset') append(agent.session, { toolPreset: INHERIT, tools: [], escalationWait: INHERIT, continuousWait: INHERIT })
+      else if (rawInput.trim()) return { kind: 'error' as const, text: 'Use /advisor-permission, /advisor-tools, /advisor-escalation-wait, /advisor-continuous-wait, or /advisor reset.' }
+      return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
+    },
   })
+  commandCtx.commands.register({
+    name: 'advisor-permission', description: 'Set the Advisor tool preset for this session', input: { hint: '<inherit|none|inspect|research|edit|custom>' },
+    handler: ({ agent, rawInput }) => {
+      const rejected = requireRoot(agent); if (rejected) return rejected
+      const value = rawInput.trim()
+      if (!isToolPreset(value)) return { kind: 'error' as const, text: 'Expected inherit, none, inspect, research, edit, or custom.' }
+      const current = sessionPolicyOverride(agent.session)
+      append(agent.session, { ...current, toolPreset: value, ...(value === 'custom' ? {} : { tools: [] }) })
+      return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
+    },
+  })
+  commandCtx.commands.register({
+    name: 'advisor-tools', description: 'Set an exact custom Advisor tool allowlist for this session', input: { hint: '<tool1,tool2,...>' },
+    handler: ({ agent, rawInput }) => {
+      const rejected = requireRoot(agent); if (rejected) return rejected
+      const tools = normalizeToolList(rawInput.trim().split(/[\s,]+/))
+      append(agent.session, { ...sessionPolicyOverride(agent.session), toolPreset: 'custom', tools })
+      return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
+    },
+  })
+  const waitCommand = (name: 'advisor-escalation-wait' | 'advisor-continuous-wait', field: 'escalationWait' | 'continuousWait', description: string): void => {
+    commandCtx.commands.register({
+      name, description, input: { hint: '<inherit|block|background>' },
+      handler: ({ agent, rawInput }) => {
+        const rejected = requireRoot(agent); if (rejected) return rejected
+        const value = rawInput.trim()
+        if (!isWaitMode(value)) return { kind: 'error' as const, text: 'Expected inherit, block, or background.' }
+        append(agent.session, { ...sessionPolicyOverride(agent.session), [field]: value })
+        return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
+      },
+    })
+  }
+  waitCommand('advisor-escalation-wait', 'escalationWait', 'Choose whether automatic escalation pauses this session for Advisor review')
+  waitCommand('advisor-continuous-wait', 'continuousWait', 'Choose whether continuous review pauses this session for Advisor review')
+}
+
+/**
+ * Human-only per-session policy commands. Root/global registration covers TUI-like
+ * compositions; each Web/root Agent also receives an agent-scoped registration
+ * because Web composes `commands` inside the session preset rather than on the
+ * host root. Command input/results never enter model history.
+ */
+export function installAdvisorPolicyCommand(ctx: Context, currentConfig: () => Config): void {
+  ctx.inject(['commands'], commandCtx => { registerPolicyCommands(commandCtx, currentConfig) })
+
+  const installed = new WeakSet<Agent>()
+  const mountAgent = (agent: Agent): void => {
+    if (agent.session.header.parentSession !== undefined || installed.has(agent)) return
+    installed.add(agent)
+    agent.ctx.inject(['commands'], commandCtx => { registerPolicyCommands(commandCtx, currentConfig) })
+  }
+  for (const agent of ctx.agents.list()) mountAgent(agent)
+  ctx.on('agent/created', ({ agent }) => { mountAgent(agent) })
 }
