@@ -36,6 +36,7 @@ export interface EscalationDecision {
   reason?: string
 }
 
+const ADVISOR_TOOL = 'consult_advisor'
 const MUTATION_TOOL = /(apply[_-]?patch|edit|write|replace|delete|move|rename|create)/i
 const VALIDATION_TOOL = /(bash|pwsh|shell|exec|terminal|command)/i
 const VALIDATION_COMMAND = /(^|\s)(test|pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+test|gradle\w*\s+test|pnpm\s+(?:run\s+)?(?:test|lint|build|typecheck)|npm\s+(?:run\s+)?(?:test|lint|build|typecheck)|yarn\s+(?:test|lint|build|typecheck)|tsc\b)/i
@@ -76,7 +77,7 @@ export class EscalationTracker {
   private state(sessionId: string): SessionState { let current = this.states.get(sessionId); if (!current) { current = createState(); this.states.set(sessionId, current) } return current }
   private addSignal(state: SessionState, signal: EscalationSignal): void { state.score += signal.weight; state.recentSignals.push(signal); if (state.recentSignals.length > 12) state.recentSignals.splice(0, state.recentSignals.length - 12) }
   observe(sessionId: string, observed: ObservedToolResult, config: Config): void {
-    if (observed.name === 'ask_advisor') return
+    if (observed.name === ADVISOR_TOOL) return
     const state = this.state(sessionId), exitCode = findExitCode(observed.value)
     const failureText = observed.errorMessage || observed.contentText || JSON.stringify(observed.value ?? '')
     if (observed.isError && ((observed.errorCode && NON_INTELLIGENCE_FAILURE.test(observed.errorCode)) || NON_INTELLIGENCE_FAILURE.test(failureText))) return

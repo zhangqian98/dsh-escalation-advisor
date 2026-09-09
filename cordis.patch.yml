@@ -9,6 +9,7 @@
         maxInputBytes: 24576
         maxOutputTokens: 2048
         timeoutMs: 120000
+        maxManualConsultsPerSession: 8
         scoreThreshold: 4
         toolErrorWeight: 2
         repeatedFailureWeight: 3

@@ -13,6 +13,7 @@ export interface Config {
   maxInputBytes: number
   maxOutputTokens: number
   timeoutMs: number
+  maxManualConsultsPerSession: number
   scoreThreshold: number
   toolErrorWeight: number
   repeatedFailureWeight: number
@@ -34,6 +35,7 @@ export const Config = z.object({
   maxInputBytes: z.number().step(1).min(4096).max(131072).default(24576),
   maxOutputTokens: z.number().step(1).min(128).max(32768).default(2048),
   timeoutMs: z.number().step(1).min(1000).max(600000).default(120000),
+  maxManualConsultsPerSession: z.number().step(1).min(0).max(100).default(8),
   scoreThreshold: z.number().step(1).min(1).max(100).default(4),
   toolErrorWeight: z.number().step(1).min(0).max(20).default(2),
   repeatedFailureWeight: z.number().step(1).min(0).max(20).default(3),
@@ -48,7 +50,7 @@ export const Config = z.object({
 })
 
 export function routeConfigured(config: Config): boolean {
-  return config.provider.trim().length > 0 && config.model.trim().length > 0
+  return config.enabled && config.provider.trim().length > 0 && config.model.trim().length > 0
 }
 
 export function severityRank(severity: AdvisorSeverity): number {
