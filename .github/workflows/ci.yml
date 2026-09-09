@@ -6,14 +6,23 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      # DSH packages currently require a newer npm resolver than the npm 11.3
+      # bundled by some Node 24 images. Match the working community-plugin CI.
+      - run: npm install --global npm@11.7.0
       - run: npm install --ignore-scripts --no-audit --no-fund
       - run: npm run check
       - run: npm run build
