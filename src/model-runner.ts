@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-subagent'
+import { delegationDepthOf } from '@deepseek-ai/dsh-subagent'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { Config } from './config.js'
 import type { EffectiveAdvisorPolicy } from './policy.js'
@@ -30,7 +30,7 @@ export interface AdvisorRunResult {
   childSessionId: string
 }
 
-/** Run one visible one-shot DSH child. The child owns its transcript and tool calls. */
+/** Run one visible one-shot DSH child beneath the exact requesting agent. */
 export async function callAdvisor(
   ctx: Context,
   config: Config,
@@ -44,15 +44,19 @@ export async function callAdvisor(
   const subagents = parent.ctx.get('subagents') ?? ctx.get('subagents')
   if (!subagents) throw new AdvisorUnavailableError('DSH subagent runtime is unavailable for this session.', 'subagents_unavailable')
 
+  // Root/task policy is a ceiling; the requesting agent's actual tool surface is
+  // the second half of the intersection. A subagent therefore cannot borrow an
+  // Advisor to reach a tool it could not itself see.
   const visible = new Set(ctx.tools.schemas(parent).map(tool => tool.name))
   const requestedTools = policy.allowedTools.filter(name => name !== 'consult_advisor')
   const allowedTools = requestedTools.filter(name => visible.has(name))
   const unavailableTools = requestedTools.filter(name => !visible.has(name))
-  const toolPolicyNote = `\n\nADVISOR TOOL POLICY:\nExposed: ${allowedTools.length ? allowedTools.join(', ') : '(none)'}\nRequested but unavailable in the parent DSH tool surface: ${unavailableTools.length ? unavailableTools.join(', ') : '(none)'}. Do not claim to have used unavailable tools.`
+  const toolPolicyNote = `\n\nADVISOR TOOL POLICY:\nExposed: ${allowedTools.length ? allowedTools.join(', ') : '(none)'}\nRequested by the root Advisor policy but unavailable in the requesting agent's DSH tool surface: ${unavailableTools.length ? unavailableTools.join(', ') : '(none)'}. Do not claim to have used unavailable tools.`
   const boundedPrompt = truncateUtf8(redactSecrets(prompt + toolPolicyNote), config.maxInputBytes)
   const callSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
   let run
   try {
+    const childDepth = delegationDepthOf(parent) + 1
     run = await subagents.start(config.subagentProvider.trim() || 'spawn', {
       label,
       prompt: [{ type: 'text', text: boundedPrompt }],
@@ -60,7 +64,9 @@ export async function callAdvisor(
       signal: callSignal,
       agentOptions: { provider: config.provider.trim(), model: config.model.trim(), maxTokens: config.maxOutputTokens },
       outputSchema: VERDICT_SCHEMA,
-      maxDepth: 1,
+      // Exact derived depth: supports Advisors below ordinary local subagents
+      // without opening an arbitrary recursive-delegation allowance here.
+      maxDepth: childDepth,
       toolFilter: { allow: allowedTools },
       persona: ADVISOR_SYSTEM_PROMPT,
     })
