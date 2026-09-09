@@ -6,6 +6,10 @@
         mode: !!js process.env.DSH_ADVISOR_MODE ?? 'escalate'
         provider: !!js process.env.DSH_ADVISOR_PROVIDER ?? ''
         model: !!js process.env.DSH_ADVISOR_MODEL ?? ''
+        subagentProvider: spawn
+        defaultEnabledTools: [read, read_image, glob, grep]
+        escalationWait: block
+        continuousWait: background
         maxInputBytes: 24576
         maxOutputTokens: 2048
         timeoutMs: 120000

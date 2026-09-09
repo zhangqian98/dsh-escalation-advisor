@@ -1,18 +1,14 @@
 # dsh-escalation-advisor
 
-A DSH-only advisor plugin that lets a cheaper primary model borrow a stronger model already configured in DeepSeek Harness only when useful.
+A DSH-only advisor plugin for running a cheaper primary model most of the time and borrowing a stronger configured DSH model when a second opinion is useful.
 
-It implements three modes with one shared advisor runtime:
+The Advisor runs as a **visible DSH child session**, not a hidden LLM request. Users can open the parent session's subagent catalog and inspect the Advisor transcript, tool calls, token use, and final result.
 
-- **manual** — exposes `consult_advisor`; no automatic model calls.
-- **escalate** — exposes `consult_advisor` and automatically consults the advisor when deterministic stuck/failure signals cross a threshold.
-- **continuous** — exposes `consult_advisor` and shadow-reviews each natural turn boundary, similar to OMP-style continuous advisors.
+## Modes
 
-The plugin does **not** store a separate API key. `provider` + `model` are passed to DSH's own `ctx.llm.prepareCall()`, so the selected model uses the provider/authentication already configured in DSH.
-
-## Status
-
-`0.1.0-alpha.1` is an implementation preview. The server plugin, three modes, live DSH settings namespace, Web model/mode settings card, DSH-native model routing, escalation scoring, consultation deduplication/budgets, secret redaction and unit tests are present.
+- **manual** — exposes `consult_advisor`; no automatic consultations.
+- **escalate** — manual consultation plus deterministic stuck/failure scoring. Default.
+- **continuous** — manual consultation plus a strong shadow review at natural turn boundaries.
 
 ## Install from Git
 
@@ -20,81 +16,120 @@ The plugin does **not** store a separate API key. `provider` + `model` are passe
 dsh plugin --profile web add git+https://github.com/zhangqian98/dsh-escalation-advisor.git
 ```
 
-Restart `dsh web`, then open **Settings → Plugins → DSH Escalation Advisor**. Pick an existing DSH model service and advisor model, choose a mode, and save. No extra API key is requested by this plugin.
+Configure the strong model in **Settings → Plugins → DSH Escalation Advisor**. The plugin stores only provider/model route IDs and reuses the authentication already configured in DSH Models.
 
-The bundle can also seed the settings namespace from environment variables:
+## Visible Advisor sessions
 
-```bash
-export DSH_ADVISOR_PROVIDER='your-existing-dsh-provider'
-export DSH_ADVISOR_MODEL='your-strong-model-id'
-export DSH_ADVISOR_MODE='escalate' # manual | escalate | continuous
-
-dsh web
-```
-
-The `escalation-advisor` namespace is registered with DSH settings using the bundle config as its base layer, so runtime reads are live rather than copied at startup. The selected provider/model must already work in DSH. Authentication remains owned by the DSH provider adapter and credential system.
-
-## Modes
-
-### `manual`
-
-Only explicit consultation runs the strong model. The model-visible `consult_advisor` tool accepts `goal`, `question`, optional `attempts`, and optional `context`; a bounded recent DSH transcript/evidence slice is added automatically. Manual calls are capped per session (`maxManualConsultsPerSession`, default 8) to stop a weak model from silently turning the advisor into its default model.
-
-### `escalate` (default)
-
-Manual consultation stays available, plus a deterministic gate observes final DSH tool outcomes. Current alpha signals are tool execution error, non-zero process exit code, the same normalized failure repeating, and repeated mutation of the same target without a successful test/build/lint/typecheck validation command.
-
-Signals add to a score. At the natural `agent/turn-stopping` boundary, a score at or above `scoreThreshold` triggers one strong-model consultation, subject to per-turn/per-problem limits and cooldown. Advice is sent back with `agent.steer()` so the cheaper primary model gets another step instead of incorrectly finishing. A successful validation command resets stuck state.
-
-Automatic consultation is claimed before the strong-model request starts. This is intentional: if the transport fails after dispatch, automatically retrying the same fingerprint could duplicate expensive inference with ambiguous delivery. A later materially different problem gets a different fingerprint and can escalate independently.
-
-### `continuous`
-
-At most once per DSH turn, the advisor reviews recent history and returns `none`, `nit`, `concern`, or `blocker`. By default lower-severity review is injected as future context while concern/blocker steers the current turn into another step. This mode intentionally spends more advisor calls and is closest to an OMP-style shadow reviewer.
-
-## Default escalation tuning
-
-```yaml
-scoreThreshold: 4
-toolErrorWeight: 2
-repeatedFailureWeight: 3
-nonZeroExitWeight: 1
-repeatedMutationWeight: 2
-repeatedMutationCount: 3
-maxAutoConsultsPerTurn: 1
-maxAutoConsultsPerProblem: 1
-cooldownTurns: 1
-```
-
-Cancellation, permission, approval and user-denial style failures are excluded from escalation scoring. The important property is deduplication: a repeated failure does not cause unlimited strong-model calls for the same problem fingerprint.
-
-## Data sent to the advisor
-
-The plugin sends a bounded recent session slice plus the trigger/caller question. It redacts common secret/token patterns and truncates by UTF-8 byte budget. The advisor has no tools or write access in this first version: the strong model is a read-only reasoning consultant, while the primary DSH agent remains the executor.
-
-## Coexistence
-
-The tool is intentionally named `consult_advisor` instead of `ask_advisor`, so this alpha can coexist at the registry-name level with `dsh-super-advisor`. Its DSH settings namespace is `escalation-advisor` for the same reason.
-
-## Design
+Each consultation currently creates a fresh one-shot child:
 
 ```text
-cheap primary model
-       |
-       +-- normal DSH tools --------------------> work
-       |
-       +-- consult_advisor (manual) --+
-       |                              |
-       +-- escalation gate -----------+--> stronger DSH model
-       |                              |       |
-       +-- continuous review ---------+       v
-                                       advice only
-                                           |
-                                           v
-                                   primary model continues
+Advisor · manual
+Advisor · escalation · turn 4
+Advisor · continuous · turn 8
 ```
 
-This is deliberately different from full model failover. A strong model normally diagnoses and recommends; it does not take over the tool loop.
+DSH Web already exposes session-backed subagent conversations from the parent header's subagent catalog, so users can open the Advisor child and inspect the complete execution record. Fresh children are currently preferred over a reused continuable child because ordinary continuable settlement notices can wake the parent even when a background review finds `severity=none`. See [DESIGN.md](./DESIGN.md).
+
+## Tool permissions: defaults plus per-session toggles
+
+Permissions are modeled as **default on/default off per tool**.
+
+The shipped global defaults enable only:
+
+```text
+read
+read_image
+glob
+grep
+```
+
+Everything else is default-off, including `edit`, `write`, shell tools, web tools, MCP tools, browser automation, database tools, and arbitrary plugin tools.
+
+In Settings, common tools are shown as global default switches. Unknown/plugin tools can be added by exact name. In an open root session, the **Advisor** control in the conversation header enumerates the tools that session actually has and displays one switch per tool:
+
+- **默认开启** — enabled by global defaults;
+- **默认关闭** — disabled unless this session opts in;
+- **会话开启** — this session explicitly enabled a default-off tool;
+- **会话关闭** — this session explicitly disabled a default-on tool.
+
+Every row can be returned individually to the global default, and the whole session can be reset to inheritance.
+
+The per-session state is stored as two deltas: `allowTools` and `denyTools`. Effective access is:
+
+```text
+(global defaultEnabledTools + session allowTools) - session denyTools
+```
+
+That means future global-default changes continue to affect tools a session has never explicitly overridden.
+
+### Enforcement
+
+The child receives a DSH `toolFilter.allow` based on its effective permission list. A second `tools/pre-execute` guard also denies Advisor-child tool calls outside the current parent-session policy. This extra guard matters because DSH scoped child tools are not necessarily hidden by a global-tool restriction.
+
+`structured_output` and the PTC transport `run_code` are internal exceptions; `consult_advisor` is never exposed to the Advisor child, preventing recursive consultation.
+
+The requested allowlist is intersected with tools actually visible in the parent session before the child is started, so a default name that is absent from one profile does not make the consultation fail.
+
+## Per-session controls
+
+The Web header panel is the normal control surface. Human slash commands remain as a fallback and do not become model messages:
+
+```text
+/advisor
+/advisor catalog
+/advisor reset
+/advisor-tool <tool-name> on|off|inherit
+/advisor-escalation-wait inherit|block|background
+/advisor-continuous-wait inherit|block|background
+```
+
+## When the primary session pauses
+
+Defaults:
+
+| Trigger | Primary behavior |
+| --- | --- |
+| manual `consult_advisor` | **block** until the child returns |
+| automatic escalation | **block** until the child returns |
+| continuous review | **background** |
+
+Manual consultation needs its answer immediately. Automatic escalation means the primary model is probably stuck and should normally stop compounding the same mistake. Continuous review is background by default so routine shadow checking does not stall throughput. The two automatic wait policies can be overridden independently per session.
+
+Combining background review with mutating tools is intentionally possible only after the user enables those tools. It can create concurrent edits in the same workspace and should be treated as an advanced configuration.
+
+## Escalation signals
+
+The deterministic gate currently tracks signals including:
+
+- final tool errors;
+- repeated normalized copies of the same failure;
+- non-zero process exits;
+- repeated mutation of the same target without a successful validation command.
+
+Cancellation, approval denial, and permission-style failures are excluded from intelligence scoring. Consultation is deduplicated by problem fingerprint and bounded by per-turn/per-problem budgets and cooldown.
+
+## Advisor result
+
+The child is asked for structured output:
+
+```json
+{
+  "severity": "none | nit | concern | blocker",
+  "summary": "...",
+  "diagnosis": "...",
+  "next_actions": ["..."],
+  "confidence": 0.0
+}
+```
+
+In blocking automatic modes, a material result is steered into the primary session before it closes. In background mode, a material result later wakes/steers the still-live parent; `none` remains silent.
+
+## Security notes
+
+- DSH owns provider authentication; this plugin stores only model route IDs.
+- Evidence is UTF-8 byte bounded and common credential forms are redacted before becoming Advisor prompt text.
+- Unknown tools default to off; DSH currently has no universal trusted effect metadata that would let this plugin safely infer arbitrary tools as read-only.
+- Tool permission is enforced at execution time, not only described in prompts.
 
 ## Development
 
@@ -104,11 +139,7 @@ npm run check
 npm run build
 ```
 
-The source is compiled against the published DSH `0.1.2-rc.1` API baseline; peer ranges also include the current alpha lines listed in `package.json`.
-
-## Prior art
-
-The design is informed by the DSH advisor ecosystem, especially continuous reviewer approaches and on-demand SuperAdvisor patterns. This implementation combines those styles with a deterministic automatic escalation gate and one shared DSH-native model/auth path.
+The visible-session and permission rework is currently in draft PR #1.
 
 ## License
 

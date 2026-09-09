@@ -37,24 +37,27 @@ function findJsonObject(text: string): string | null {
   return null
 }
 
+export function verdictFromStructured(value: unknown, rawInput = ''): AdvisorVerdict {
+  const parsed = value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const severityRaw = asString(parsed.severity).toLowerCase()
+  const severity = (SEVERITIES as readonly string[]).includes(severityRaw) ? severityRaw as AdvisorSeverity : 'concern'
+  const confidenceRaw = typeof parsed.confidence === 'number' ? parsed.confidence : undefined
+  const raw = redactSecrets(rawInput).trim()
+  return {
+    severity,
+    summary: asString(parsed.summary) || 'Advisor review',
+    diagnosis: asString(parsed.diagnosis) || raw || 'No diagnosis returned.',
+    nextActions: asStringArray(parsed.next_actions ?? parsed.nextActions ?? parsed.actions),
+    ...(confidenceRaw === undefined ? {} : { confidence: Math.max(0, Math.min(1, confidenceRaw)) }),
+    raw,
+  }
+}
+
 export function parseVerdict(rawInput: string): AdvisorVerdict {
   const raw = redactSecrets(rawInput).trim()
   const candidate = findJsonObject(raw)
   if (candidate) {
-    try {
-      const parsed = JSON.parse(candidate) as Record<string, unknown>
-      const severityRaw = asString(parsed.severity).toLowerCase()
-      const severity = (SEVERITIES as readonly string[]).includes(severityRaw) ? severityRaw as AdvisorSeverity : 'concern'
-      const confidenceRaw = typeof parsed.confidence === 'number' ? parsed.confidence : undefined
-      return {
-        severity,
-        summary: asString(parsed.summary) || asString(parsed.assessment) || 'Advisor review',
-        diagnosis: asString(parsed.diagnosis) || asString(parsed.reason) || raw,
-        nextActions: asStringArray(parsed.next_actions ?? parsed.nextActions ?? parsed.actions),
-        ...(confidenceRaw === undefined ? {} : { confidence: Math.max(0, Math.min(1, confidenceRaw)) }),
-        raw,
-      }
-    } catch {}
+    try { return verdictFromStructured(JSON.parse(candidate), raw) } catch {}
   }
   const lower = raw.toLowerCase()
   const severity: AdvisorSeverity = lower.includes('blocker') ? 'blocker' : lower.includes('concern') ? 'concern' : lower.includes('nit') ? 'nit' : raw.length === 0 ? 'none' : 'concern'
