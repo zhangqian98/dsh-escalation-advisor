@@ -1,18 +1,14 @@
 # dsh-escalation-advisor
 
-A DSH-only advisor plugin that lets a cheaper primary model borrow a stronger model already configured in DeepSeek Harness only when useful.
+A DSH-only advisor plugin for running a cheaper primary model most of the time and borrowing a stronger configured DSH model when a second opinion is useful.
 
-It implements three modes with one shared advisor runtime:
+The Advisor now runs as a **visible DSH child session**, not a hidden LLM request. Users can open the parent session's subagent catalog and inspect the Advisor's transcript, tool calls, token use, and final result.
 
-- **manual** — exposes `consult_advisor`; no automatic model calls.
-- **escalate** — exposes `consult_advisor` and automatically consults the advisor when deterministic stuck/failure signals cross a threshold.
-- **continuous** — exposes `consult_advisor` and shadow-reviews each natural turn boundary, similar to OMP-style continuous advisors.
+## Modes
 
-The plugin does **not** store a separate API key. `provider` + `model` are passed to DSH's own `ctx.llm.prepareCall()`, so the selected model uses the provider/authentication already configured in DSH.
-
-## Status
-
-`0.1.0-alpha.1` is an implementation preview. The server plugin, three modes, live DSH settings namespace, Web model/mode settings card, DSH-native model routing, escalation scoring, consultation deduplication/budgets, secret redaction and unit tests are present.
+- **manual** — exposes `consult_advisor`; no automatic consultations.
+- **escalate** — manual consultation plus deterministic stuck/failure scoring. Default.
+- **continuous** — manual consultation plus a strong shadow review at natural turn boundaries.
 
 ## Install from Git
 
@@ -20,81 +16,115 @@ The plugin does **not** store a separate API key. `provider` + `model` are passe
 dsh plugin --profile web add git+https://github.com/zhangqian98/dsh-escalation-advisor.git
 ```
 
-Restart `dsh web`, then open **Settings → Plugins → DSH Escalation Advisor**. Pick an existing DSH model service and advisor model, choose a mode, and save. No extra API key is requested by this plugin.
-
-The bundle can also seed the settings namespace from environment variables:
+Configure the strong model either in **Settings → Plugins → DSH Escalation Advisor** or with environment defaults:
 
 ```bash
 export DSH_ADVISOR_PROVIDER='your-existing-dsh-provider'
 export DSH_ADVISOR_MODEL='your-strong-model-id'
-export DSH_ADVISOR_MODE='escalate' # manual | escalate | continuous
+export DSH_ADVISOR_MODE='escalate'
 
 dsh web
 ```
 
-The `escalation-advisor` namespace is registered with DSH settings using the bundle config as its base layer, so runtime reads are live rather than copied at startup. The selected provider/model must already work in DSH. Authentication remains owned by the DSH provider adapter and credential system.
+The plugin never stores a separate API key. The Advisor child uses the provider/model already configured in DSH.
 
-## Modes
+## Advisor child sessions
 
-### `manual`
-
-Only explicit consultation runs the strong model. The model-visible `consult_advisor` tool accepts `goal`, `question`, optional `attempts`, and optional `context`; a bounded recent DSH transcript/evidence slice is added automatically. Manual calls are capped per session (`maxManualConsultsPerSession`, default 8) to stop a weak model from silently turning the advisor into its default model.
-
-### `escalate` (default)
-
-Manual consultation stays available, plus a deterministic gate observes final DSH tool outcomes. Current alpha signals are tool execution error, non-zero process exit code, the same normalized failure repeating, and repeated mutation of the same target without a successful test/build/lint/typecheck validation command.
-
-Signals add to a score. At the natural `agent/turn-stopping` boundary, a score at or above `scoreThreshold` triggers one strong-model consultation, subject to per-turn/per-problem limits and cooldown. Advice is sent back with `agent.steer()` so the cheaper primary model gets another step instead of incorrectly finishing. A successful validation command resets stuck state.
-
-Automatic consultation is claimed before the strong-model request starts. This is intentional: if the transport fails after dispatch, automatically retrying the same fingerprint could duplicate expensive inference with ambiguous delivery. A later materially different problem gets a different fingerprint and can escalate independently.
-
-### `continuous`
-
-At most once per DSH turn, the advisor reviews recent history and returns `none`, `nit`, `concern`, or `blocker`. By default lower-severity review is injected as future context while concern/blocker steers the current turn into another step. This mode intentionally spends more advisor calls and is closest to an OMP-style shadow reviewer.
-
-## Default escalation tuning
-
-```yaml
-scoreThreshold: 4
-toolErrorWeight: 2
-repeatedFailureWeight: 3
-nonZeroExitWeight: 1
-repeatedMutationWeight: 2
-repeatedMutationCount: 3
-maxAutoConsultsPerTurn: 1
-maxAutoConsultsPerProblem: 1
-cooldownTurns: 1
-```
-
-Cancellation, permission, approval and user-denial style failures are excluded from escalation scoring. The important property is deduplication: a repeated failure does not cause unlimited strong-model calls for the same problem fingerprint.
-
-## Data sent to the advisor
-
-The plugin sends a bounded recent session slice plus the trigger/caller question. It redacts common secret/token patterns and truncates by UTF-8 byte budget. The advisor has no tools or write access in this first version: the strong model is a read-only reasoning consultant, while the primary DSH agent remains the executor.
-
-## Coexistence
-
-The tool is intentionally named `consult_advisor` instead of `ask_advisor`, so this alpha can coexist at the registry-name level with `dsh-super-advisor`. Its DSH settings namespace is `escalation-advisor` for the same reason.
-
-## Design
+Each consultation currently creates a fresh one-shot DSH child with a label such as:
 
 ```text
-cheap primary model
-       |
-       +-- normal DSH tools --------------------> work
-       |
-       +-- consult_advisor (manual) --+
-       |                              |
-       +-- escalation gate -----------+--> stronger DSH model
-       |                              |       |
-       +-- continuous review ---------+       v
-                                       advice only
-                                           |
-                                           v
-                                   primary model continues
+Advisor · manual
+Advisor · escalation · turn 4
+Advisor · continuous · turn 8
 ```
 
-This is deliberately different from full model failover. A strong model normally diagnoses and recommends; it does not take over the tool loop.
+This is deliberate. Fresh children make the permission boundary and evidence packet easy to audit, and one-shot reviews can run in the background without the standard continuable-child settlement notice waking the primary session for a `severity=none` result. See [DESIGN.md](./DESIGN.md) for the reuse decision.
+
+DSH Web already exposes session-backed subagent conversations from the parent header's subagent catalog, so no separate transcript viewer is required.
+
+## Tool permissions
+
+Advisor tool access is enforced by DSH child `toolFilter.allow`.
+
+Global defaults:
+
+| Preset | Exposed tools |
+| --- | --- |
+| `none` | none |
+| `inspect` | `read`, `read_image`, `glob`, `grep` |
+| `research` | inspect + `web_search`, `web_fetch` |
+| `edit` | inspect + `edit`, `write` |
+| `custom` | exact configured allowlist |
+
+`inspect` is the default. Shells, MCP tools, browser control, database tools, and other deployment-specific tools are **not guessed to be read-only**. Add them explicitly through `custom` if desired.
+
+`edit` can modify the same workspace as the primary model. Combining edit permissions with background review can therefore create concurrent edits and should be used deliberately.
+
+## Per-session overrides
+
+Global Settings are defaults. Every parent session can override Advisor permissions and wait behavior without changing other sessions:
+
+```text
+/advisor
+/advisor reset
+/advisor-permission inherit|none|inspect|research|edit|custom
+/advisor-tools read,grep,glob,...
+/advisor-escalation-wait inherit|block|background
+/advisor-continuous-wait inherit|block|background
+```
+
+These are DSH human commands: command input/output does not become a model message. The Web client decorates the permission and wait commands with popup selectors; `/advisor-tools` remains the advanced exact-name allowlist path.
+
+Overrides are persisted as latest-wins log-only `advisor/policy` events in that parent session. `/advisor reset` returns the session to global inheritance.
+
+## When the primary session pauses
+
+Defaults:
+
+| Advisor trigger | Primary behavior |
+| --- | --- |
+| manual `consult_advisor` | **block** until the child returns |
+| automatic escalation | **block** until the child returns |
+| continuous review | **background** |
+
+Why: an explicit manual tool call needs its answer immediately; escalation means the primary model is probably stuck and should not compound the mistake; continuous review should normally preserve throughput and only wake the primary session if the later review finds a material concern.
+
+Automatic wait behavior is independently overridable per session.
+
+## Escalation signals
+
+The current deterministic gate tracks signals including:
+
+- final tool errors;
+- repeated normalized copies of the same failure;
+- non-zero process exits;
+- repeated mutation of the same target without a successful validation command.
+
+Cancellation, approval denial, and permission-style failures are excluded from intelligence scoring. Consultation is deduplicated by problem fingerprint and bounded by per-turn/per-problem budgets and cooldown.
+
+## Advisor result
+
+The child is asked for structured output:
+
+```json
+{
+  "severity": "none | nit | concern | blocker",
+  "summary": "...",
+  "diagnosis": "...",
+  "next_actions": ["..."],
+  "confidence": 0.0
+}
+```
+
+In blocking automatic modes, a material result is steered into the primary session before it closes. In background mode, a material result later wakes/steers the still-live parent; `none` remains silent. Lower-severity continuous findings may be injected without waking an idle parent.
+
+## Security notes
+
+- DSH owns provider authentication; this plugin stores only model route IDs.
+- Evidence is UTF-8 byte bounded and common credential forms are redacted before becoming Advisor prompt text.
+- Tool permissions are an execution-layer allowlist, not prompt-only instructions.
+- The Advisor's structured-output tool remains child-scoped and is not granted by the user tool allowlist.
+- Arbitrary tools are not auto-classified as read-only because DSH does not yet expose a general trusted effects classification for every tool.
 
 ## Development
 
@@ -104,11 +134,7 @@ npm run check
 npm run build
 ```
 
-The source is compiled against the published DSH `0.1.2-rc.1` API baseline; peer ranges also include the current alpha lines listed in `package.json`.
-
-## Prior art
-
-The design is informed by the DSH advisor ecosystem, especially continuous reviewer approaches and on-demand SuperAdvisor patterns. This implementation combines those styles with a deterministic automatic escalation gate and one shared DSH-native model/auth path.
+The project is currently alpha. The feature branch `feat/advisor-session-permissions` contains the visible-session / permission rework before it is merged to `main`.
 
 ## License
 

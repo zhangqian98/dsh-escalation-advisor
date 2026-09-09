@@ -1,32 +1,33 @@
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { Config as ConfigSchema, routeConfigured, severityRank, type AdvisorSeverity, type Config as AdvisorConfig } from './config.js'
 import { recentSessionContext, textContent } from './context.js'
 import { callAdvisor, AdvisorUnavailableError } from './model-runner.js'
+import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
 import { continuousPrompt, escalationPrompt, manualPrompt, toolGuidance } from './prompts.js'
 import { EscalationTracker } from './state.js'
 import type { AdvisorVerdict } from './verdict.js'
 
 export const name = 'dsh-escalation-advisor'
-export const inject = ['tools', 'llm', 'settings', 'systemPrompt']
+export const inject = ['tools', 'settings', 'systemPrompt', 'agents']
 export { ConfigSchema as Config }
 export type PluginConfig = AdvisorConfig
 export const SETTINGS_NAMESPACE = 'escalation-advisor'
 export const ADVISOR_TOOL_NAME = 'consult_advisor'
 
 interface AskAdvisorArgs { goal: string; question: string; attempts?: string; context?: string }
-interface AdvisorToolResult { status: 'ok' | 'unavailable' | 'error'; severity: AdvisorSeverity; summary: string; diagnosis: string; next_actions: string[]; confidence: number }
-function advisorToolResult(verdict: AdvisorVerdict): AdvisorToolResult { return { status: 'ok', severity: verdict.severity, summary: verdict.summary, diagnosis: verdict.diagnosis, next_actions: verdict.nextActions, confidence: verdict.confidence ?? 0 } }
-function unavailable(message: string): AdvisorToolResult { return { status: 'unavailable', severity: 'none', summary: 'Advisor unavailable', diagnosis: message, next_actions: [], confidence: 0 } }
-function adviceMessage(verdict: AdvisorVerdict, origin: 'automatic escalation' | 'continuous review'): string {
+interface AdvisorToolResult { status: 'ok' | 'unavailable' | 'error'; severity: AdvisorSeverity; summary: string; diagnosis: string; next_actions: string[]; confidence: number; child_session_id: string }
+function advisorToolResult(verdict: AdvisorVerdict, childSessionId: string): AdvisorToolResult { return { status: 'ok', severity: verdict.severity, summary: verdict.summary, diagnosis: verdict.diagnosis, next_actions: verdict.nextActions, confidence: verdict.confidence ?? 0, child_session_id: childSessionId } }
+function unavailable(message: string): AdvisorToolResult { return { status: 'unavailable', severity: 'none', summary: 'Advisor unavailable', diagnosis: message, next_actions: [], confidence: 0, child_session_id: '' } }
+function adviceMessage(verdict: AdvisorVerdict, origin: 'automatic escalation' | 'continuous review', childSessionId: string): string {
   const actions = verdict.nextActions.length ? `\nRecommended next actions:\n${verdict.nextActions.map((item, index) => `${index + 1}. ${item}`).join('\n')}` : ''
-  return `[Strong advisor — ${origin}; severity=${verdict.severity}]\n${verdict.summary}\n\n${verdict.diagnosis}${actions}\n\nTreat this as an independent review, not ground truth. Verify it against repository evidence and tool results before making irreversible changes.`
+  return `[Strong advisor — ${origin}; severity=${verdict.severity}; child=${childSessionId}]\n${verdict.summary}\n\n${verdict.diagnosis}${actions}\n\nTreat this as an independent review, not ground truth. Verify it against repository evidence and tool results before making irreversible changes.`
 }
-function isRootAgent(agent: { session: { header: { parentSession?: unknown } } }): boolean { return agent.session.header.parentSession === undefined }
+function isRootAgent(agent: Agent): boolean { return agent.session.header.parentSession === undefined }
 
 export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
   const logger = ctx.logger(name)
@@ -34,6 +35,25 @@ export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
   const currentConfig = (): AdvisorConfig => settings.get()
   const tracker = new EscalationTracker()
   const manualCalls = new Map<string, number>()
+  const backgroundControllers = new Map<string, Set<AbortController>>()
+  const disposed = new AbortController()
+  ctx.effect(() => () => disposed.abort(), 'advisor: abort background work on unload')
+  installAdvisorPolicyCommand(ctx, currentConfig)
+
+  const trackBackground = (sessionId: string, controller: AbortController): (() => void) => {
+    let set = backgroundControllers.get(sessionId)
+    if (!set) { set = new Set(); backgroundControllers.set(sessionId, set) }
+    set.add(controller)
+    return () => { set!.delete(controller); if (set!.size === 0) backgroundControllers.delete(sessionId) }
+  }
+  const launchBackground = (agent: Agent, task: (signal: AbortSignal) => Promise<void>): void => {
+    const controller = new AbortController()
+    const release = trackBackground(agent.session.id, controller)
+    const signal = AbortSignal.any([controller.signal, disposed.signal])
+    void task(signal)
+      .catch(error => logger.warn(`background advisor failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(release)
+  }
 
   ctx.systemPrompt.section({
     name: 'escalation-advisor-guidance',
@@ -49,10 +69,10 @@ export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
 
   ctx.tools.register(defineTool({
     name: ADVISOR_TOOL_NAME,
-    description: 'Ask a stronger configured DSH model for an independent engineering second opinion. Use for genuine uncertainty, conflicting evidence, repeated failures, or high-impact decisions; not routine work.',
+    description: 'Ask a stronger configured DSH model for an independent engineering second opinion. The advisor runs in a visible child session and may use only tools allowed by the user for this parent session.',
     parameters: { goal: { type: 'string', required: true }, question: { type: 'string', required: true }, attempts: { type: 'string' }, context: { type: 'string' } },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { status: { type: 'string', required: true, enum: ['ok', 'unavailable', 'error'] }, severity: { type: 'string', required: true, enum: ['none', 'nit', 'concern', 'blocker'] }, summary: { type: 'string', required: true }, diagnosis: { type: 'string', required: true }, next_actions: { type: 'array', required: true, items: { type: 'string' } }, confidence: { type: 'number', required: true } } },
+      schema: { type: 'object', additionalProperties: false, properties: { status: { type: 'string', required: true, enum: ['ok', 'unavailable', 'error'] }, severity: { type: 'string', required: true, enum: ['none', 'nit', 'concern', 'blocker'] }, summary: { type: 'string', required: true }, diagnosis: { type: 'string', required: true }, next_actions: { type: 'array', required: true, items: { type: 'string' } }, confidence: { type: 'number', required: true }, child_session_id: { type: 'string', required: true } } },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     isConcurrencySafe: () => false,
@@ -68,8 +88,14 @@ export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
       manualCalls.set(sessionId, count + 1)
       try {
         const transcript = recentSessionContext(exec.agent, Math.floor(config.maxInputBytes * 0.65))
-        return advisorToolResult(await callAdvisor(ctx, config, manualPrompt({ goal: args.goal, question: args.question, attempts: args.attempts ?? '', context: args.context ?? '', transcript }), exec.signal))
-      } catch (error) { const message = error instanceof Error ? error.message : String(error); logger.warn(`manual advisor call failed: ${message}`); return unavailable(message) }
+        const policy = effectiveAdvisorPolicy(config, exec.agent.session)
+        const answer = await callAdvisor(ctx, config, exec.agent, manualPrompt({ goal: args.goal, question: args.question, attempts: args.attempts ?? '', context: args.context ?? '', transcript }), exec.signal, policy, 'Advisor · manual')
+        return advisorToolResult(answer.verdict, answer.childSessionId)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.warn(`manual advisor call failed: ${message}`)
+        return unavailable(message)
+      }
     },
   }))
 
@@ -82,34 +108,51 @@ export function apply(ctx: Context, entryConfig: AdvisorConfig): void {
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }): Promise<void> => {
     const config = currentConfig()
     if (!config.enabled || !isRootAgent(agent) || !routeConfigured(config) || config.mode === 'manual') return
+    const policy = effectiveAdvisorPolicy(config, agent.session)
+
     if (config.mode === 'continuous') {
       if (!tracker.markContinuousReview(agent.session.id, turn)) return
-      try {
-        const verdict = await callAdvisor(ctx, config, continuousPrompt(recentSessionContext(agent, config.maxInputBytes)), signal)
-        if (verdict.severity === 'none') return
+      const review = async (runSignal: AbortSignal): Promise<void> => {
+        const answer = await callAdvisor(ctx, config, agent, continuousPrompt(recentSessionContext(agent, config.maxInputBytes)), runSignal, policy, `Advisor · continuous · turn ${turn}`)
+        const verdict = answer.verdict
+        if (verdict.severity === 'none' || ctx.agents.get(agent.id) !== agent) return
         if (severityRank(verdict.severity) < severityRank(config.continuousMinSeverity)) {
-          if (config.injectNits) agent.inject(createUserMessage({ content: [{ type: 'text', text: adviceMessage(verdict, 'continuous review') }], source: { kind: 'plugin', plugin: name } }))
+          if (config.injectNits) agent.inject(createUserMessage({ content: [{ type: 'text', text: adviceMessage(verdict, 'continuous review', answer.childSessionId) }], source: { kind: 'plugin', plugin: name } }))
           return
         }
-        agent.steer(createUserMessage({ content: [{ type: 'text', text: adviceMessage(verdict, 'continuous review') }], source: { kind: 'plugin', plugin: name } }))
-      } catch (error) { logger.warn(`continuous advisor review failed: ${error instanceof Error ? error.message : String(error)}`) }
+        agent.steer(createUserMessage({ content: [{ type: 'text', text: adviceMessage(verdict, 'continuous review', answer.childSessionId) }], source: { kind: 'plugin', plugin: name } }))
+      }
+      if (policy.continuousWait === 'background') launchBackground(agent, review)
+      else {
+        try { await review(signal) }
+        catch (error) { logger.warn(`continuous advisor review failed: ${error instanceof Error ? error.message : String(error)}`) }
+      }
       return
     }
 
     const decision = tracker.decision(agent.session.id, turn, config)
     if (!decision.shouldConsult) return
-    // Claim before sending. If the transport fails after request dispatch, automatically
-    // retrying the same fingerprint could duplicate strong-model cost with ambiguous delivery.
     tracker.markAutoConsult(agent.session.id, turn, decision.problemFingerprint)
-    try {
-      const verdict = await callAdvisor(ctx, config, escalationPrompt(decision.score, decision.signals, recentSessionContext(agent, config.maxInputBytes)), signal)
+    const review = async (runSignal: AbortSignal): Promise<void> => {
+      const answer = await callAdvisor(ctx, config, agent, escalationPrompt(decision.score, decision.signals, recentSessionContext(agent, config.maxInputBytes)), runSignal, policy, `Advisor · escalation · turn ${turn}`)
       tracker.noteProgress(agent.session.id)
-      if (verdict.severity !== 'none') agent.steer(createUserMessage({ content: [{ type: 'text', text: adviceMessage(verdict, 'automatic escalation') }], source: { kind: 'plugin', plugin: name } }))
-    } catch (error) { const message = error instanceof AdvisorUnavailableError ? error.message : error instanceof Error ? error.message : String(error); logger.warn(`automatic advisor escalation failed: ${message}`) }
+      if (answer.verdict.severity !== 'none' && ctx.agents.get(agent.id) === agent) agent.steer(createUserMessage({ content: [{ type: 'text', text: adviceMessage(answer.verdict, 'automatic escalation', answer.childSessionId) }], source: { kind: 'plugin', plugin: name } }))
+    }
+    if (policy.escalationWait === 'background') launchBackground(agent, review)
+    else {
+      try { await review(signal) }
+      catch (error) {
+        const message = error instanceof AdvisorUnavailableError ? error.message : error instanceof Error ? error.message : String(error)
+        logger.warn(`automatic advisor escalation failed: ${message}`)
+      }
+    }
   })
 
   ctx.on('agent/disposed', ({ agent }) => {
     tracker.clear(agent.session.id)
     manualCalls.delete(agent.session.id)
+    const controllers = backgroundControllers.get(agent.session.id)
+    if (controllers) for (const controller of controllers) controller.abort(new Error('parent agent disposed'))
+    backgroundControllers.delete(agent.session.id)
   })
 }

@@ -1,15 +1,12 @@
 {
   "name": "dsh-escalation-advisor",
-  "version": "0.1.0-alpha.1",
-  "description": "Three-mode advisor plugin for DeepSeek Harness: manual second opinion, automatic escalation, and continuous shadow review.",
+  "version": "0.1.0-alpha.2",
+  "description": "Three-mode visible-session advisor plugin for DeepSeek Harness with configurable tool permissions and escalation behavior.",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
-    },
+    ".": { "types": "./lib/index.d.ts", "default": "./lib/index.js" },
     "./client": "./client/index.js",
     "./package.json": "./package.json"
   },
@@ -25,15 +22,18 @@
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
-      "inject": ["@deepseek-ai/dsh-client-ui-settings-plugins"],
+      "inject": ["@deepseek-ai/dsh-client-ui-settings-plugins", "@deepseek-ai/dsh-client-ui-commands", "@deepseek-ai/dsh-client-ui-session"],
       "platform": "web"
     }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-agent": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
+    "@deepseek-ai/dsh-commands": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
     "@deepseek-ai/dsh-llm": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
+    "@deepseek-ai/dsh-session": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
     "@deepseek-ai/dsh-settings": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
+    "@deepseek-ai/dsh-subagent": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
     "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1",
     "@deepseek-ai/dsh-tools": "0.1.2-rc.1 || 0.1.3-alpha.2 || 0.1.5-alpha.1"
   },
@@ -41,8 +41,11 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-commands": "0.1.2-rc.1",
     "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.2-rc.1",
     "@deepseek-ai/dsh-settings": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subagent": "0.1.2-rc.1",
     "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1",
     "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
     "@types/node": "^24.0.0",
@@ -50,7 +53,7 @@
     "vitest": "^3.2.0"
   },
   "engines": { "node": "^22.19.0 || >=24.2.0" },
-  "keywords": ["dsh-plugin", "deepseek-harness", "advisor", "escalation", "second-opinion", "shadow-reviewer"],
+  "keywords": ["dsh-plugin", "deepseek-harness", "advisor", "escalation", "second-opinion", "shadow-reviewer", "subagent"],
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/zhangqian98/dsh-escalation-advisor.git" }
 }
