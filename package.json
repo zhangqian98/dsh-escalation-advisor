@@ -1,7 +1,7 @@
 {
   "name": "dsh-escalation-advisor",
-  "version": "0.1.0-alpha.2",
-  "description": "Three-mode visible-session advisor plugin for DeepSeek Harness with configurable tool permissions and escalation behavior.",
+  "version": "0.1.0-alpha.3",
+  "description": "Three-mode visible-session advisor plugin for DeepSeek Harness with configurable tool permissions, local-subagent coverage, and task-tree budgets.",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -10,7 +10,7 @@
     "./client": "./client/index.js",
     "./package.json": "./package.json"
   },
-  "files": ["lib", "client", "cordis.patch.yml", "README.md", "LICENSE"],
+  "files": ["lib", "client", "cordis.patch.yml", "README.md", "LICENSE", "DESIGN.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
