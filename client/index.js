@@ -12,6 +12,7 @@ window.__ModuleLoader__.load({
       row: { display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))' },
       toolGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, marginTop: 10 },
       toolToggle: { display: 'flex', alignItems: 'center', gap: 9, padding: '9px 10px', border: '1px solid var(--dsw-alias-border-l2, #ddd)', borderRadius: 8 },
+      coverageGrid: { display: 'grid', gridTemplateColumns: 'minmax(130px,1fr) auto auto', gap: 8, alignItems: 'center', marginTop: 10 },
       headerRoot: { position: 'relative', display: 'inline-flex', alignItems: 'center' },
       headerButton: { cursor: 'pointer', padding: '4px 8px', border: '1px solid var(--dsw-alias-border-l2, #ddd)', borderRadius: 7, background: 'transparent', color: 'inherit', font: 'inherit' },
       panel: { position: 'absolute', right: 0, top: 'calc(100% + 8px)', width: 440, maxWidth: 'min(440px, 88vw)', maxHeight: '70vh', overflow: 'auto', zIndex: 1000, padding: 14, border: '1px solid var(--dsw-alias-border-l2, #ddd)', borderRadius: 12, background: 'var(--dsw-alias-background-l1, #fff)', color: 'var(--dsw-alias-label-primary, inherit)', boxShadow: '0 12px 35px rgba(0,0,0,.18)' },
@@ -72,6 +73,7 @@ window.__ModuleLoader__.load({
       const commonNames = new Set(COMMON_TOOLS.map(([name]) => name))
       const extraDefaultTools = enabledDefaults.filter(name => !commonNames.has(name))
       const field = (label, control, hint) => h('div', { style: { margin: '14px 0' } }, h('label', null, label, control), hint && h('p', { style: css.hint }, hint))
+      const check = (fieldName, label) => h('label', { style: { display: 'inline-flex', gap: 6, alignItems: 'center', justifyContent: 'center' } }, h('input', { type: 'checkbox', checked: !!value[fieldName], disabled, onChange: e => edit(fieldName, e.target.checked) }), label)
       const setDefaultTool = (name, on) => edit('defaultEnabledTools', on ? uniqueTools([...enabledDefaults, name]) : enabledDefaults.filter(item => item !== name))
       const save = async () => {
         if (saveDisabled) return
@@ -86,8 +88,8 @@ window.__ModuleLoader__.load({
 
       return h('li', { style: css.card, 'data-escalation-advisor-settings': true },
         h('h3', { style: { margin: '2px 0 8px' } }, 'DSH Escalation Advisor'),
-        h('p', { style: { margin: '6px 0', lineHeight: 1.6 } }, 'Advisor 以可查看的 DSH 子会话运行。这里配置模型、全局默认工具开关和等待策略。'),
-        h('p', { style: css.hint }, '工具权限是“默认开/默认关”。当前会话可在标题栏 Advisor 面板逐个覆盖；未出现在默认开启名单中的任何工具都默认关闭。'),
+        h('p', { style: { margin: '6px 0', lineHeight: 1.6 } }, 'Advisor 以可查看的 DSH 子会话运行。这里配置模型、覆盖范围、全局默认工具开关和等待策略。'),
+        h('p', { style: css.hint }, '工具权限是“默认开/默认关”。当前 root 会话可在标题栏 Advisor 面板逐个覆盖；本地 subagent 只能在 root 允许范围与自身实际可见工具的交集中使用 Advisor 工具。'),
         h('label', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 14 } }, h('input', { type: 'checkbox', checked: value.enabled, disabled, onChange: e => edit('enabled', e.target.checked) }), '启用 Advisor'),
         field('模式', h('select', { style: css.control, value: value.mode, disabled, onChange: e => edit('mode', e.target.value) }, h('option', { value: 'manual' }, 'manual'), h('option', { value: 'escalate' }, 'escalate（推荐）'), h('option', { value: 'continuous' }, 'continuous'))),
         h('div', { style: css.row },
@@ -96,8 +98,18 @@ window.__ModuleLoader__.load({
         customModel && field('模型 ID', h('input', { type: 'text', style: css.control, value: value.model, disabled, onChange: e => edit('model', e.target.value) })),
 
         h('div', { style: { marginTop: 18 } },
+          h('strong', null, 'Agent 覆盖范围'),
+          h('p', { style: css.hint }, 'Manual 与自动 escalation 默认覆盖主 agent 和本地 DSH subagent；Continuous 默认只审主 agent，避免 N 个 worker 各自持续调用强模型。Advisor 自己永远不递归。'),
+          h('div', { style: css.coverageGrid },
+            h('strong', null, '模式'), h('strong', { style: { textAlign: 'center' } }, '主 agent'), h('strong', { style: { textAlign: 'center' } }, '本地 subagent'),
+            h('span', null, 'Manual consultation'), check('manualMainAgent', '开'), check('manualLocalSubagents', '开'),
+            h('span', null, 'Automatic escalation'), check('escalationMainAgent', '开'), check('escalationLocalSubagents', '开'),
+            h('span', null, 'Continuous review'), check('continuousMainAgent', '开'), check('continuousLocalSubagents', '开')),
+          h('p', { style: css.hint }, '本地 subagent 的自动 escalation / continuous 一旦启用会强制等待 Advisor 完成，避免 one-shot worker 先把旧结果交回父 agent。')),
+
+        h('div', { style: { marginTop: 18 } },
           h('strong', null, '全局默认工具开关'),
-          h('p', { style: css.hint }, '推荐只默认开启明确的检查能力。写文件、shell、MCP/插件工具默认保持关闭；它们可以在具体会话里临时打开。'),
+          h('p', { style: css.hint }, '推荐只默认开启明确的检查能力。写文件、shell、MCP/插件工具默认保持关闭；它们可以在具体 root 会话里临时打开。'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             h('button', { type: 'button', style: css.button, disabled, onClick: () => edit('defaultEnabledTools', SAFE_DEFAULTS) }, '恢复安全默认'),
             h('button', { type: 'button', style: css.button, disabled, onClick: () => edit('defaultEnabledTools', uniqueTools([...SAFE_DEFAULTS, 'web_search', 'web_fetch'])) }, '检查 + 联网'),
@@ -109,17 +121,19 @@ window.__ModuleLoader__.load({
           field('其它默认开启工具', h('input', { type: 'text', style: css.control, value: extraDefaultTools.join(', '), disabled, placeholder: 'mcp__server__tool, custom_tool', onChange: e => edit('defaultEnabledTools', uniqueTools([...enabledDefaults.filter(name => commonNames.has(name)), ...e.target.value.split(/[\s,]+/)])) }), '用于 MCP 或其它插件工具的精确名称。没有显式加入这里的未知工具默认关闭。')),
 
         h('div', { style: css.row },
-          field('自动 escalation', h('select', { style: css.control, value: value.escalationWait, disabled, onChange: e => edit('escalationWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
-          field('Continuous review', h('select', { style: css.control, value: value.continuousWait, disabled, onChange: e => edit('continuousWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label))))),
-        h('details', { style: { marginTop: 18 } }, h('summary', { style: { cursor: 'pointer', fontWeight: 600 } }, '成本与阈值'),
+          field('主 agent 自动 escalation', h('select', { style: css.control, value: value.escalationWait, disabled, onChange: e => edit('escalationWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
+          field('主 agent Continuous review', h('select', { style: css.control, value: value.continuousWait, disabled, onChange: e => edit('continuousWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label))))),
+        h('details', { style: { marginTop: 18 } }, h('summary', { style: { cursor: 'pointer', fontWeight: 600 } }, '成本、预算与阈值'),
           h('div', { style: css.row },
-            field('手动咨询 / session', h('input', { type: 'number', min: 0, max: 100, style: css.control, value: value.maxManualConsultsPerSession, disabled, onChange: e => edit('maxManualConsultsPerSession', Number(e.target.value)) })),
+            field('手动咨询 / agent', h('input', { type: 'number', min: 0, max: 100, style: css.control, value: value.maxManualConsultsPerSession, disabled, onChange: e => edit('maxManualConsultsPerSession', Number(e.target.value)) })),
+            field('Task-tree 顾问总预算', h('input', { type: 'number', min: 0, max: 1000, style: css.control, value: value.maxAdvisorConsultsPerTask, disabled, onChange: e => edit('maxAdvisorConsultsPerTask', Number(e.target.value)) })),
+            field('Task-tree 最大并发', h('input', { type: 'number', min: 1, max: 32, style: css.control, value: value.maxConcurrentAdvisorRuns, disabled, onChange: e => edit('maxConcurrentAdvisorRuns', Number(e.target.value)) })),
             field('自动升级阈值', h('input', { type: 'number', min: 1, max: 100, style: css.control, value: value.scoreThreshold, disabled, onChange: e => edit('scoreThreshold', Number(e.target.value)) })),
             field('顾问最大输出 tokens', h('input', { type: 'number', min: 128, max: 32768, style: css.control, value: value.maxOutputTokens, disabled, onChange: e => edit('maxOutputTokens', Number(e.target.value)) })))),
         h('button', { type: 'button', style: css.button, disabled: catalog.status === 'loading', onClick: () => setReload(n => n + 1) }, catalog.status === 'loading' ? '正在读取模型列表…' : '刷新模型列表'),
         catalog.status === 'error' && h('p', { style: css.hint }, '模型目录读取失败；请先确认 DSH Models 可用。'),
         catalog.partial && h('p', { style: css.hint }, '部分 provider 未完整返回模型目录，可手动填写模型 ID。'),
-        h('p', { style: css.hint }, '当前会话标题栏的 Advisor 面板会枚举该会话实际可见的全部工具，并可逐个覆盖这里的默认开关。'),
+        h('p', { style: css.hint }, '当前 root 会话标题栏的 Advisor 面板会枚举该会话实际可见的全部工具，并可逐个覆盖这里的默认开关。覆盖作为整棵本地 agent 树的权限 ceiling。'),
         conflicted && h('p', { role: 'alert', style: css.hint }, '设置已被其他页面修改，请放弃草稿后重试。'), notice && h('p', { role: 'status', style: css.hint }, notice),
         h('div', { style: { display: 'flex', gap: 10 } }, h('button', { type: 'button', style: { ...css.button, opacity: saveDisabled ? 0.55 : 1 }, disabled: saveDisabled, onClick: () => { void save() } }, saving ? '保存中…' : '保存'), h('button', { type: 'button', style: css.button, disabled: saving || !draft, onClick: () => { setDraft(null); setManualModel(false); setNotice('') } }, '放弃修改')))
     }
@@ -144,13 +158,15 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState('')
       const [query, setQuery] = React.useState('')
       const root = React.useRef(null)
+      const isSubagent = ctx.sessions.subagentAddress(sessionId) !== undefined
 
       const load = React.useCallback(async () => {
+        if (isSubagent) return
         setError('')
         try { setCatalog(parseCatalog(await runCommand(ctx, sessionId, '/advisor catalog'))) }
         catch (err) { setError(err instanceof Error ? err.message : String(err)) }
-      }, [ctx, sessionId])
-      React.useEffect(() => { if (open) void load() }, [open, load])
+      }, [ctx, sessionId, isSubagent])
+      React.useEffect(() => { if (open && !isSubagent) void load() }, [open, load, isSubagent])
       React.useEffect(() => {
         if (!open) return
         const close = event => { if (root.current && !root.current.contains(event.target)) setOpen(false) }
@@ -158,6 +174,7 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('pointerdown', close)
       }, [open])
 
+      if (isSubagent) return null
       const mutate = async (key, line) => {
         setBusy(key); setError('')
         try { setCatalog(parseCatalog(await runCommand(ctx, sessionId, line))) }
@@ -171,14 +188,14 @@ window.__ModuleLoader__.load({
         h('button', { type: 'button', style: css.headerButton, 'aria-expanded': open, onClick: () => setOpen(v => !v) }, catalog ? `Advisor · ${enabledCount}` : 'Advisor'),
         open && h('div', { style: css.panel },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
-            h('strong', null, 'Advisor 权限 · 当前会话'),
+            h('strong', null, 'Advisor 权限 · 当前 root 会话'),
             h('button', { type: 'button', style: css.mini, disabled: !!busy, onClick: () => mutate('reset', '/advisor reset').then(load) }, '全部恢复默认')),
-          h('p', { style: css.hint }, '默认关闭的工具可以在这里临时打开；默认开启的也可以关闭。只影响这个主会话创建的 Advisor。'),
+          h('p', { style: css.hint }, '这个 allowlist 是整棵本地 agent 树的上限。subagent 还必须自己能看到对应工具，Advisor 才能使用。'),
           error && h('p', { role: 'alert', style: { ...css.hint, color: 'var(--dsw-alias-label-error, #b42318)' } }, error),
           catalog && h(React.Fragment, null,
             h('div', { style: css.row },
-              h('label', null, 'Escalation', h('select', { style: css.control, value: catalog.escalationWaitOverride ?? 'inherit', disabled: !!busy, onChange: e => mutate('wait-e', `/advisor-escalation-wait ${e.target.value}`) }, h('option', { value: 'inherit' }, `跟随默认 (${catalog.escalationWait})`), h('option', { value: 'block' }, '阻塞主会话'), h('option', { value: 'background' }, '后台运行'))),
-              h('label', null, 'Continuous', h('select', { style: css.control, value: catalog.continuousWaitOverride ?? 'inherit', disabled: !!busy, onChange: e => mutate('wait-c', `/advisor-continuous-wait ${e.target.value}`) }, h('option', { value: 'inherit' }, `跟随默认 (${catalog.continuousWait})`), h('option', { value: 'block' }, '阻塞主会话'), h('option', { value: 'background' }, '后台运行')))),
+              h('label', null, 'Root escalation', h('select', { style: css.control, value: catalog.escalationWaitOverride ?? 'inherit', disabled: !!busy, onChange: e => mutate('wait-e', `/advisor-escalation-wait ${e.target.value}`) }, h('option', { value: 'inherit' }, `跟随默认 (${catalog.escalationWait})`), h('option', { value: 'block' }, '阻塞主会话'), h('option', { value: 'background' }, '后台运行'))),
+              h('label', null, 'Root continuous', h('select', { style: css.control, value: catalog.continuousWaitOverride ?? 'inherit', disabled: !!busy, onChange: e => mutate('wait-c', `/advisor-continuous-wait ${e.target.value}`) }, h('option', { value: 'inherit' }, `跟随默认 (${catalog.continuousWait})`), h('option', { value: 'block' }, '阻塞主会话'), h('option', { value: 'background' }, '后台运行')))),
             h('input', { type: 'search', style: css.control, placeholder: `搜索 ${catalog.tools.length} 个工具…`, value: query, onChange: e => setQuery(e.target.value) }),
             h('div', { style: { marginTop: 8 } }, ...tools.map(tool => {
               const overridden = tool.override !== 'inherit'
@@ -197,7 +214,7 @@ window.__ModuleLoader__.load({
       const sessionFor = session => ctx.sessions.binding(session.sessionId)?.session
       const decorate = (name, options) => ctx.effect(() => command.decorate({
         name,
-        available: () => true,
+        available: session => ctx.sessions.subagentAddress(session.sessionId) === undefined,
         ui: {
           kind: 'popupSelect',
           options: () => Promise.resolve(options.map(([id, label]) => ({ id, label }))),

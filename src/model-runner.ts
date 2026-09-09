@@ -30,7 +30,7 @@ export interface AdvisorRunResult {
   childSessionId: string
 }
 
-/** Run one visible one-shot DSH child. The child owns its transcript and tool calls. */
+/** Run one visible one-shot DSH child beneath the exact requesting agent. */
 export async function callAdvisor(
   ctx: Context,
   config: Config,
@@ -44,11 +44,14 @@ export async function callAdvisor(
   const subagents = parent.ctx.get('subagents') ?? ctx.get('subagents')
   if (!subagents) throw new AdvisorUnavailableError('DSH subagent runtime is unavailable for this session.', 'subagents_unavailable')
 
+  // Root/task policy is a ceiling; the requesting agent's actual tool surface is
+  // the second half of the intersection. A subagent therefore cannot borrow an
+  // Advisor to reach a tool it could not itself see.
   const visible = new Set(ctx.tools.schemas(parent).map(tool => tool.name))
   const requestedTools = policy.allowedTools.filter(name => name !== 'consult_advisor')
   const allowedTools = requestedTools.filter(name => visible.has(name))
   const unavailableTools = requestedTools.filter(name => !visible.has(name))
-  const toolPolicyNote = `\n\nADVISOR TOOL POLICY:\nExposed: ${allowedTools.length ? allowedTools.join(', ') : '(none)'}\nRequested but unavailable in the parent DSH tool surface: ${unavailableTools.length ? unavailableTools.join(', ') : '(none)'}. Do not claim to have used unavailable tools.`
+  const toolPolicyNote = `\n\nADVISOR TOOL POLICY:\nExposed: ${allowedTools.length ? allowedTools.join(', ') : '(none)'}\nRequested by the root Advisor policy but unavailable in the requesting agent's DSH tool surface: ${unavailableTools.length ? unavailableTools.join(', ') : '(none)'}. Do not claim to have used unavailable tools.`
   const boundedPrompt = truncateUtf8(redactSecrets(prompt + toolPolicyNote), config.maxInputBytes)
   const callSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
   let run
@@ -60,7 +63,10 @@ export async function callAdvisor(
       signal: callSignal,
       agentOptions: { provider: config.provider.trim(), model: config.model.trim(), maxTokens: config.maxOutputTokens },
       outputSchema: VERDICT_SCHEMA,
-      maxDepth: 1,
+      // Do not impose a fixed absolute maxDepth here: a requester can itself be
+      // a local subagent. Advisor recursion is prevented by this plugin's role
+      // guard; any ordinary subagent tool explicitly exposed to the Advisor
+      // continues to enforce its own DSH depth policy.
       toolFilter: { allow: allowedTools },
       persona: ADVISOR_SYSTEM_PROMPT,
     })
