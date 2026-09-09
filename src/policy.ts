@@ -158,7 +158,7 @@ function registerPolicyCommands(commandCtx: Context, currentConfig: () => Config
       const input = rawInput.trim()
       if (input === 'reset') {
         append(agent.session, { allowTools: [], denyTools: [], escalationWait: INHERIT, continuousWait: INHERIT })
-        return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
+        return { kind: 'success' as const, text: JSON.stringify(catalogFor(currentConfig(), agent)) }
       }
       if (input === 'catalog') return { kind: 'success' as const, text: JSON.stringify(catalogFor(currentConfig(), agent)) }
       if (input) return { kind: 'error' as const, text: 'Expected /advisor, /advisor catalog, or /advisor reset.' }
