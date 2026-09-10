@@ -259,4 +259,66 @@ describe('buildCasePacket', () => {
     expect(review.meaningful).toBe(false)
     expect(packet.tool_activity[0].outcome).toBe('result-not-observed')
   })
+  it('bounds a long delta while keeping trigger-related and failing checks in order', () => {
+    const events: FakeEvent[] = [user(0, 'Harden the migration')]
+    let seq = 1
+    for (let index = 0; index < 30; index++) {
+      events.push(call(seq++, 'ok-' + index, 'exec_command', { cmd: 'npm test suite-' + index }))
+      events.push(result(seq++, 'ok-' + index, 'green'))
+    }
+    events.push(call(seq++, 'related', 'exec_command', { cmd: 'npm test auth' }))
+    events.push(result(seq++, 'related', 'auth assertion failed', true))
+    for (let index = 0; index < 4; index++) {
+      events.push(call(seq++, 'bad-' + index, 'exec_command', { cmd: 'npm test broken-' + index }))
+      events.push(result(seq++, 'bad-' + index, 'failed', true))
+    }
+    const root = fakeAgent('root', events)
+    const packet = JSON.parse(buildCasePacket({
+      ...baseInput(root, root),
+      mode: 'escalation',
+      trigger: { turn: 3, score: 6, shouldConsult: true, problemFingerprint: 'fp', signals: [{ kind: 'nonzero-exit', weight: 1, fingerprint: 'fp', detail: 'auth failed', validationKey: 'auth-test' }] },
+      observedEvidence: [{ callId: 'related', tool: 'exec_command', argumentsSummary: 'npm test auth', outcome: 'validation-failure', errorSummary: 'auth assertion failed', repeatCount: 1, validationKey: 'auth-test' }],
+    }).prompt)
+    expect(packet.validation.map((entry: { call_id: string }) => entry.call_id))
+      .toEqual(['ok-28', 'ok-29', 'related', 'bad-0', 'bad-1', 'bad-2', 'bad-3'])
+    expect(packet.validation[2]).toMatchObject({ relevant_to_problem: true, outcome: 'failed' })
+    // The caps drop rows, so the aggregate has to carry the count the advisor
+    // would otherwise lose.
+    expect(packet.validation_summary).toEqual({ total: 35, retained: 7, omitted: 28, succeeded: 30, failed: 5, other: 0, relevant: 1 })
+  })
+
+  it('keeps only the newest failures and never a stale successful backlog', () => {
+    const events: FakeEvent[] = [user(0, 'Stop the flaky suite')]
+    let seq = 1
+    for (let index = 0; index < 12; index++) {
+      events.push(call(seq++, 'bad-' + index, 'exec_command', { cmd: 'npm test flaky-' + index }))
+      events.push(result(seq++, 'bad-' + index, 'flaky failure', true))
+    }
+    const root = fakeAgent('root', events)
+    const packet = JSON.parse(buildCasePacket(baseInput(root, root)).prompt)
+    expect(packet.failures.map((entry: { call_id: string }) => entry.call_id))
+      .toEqual(['bad-4', 'bad-5', 'bad-6', 'bad-7', 'bad-8', 'bad-9', 'bad-10', 'bad-11'])
+    expect(packet.validation).toHaveLength(10)
+    expect(packet.validation_summary).toMatchObject({ total: 12, retained: 10, omitted: 2, succeeded: 0, failed: 12, other: 0, relevant: 0 })
+  })
+  it('keeps a trigger-related failure that predates eight unrelated ones', () => {
+    const events: FakeEvent[] = [user(0, 'Fix the auth regression')]
+    let seq = 1
+    events.push(call(seq++, 'auth-dead', 'exec_command', { cmd: 'npm test auth' }))
+    events.push(result(seq++, 'auth-dead', 'auth assertion failed', true))
+    for (let index = 0; index < 9; index++) {
+      events.push(call(seq++, 'noise-' + index, 'exec_command', { cmd: 'npm test unrelated-' + index }))
+      events.push(result(seq++, 'noise-' + index, 'unrelated failure', true))
+    }
+    const root = fakeAgent('root', events)
+    const packet = JSON.parse(buildCasePacket({
+      ...baseInput(root, root),
+      mode: 'escalation',
+      trigger: { turn: 3, score: 6, shouldConsult: true, problemFingerprint: 'fp', signals: [{ kind: 'nonzero-exit', weight: 1, fingerprint: 'fp', detail: 'auth failed', validationKey: 'auth-test' }] },
+      observedEvidence: [{ callId: 'auth-dead', tool: 'exec_command', argumentsSummary: 'npm test auth', outcome: 'validation-failure', errorSummary: 'auth assertion failed', repeatCount: 3, validationKey: 'auth-test' }],
+    }).prompt)
+    expect(packet.failures.map((entry: { call_id: string }) => entry.call_id))
+      .toEqual(['auth-dead', 'noise-2', 'noise-3', 'noise-4', 'noise-5', 'noise-6', 'noise-7', 'noise-8'])
+    expect(packet.failures[0]).toMatchObject({ call_id: 'auth-dead', repeat_count: 3, tool: 'exec_command' })
+  })
 })

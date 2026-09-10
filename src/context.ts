@@ -191,6 +191,50 @@ function redactValue(value: unknown): unknown {
   return Object.fromEntries(Object.entries(object).map(([key, child]) => [key, redactValue(child)]))
 }
 
+// A packet only spans the current task delta, but escalation has no review
+// cursor, so that delta keeps growing for as long as the task does. These caps
+// keep the evidence proportional to what still needs a decision. A recorded
+// packet from one long task carried 204 validation rows (182 KB), of which 203
+// had succeeded and none matched the trigger, while tool_activity already
+// summarizes the most recent calls with their outcomes.
+const MAX_VALIDATION_ENTRIES = 10
+const VALIDATION_SUCCESS_CONTEXT = 2
+const MAX_FAILURES = 8
+
+/**
+ * Keeps every failed or trigger-related check plus the most recent successful
+ * ones, in the original chronological order. The same rule applies to short and
+ * long deltas, so a packet never depends on how far the task has progressed.
+ */
+function boundedValidation<T extends { outcome: string; relevant_to_problem: boolean }>(entries: readonly T[]): T[] {
+  const related: number[] = []
+  const failed: number[] = []
+  const successful: number[] = []
+  entries.forEach((entry, index) => {
+    if (entry.relevant_to_problem) related.push(index)
+    else if (entry.outcome === 'succeeded') successful.push(index)
+    else failed.push(index)
+  })
+  // A trigger-related check is the reason the consultation exists, so the cap
+  // never evicts one. The remaining budget goes to the newest failures and then
+  // to a short tail of successful checks.
+  const keptRelated = related.slice(-MAX_VALIDATION_ENTRIES)
+  const keptFailed = failed.slice(-Math.max(0, MAX_VALIDATION_ENTRIES - keptRelated.length))
+  const room = Math.max(0, MAX_VALIDATION_ENTRIES - keptRelated.length - keptFailed.length)
+  const keptSuccessful = successful.slice(-Math.min(VALIDATION_SUCCESS_CONTEXT, room))
+  return [...keptRelated, ...keptFailed, ...keptSuccessful].sort((left, right) => left - right).map(index => entries[index]!)
+}
+
+/** Pinned entries plus the newest of the rest, in the original chronological order. */
+function boundedEvidence<T>(entries: readonly T[], pin: (entry: T) => boolean, limit: number): T[] {
+  const pinned: number[] = []
+  const rest: number[] = []
+  entries.forEach((entry, index) => (pin(entry) ? pinned : rest).push(index))
+  const keptPinned = pinned.slice(-limit)
+  const keptRest = rest.slice(-Math.max(0, limit - keptPinned.length))
+  return [...keptPinned, ...keptRest].sort((left, right) => left - right).map(index => entries[index]!)
+}
+
 export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
   const requesterEvents = eventsOf(input.requester)
   const rootEvents = sessionId(input.requester) === sessionId(input.root) ? requesterEvents : eventsOf(input.root)
@@ -245,6 +289,13 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
       : text
   }
   const observed = new Map((input.observedEvidence ?? input.trigger?.evidence ?? []).filter(item => item.callId).map(item => [item.callId, item]))
+  // Tracker evidence ties a call to the trigger through its validation key. That
+  // link is what the consultation is about, so it survives every cap below.
+  const triggerKeys = new Set((input.trigger?.signals ?? []).flatMap(signal => signal.validationKey === undefined ? [] : [signal.validationKey]))
+  const triggerRelated = (callId: string): boolean => {
+    const key = observed.get(callId)?.validationKey
+    return key !== undefined && triggerKeys.has(key)
+  }
   const activity = [...callById.entries()]
     .filter(([callId, call]) => deltaSeqs.has(eventSeq(call.event))
       || (resultById.get(callId) !== undefined && deltaSeqs.has(eventSeq(resultById.get(callId)!.event))))
@@ -263,8 +314,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
         }),
       }
     })
-  const failures = activity
-    .filter(item => item.outcome === 'failed')
+  const failures = boundedEvidence(activity.filter(item => item.outcome === 'failed'), item => triggerRelated(item.call_id), MAX_FAILURES)
     .map(item => ({
       tool: item.tool,
       arguments_summary: item.arguments_summary,
@@ -272,17 +322,31 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
        repeat_count: observed.get(item.call_id)?.repeatCount ?? 1,
       call_id: item.call_id,
     }))
-  const validation = activity.flatMap(item => {
+  const validationEvidence = activity.flatMap(item => {
     const call = callById.get(item.call_id)
     const label = call && validationLabel(call.name, call.args)
     if (!label || item.outcome === 'result-not-observed') return []
     return [{
       command_or_tool: label,
       outcome: item.outcome,
-      relevant_to_problem: observed.get(item.call_id)?.validationKey !== undefined && (input.trigger?.signals.some(signal => signal.validationKey === observed.get(item.call_id)?.validationKey) ?? false),
+      relevant_to_problem: triggerRelated(item.call_id),
       call_id: item.call_id,
     }]
   })
+  const validation = boundedValidation(validationEvidence)
+  // The caps drop rows, so the aggregate keeps the count the advisor would
+  // otherwise lose: two unrelated successes and two hundred look identical.
+  const succeededChecks = validationEvidence.filter(entry => entry.outcome === 'succeeded').length
+  const failedChecks = validationEvidence.filter(entry => entry.outcome === 'failed').length
+  const validationSummary = {
+    total: validationEvidence.length,
+    retained: validation.length,
+    omitted: validationEvidence.length - validation.length,
+    succeeded: succeededChecks,
+    failed: failedChecks,
+    other: validationEvidence.length - succeededChecks - failedChecks,
+    relevant: validationEvidence.filter(entry => entry.relevant_to_problem).length,
+  }
   const changedPaths = unique(activity.flatMap(item => {
     const call = callById.get(item.call_id)
     return call && item.outcome === 'succeeded' && MUTATION_TOOL.test(call.name) ? collectPaths(call.args) : []
@@ -365,6 +429,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     attempts,
     failures,
     validation,
+    validation_summary: validationSummary,
     workspace: {
       observed_changed_paths: changedPaths,
       relevant_symbols: [] as string[],
