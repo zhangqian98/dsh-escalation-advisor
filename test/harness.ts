@@ -10,13 +10,38 @@ import LlmRuntime, {
   ToolCallId,
   type GenerateOptions,
   type LlmResolvedModelInfo,
+  type MessageId,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId, SessionLogOffset, type SessionEvent } from '@deepseek-ai/dsh-session'
 import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
+import SessionPersistence, {
+  SessionAlreadyExistsError,
+  SessionAlreadyOwnedError,
+  SessionHandleClosedError,
+  SessionPersistenceNotFoundError,
+  SessionPersistenceRevision,
+  SessionReadOnlyError,
+  type SessionAccess,
+  type SessionHandle,
+  type SessionHandleAppendOptions,
+  type SessionHandleFlushOptions,
+  type SessionHandleReadOptions,
+  type SessionHandleReadResult,
+  type SessionHeader,
+  type SessionPersistenceCreateOptions,
+  type SessionPersistenceSnapshot,
+} from '@deepseek-ai/dsh-session-persistence'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SettingsProvider, { type SettingsNamespace } from '@deepseek-ai/dsh-settings'
-import SubagentRuntime, { type SubagentRun, type SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import SubagentRuntime, {
+  finalAssistantOutput,
+  type ContinuableStart,
+  type SubagentInterruptAuthority,
+  type SubagentRun,
+  type SubagentStartRequest,
+} from '@deepseek-ai/dsh-subagent'
+import { queueHostSubagentPrompt, steerHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import * as Spawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -76,6 +101,144 @@ class MemorySettings extends SettingsProvider {
   }
 }
 
+interface MemoryStoredSession {
+  readonly header: SessionHeader
+  readonly inheritedEventCount: SessionLogOffset
+  readonly events: SessionEvent[]
+  revision: number
+  writerOpen: boolean
+}
+
+/** One open channel onto an in-memory stored session. */
+class MemorySessionHandle implements SessionHandle {
+  private closed = false
+
+  constructor(private readonly record: MemoryStoredSession, readonly access: SessionAccess) {
+    if (access === 'write') record.writerOpen = true
+  }
+
+  get id(): SessionId {
+    return this.record.header.id
+  }
+
+  get header(): SessionHeader {
+    return this.record.header
+  }
+
+  get inheritedEventCount(): SessionLogOffset {
+    return this.record.inheritedEventCount
+  }
+
+  async read(
+    offset = 0,
+    length?: number,
+    options: SessionHandleReadOptions = {},
+  ): Promise<SessionHandleReadResult> {
+    this.assertOpen('read')
+    options.signal?.throwIfAborted()
+    const end = length === undefined ? this.record.events.length : offset + length
+    return { eventState: 'shared-frozen', events: this.record.events.slice(offset, end) }
+  }
+
+  async append(events: readonly SessionEvent[], options: SessionHandleAppendOptions = {}): Promise<void> {
+    this.assertOpen('append')
+    if (this.access !== 'write') throw new SessionReadOnlyError(this.id, 'append')
+    options.signal?.throwIfAborted()
+    for (const event of events) {
+      if (Number(event.seq) !== this.record.events.length) {
+        throw new Error(`MemorySessionPersistence: non-contiguous append at seq ${String(event.seq)} over ${this.record.events.length} stored events`)
+      }
+      this.record.events.push(event)
+    }
+    this.record.revision += 1
+  }
+
+  async flush(options: SessionHandleFlushOptions = {}): Promise<void> {
+    this.assertOpen('flush')
+    options.signal?.throwIfAborted()
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    if (this.access === 'write') this.record.writerOpen = false
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close()
+  }
+
+  private assertOpen(operation: string): void {
+    if (this.closed) throw new SessionHandleClosedError(this.id, operation)
+  }
+}
+
+/**
+ * In-memory `sessionPersistence` backend.
+ *
+ * Continuable children require the `sessionPersistence` capability, and
+ * `@deepseek-ai/dsh-agent-loop` routes EVERY session creation through it once
+ * it is mounted (`createStoredSession`), so a presence-only service is not an
+ * option: `SessionHandle.append` is on the live publish path and
+ * `AgentLoop.resume` reads through the same handle.
+ *
+ * This backend therefore implements the real contract in memory — contiguous
+ * appends, per-session write ownership, revisioned `stat`/`list`, `read` — and
+ * nothing more. It exists because the durable backends
+ * (`dsh-session-persistence-jsonl`) and the query service cold resume requires
+ * (`dsh-session-query`) are absent from this repository's installed dependency
+ * set; it is honest about what it is, and a passing test can only conclude that
+ * the in-process continuation lifecycle worked, never that storage did.
+ */
+export class MemorySessionPersistence extends SessionPersistence {
+  private readonly stored = new Map<string, MemoryStoredSession>()
+
+  override async create(
+    header: SessionHeader,
+    options: SessionPersistenceCreateOptions = {},
+  ): Promise<SessionHandle> {
+    options.signal?.throwIfAborted()
+    if (this.stored.has(String(header.id))) throw new SessionAlreadyExistsError(header.id)
+    const record: MemoryStoredSession = {
+      header,
+      inheritedEventCount: options.inheritedEventCount ?? SessionLogOffset(0),
+      events: [],
+      revision: 0,
+      writerOpen: false,
+    }
+    this.stored.set(String(header.id), record)
+    return new MemorySessionHandle(record, 'write')
+  }
+
+  override async open(id: SessionId, access: SessionAccess): Promise<SessionHandle> {
+    const record = this.stored.get(String(id))
+    if (record === undefined) throw new SessionPersistenceNotFoundError(id)
+    if (access === 'write' && record.writerOpen) throw new SessionAlreadyOwnedError(id)
+    return new MemorySessionHandle(record, access)
+  }
+
+  override flush(): Promise<void> {
+    return Promise.resolve()
+  }
+
+  override stat(id: SessionId): Promise<SessionPersistenceSnapshot | undefined> {
+    const record = this.stored.get(String(id))
+    return Promise.resolve(record === undefined ? undefined : this.snapshotOf(record))
+  }
+
+  override list(): Promise<readonly SessionPersistenceSnapshot[]> {
+    return Promise.resolve([...this.stored.values()].map(record => this.snapshotOf(record)))
+  }
+
+  private snapshotOf(record: MemoryStoredSession): SessionPersistenceSnapshot {
+    return {
+      header: record.header,
+      revision: SessionPersistenceRevision(`memory-${record.revision}`),
+      eventCount: record.events.length,
+    }
+  }
+}
+
 export const TEST_CONFIG: Config = {
   enabled: true,
   mode: 'manual',
@@ -118,6 +281,16 @@ export interface CreatedAgentRecord {
   disposedEvents?: readonly SessionEvent[]
 }
 
+export interface ContinuableStartOptions {
+  readonly label?: string
+  readonly prompt?: string
+  readonly persona?: string
+  readonly toolFilter?: SubagentStartRequest['toolFilter']
+  readonly model?: string
+  readonly parent?: Agent
+  readonly signal?: AbortSignal
+}
+
 export interface IntegrationHarness {
   readonly ctx: Context
   readonly root: Agent
@@ -130,6 +303,15 @@ export interface IntegrationHarness {
     prompt?: string
     toolFilter?: SubagentStartRequest['toolFilter']
   }): Promise<SubagentRun>
+  /** Start one continuable child and resolve at its initial inbox acceptance. */
+  startContinuableChild(options?: ContinuableStartOptions): Promise<ContinuableStart>
+  /** The live Agent for one durable child id, or `undefined` once it is released. */
+  childAgent(childId: string): Agent | undefined
+  /** Deliver one model-authored message exactly as `ctx.subagents.sendMessage` does (steer). */
+  sendToChild(childId: string, text: string, signal?: AbortSignal): Promise<MessageId>
+  /** Deliver one host-authored message as a distinct queued turn (queue). */
+  queueToChild(childId: string, text: string, signal?: AbortSignal): Promise<MessageId>
+  interruptChild(childId: string, authority?: SubagentInterruptAuthority): void
 }
 
 async function mountInvariants(ctx: Context): Promise<void> {
@@ -139,10 +321,20 @@ async function mountInvariants(ctx: Context): Promise<void> {
   await ctx.plugin(AgentLoopInvariant)
 }
 
+export interface IntegrationHarnessOptions {
+  /**
+   * Mount {@link PresenceOnlySessionPersistence}. Off by default so every
+   * existing test keeps the environment it was written against; continuable
+   * children cannot even be started without it.
+   */
+  readonly sessionPersistence?: boolean
+}
+
 export async function createIntegrationHarness(
   scripts: Record<string, ScriptEntry[]>,
   config: Partial<Config> = {},
   rootOptions: Partial<AgentOptions> = {},
+  options: IntegrationHarnessOptions = {},
 ): Promise<IntegrationHarness> {
   const ctx = new Context()
   const adapter = new ScriptedAdapter(scripts)
@@ -159,6 +351,7 @@ export async function createIntegrationHarness(
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
+  if (options.sessionPersistence === true) await ctx.plugin(MemorySessionPersistence)
   ctx.llm.registerAdapter(['mock'], adapter)
   await ctx.plugin(Advisor, { ...TEST_CONFIG, ...config })
 
@@ -197,6 +390,42 @@ export async function createIntegrationHarness(
         agentOptions: { provider: 'mock', model: options.model ?? 'worker' },
         ...(options.toolFilter === undefined ? {} : { toolFilter: options.toolFilter }),
       })
+    },
+    startContinuableChild(startOptions = {}): Promise<ContinuableStart> {
+      const signal = startOptions.signal ?? new AbortController().signal
+      return ctx.subagents.startContinuable({
+        provider: 'spawn',
+        label: startOptions.label ?? 'Continuable Worker',
+        signal,
+        request: {
+          parent: startOptions.parent ?? root,
+          prompt: [{ type: 'text', text: startOptions.prompt ?? 'Complete the continuable task.' }],
+          agentOptions: { provider: 'mock', model: startOptions.model ?? 'worker' },
+          ...(startOptions.persona === undefined ? {} : { persona: startOptions.persona }),
+          ...(startOptions.toolFilter === undefined ? {} : { toolFilter: startOptions.toolFilter }),
+        },
+      })
+    },
+    childAgent(childId: string): Agent | undefined {
+      return ctx.agents.get(SessionId(childId))
+    },
+    sendToChild(childId: string, text: string, signal?: AbortSignal): Promise<MessageId> {
+      return ctx.subagents.sendMessage(root, SessionId(childId), [{ type: 'text', text }], {
+        signal: signal ?? new AbortController().signal,
+      })
+    },
+    queueToChild(childId: string, text: string, signal?: AbortSignal): Promise<MessageId> {
+      return queueHostSubagentPrompt(
+        ctx.subagents,
+        root,
+        SessionId(childId),
+        [{ type: 'text', text }],
+        { kind: 'plugin', plugin: 'test-harness' },
+        signal ?? new AbortController().signal,
+      )
+    },
+    interruptChild(childId: string, authority?: SubagentInterruptAuthority): void {
+      ctx.subagents.interrupt(SessionId(childId), authority ?? { kind: 'ancestor', agent: root })
     },
   }
 }
@@ -266,10 +495,15 @@ export function requestText(request: GenerateOptions): string {
 }
 
 export function systemPromptOf(request: GenerateOptions): string {
+  // The runtime delivers the composed system prompt on `GenerateOptions.system`
+  // in some versions and as a leading system message in others. Read both so an
+  // assertion about persona or guidance holds on either.
+  const carried = typeof (request as { system?: unknown }).system === 'string' ? String((request as { system?: unknown }).system) : ''
   const first = request.messages[0]
-  return first?.role === 'system'
+  const leading = first?.role === 'system'
     ? first.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
     : ''
+  return carried + leading
 }
 
 export function deferred<T = void>(): {
@@ -289,4 +523,168 @@ export async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Pro
     if (Date.now() >= deadline) throw new Error('Timed out waiting for integration condition')
     await new Promise(resolve => setTimeout(resolve, 5))
   }
+}
+
+/**
+ * One ordered observation of a continuable child's turn. Every detail holds
+ * owned leaf data only: ids, statuses, turn numbers, and reasons — never a live
+ * Agent, Session, or subscriber object.
+ */
+export interface ContinuationTraceEntry {
+  readonly order: number
+  readonly name: string
+  readonly detail: Readonly<Record<string, string | number | boolean>>
+}
+
+const TRACED_SESSION_EVENTS = new Set([
+  'turn/start',
+  'turn/end',
+  'user/message',
+  'assistant/message',
+  'subagent/descriptor',
+])
+
+function sessionEventDetail(event: SessionEvent): Record<string, string | number | boolean> {
+  const data = event.data as { turn?: number; reason?: { kind?: string }; source?: { kind?: string } }
+  return {
+    seq: event.seq,
+    ...(data.turn === undefined ? {} : { turn: data.turn }),
+    ...(data.reason?.kind === undefined ? {} : { reason: data.reason.kind }),
+    ...(data.source?.kind === undefined ? {} : { source: data.source.kind }),
+  }
+}
+
+/**
+ * Recorder for every observable boundary a continuable child crosses, as seen
+ * from a listener registered on the harness's own (unscoped) root context.
+ *
+ * `@deepseek-ai/dsh-scope` admits an untagged listener to every carrier, so
+ * this is exactly the visibility a host-tier plugin has; nothing here is
+ * child-local. Register the recorder before dispatching so no boundary can be
+ * missed, and note that observations that arrive before a dispatch promise
+ * resolves are recorded first, because the trace is append-only over time.
+ */
+export class ContinuationTrace {
+  readonly entries: ContinuationTraceEntry[] = []
+  private order = 0
+
+  constructor(ctx: Context) {
+    ctx.on('agent/created', ({ agent }) => this.push('agent/created', { agent: String(agent.id) }))
+    ctx.on('agent/disposed', ({ agent }) => this.push('agent/disposed', { agent: String(agent.id) }))
+    ctx.on('agent/status', ({ agent, status }) => this.push('agent/status', { agent: String(agent.id), status: String(status) }))
+    ctx.on('agent/inbox/inserted', ({ agent, message }) => this.push('agent/inbox/inserted', {
+      agent: String(agent.id),
+      message: String(message.id),
+      source: String(message.source?.kind ?? ''),
+    }))
+    ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => this.push('agent/inbox/claimed', {
+      agent: String(agent.id),
+      message: String(message.id),
+      turn,
+    }))
+    ctx.on('agent/inbox/discarded', ({ agent, message }) => this.push('agent/inbox/discarded', {
+      agent: String(agent.id),
+      message: String(message.id),
+    }))
+    ctx.on('agent/turn-stopping', ({ agent, turn }) => this.push('agent/turn-stopping', {
+      agent: String(agent.id),
+      turn,
+      turnAlreadyClosed: agent.session.snapshotEvents().some(event =>
+        event.type === 'turn/end' && (event.data as { turn?: number }).turn === turn),
+    }))
+    ctx.on('subagent/start', info => this.push('subagent/start', {
+      id: String(info.id),
+      provider: String(info.provider),
+      local: info.local,
+    }))
+    ctx.on('subagent/end', info => this.push('subagent/end', {
+      id: String(info.id),
+      provider: String(info.provider),
+      stopReason: String(info.stopReason),
+    }))
+    ctx.on('session/event', (session, event) => {
+      if (!TRACED_SESSION_EVENTS.has(String(event.type))) return
+      this.push(`session/${String(event.type)}`, { session: String(session.id), ...sessionEventDetail(event) })
+    })
+  }
+
+  /** Record a caller-side observation (an awaited promise settling) in the same order. */
+  mark(name: string, detail: Record<string, string | number | boolean> = {}): void {
+    this.push(name, detail)
+  }
+
+  private push(name: string, detail: Record<string, string | number | boolean>): void {
+    this.entries.push({ order: ++this.order, name, detail })
+  }
+
+  /** Every recorded boundary in arrival order, for one session id when given. */
+  of(sessionId?: string): readonly ContinuationTraceEntry[] {
+    if (sessionId === undefined) return this.entries
+    return this.entries.filter(entry => entry.detail.session === sessionId || entry.detail.agent === sessionId || entry.detail.id === sessionId)
+  }
+
+  /** One-line rendering of the recorded order, used in failure output and reports. */
+  render(sessionId?: string): string {
+    return this.of(sessionId)
+      .map(({ order, name, detail }) => `${String(order).padStart(3, ' ')} ${name} ${JSON.stringify(detail)}`)
+      .join('\n')
+  }
+
+  /** Position of the first entry matching `name` and every optional detail pair. */
+  position(name: string, detail: Record<string, string | number | boolean> = {}): number {
+    return this.entries.findIndex(entry => entry.name === name &&
+      Object.entries(detail).every(([key, value]) => entry.detail[key] === value))
+  }
+
+  /** All entries matching `name` and every optional detail pair. */
+  all(name: string, detail: Record<string, string | number | boolean> = {}): readonly ContinuationTraceEntry[] {
+    return this.entries.filter(entry => entry.name === name &&
+      Object.entries(detail).every(([key, value]) => entry.detail[key] === value))
+  }
+}
+
+/**
+ * The child's own closing output, selected by the same rule the one-shot
+ * `SubagentResult.output` uses. A fresh continuable child owns every event in
+ * its log, so the whole snapshot is the child-owned suffix.
+ */
+export function childOutputText(agent: Agent): string {
+  return (finalAssistantOutput(agent.session.snapshotEvents()) ?? [])
+    .flatMap(block => block.type === 'text' ? [block.text] : [])
+    .join('')
+}
+
+/** Turn numbers the given session has closed, with each turn's recorded reason. */
+export function closedTurns(agent: Agent): { turn: number; reason: string }[] {
+  return agent.session.snapshotEvents()
+    .filter(event => event.type === 'turn/end')
+    .map(event => {
+      const data = event.data as { turn: number; reason?: { kind?: string } }
+      return { turn: data.turn, reason: String(data.reason?.kind ?? '') }
+    })
+}
+
+/**
+ * Await the child's own `turn/end` for one specific claimed turn — the
+ * settlement boundary a delivered message is actually attributable to. The
+ * listener is installed before the wait so a turn that closes early is still
+ * observed; `agent/turn/end` is a durable session append, not a live-only edge.
+ */
+export function waitForTurnEnd(agent: Agent, turn: number, timeoutMs = 5000): Promise<{ turn: number; reason: string }> {
+  const observed = closedTurns(agent).find(closed => closed.turn === turn)
+  if (observed !== undefined) return Promise.resolve(observed)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      dispose()
+      reject(new Error(`Timed out waiting for turn ${turn} to close in session ${String(agent.id)}`))
+    }, timeoutMs)
+    const dispose = agent.ctx.on('session/event', (session, event) => {
+      if (session !== agent.session || event.type !== 'turn/end') return
+      const data = event.data as { turn: number; reason?: { kind?: string } }
+      if (data.turn !== turn) return
+      clearTimeout(timer)
+      dispose()
+      resolve({ turn: data.turn, reason: String(data.reason?.kind ?? '') })
+    })
+  })
 }
