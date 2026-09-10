@@ -4,6 +4,8 @@ import TypertGateway from '@deepseek-ai/dsh-api-gateway'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { createIntegrationHarness, textResponse, toolCallResponse, advisorVerdictResponse, type IntegrationHarness } from './harness.js'
+import { advisorObligationSnapshot } from '../src/remote.js'
+import { MAX_AUTO_REMINDERS_PER_TASK, ObligationStore } from '../src/obligations.js'
 
 describe('Advisor Remote policy API', () => {
   let harness: IntegrationHarness | undefined
@@ -108,5 +110,39 @@ describe('Advisor Remote policy API', () => {
     expect(report.question).toBe('Does this assumption hold?')
     expect(JSON.parse(report.text)).toMatchObject({ status: 'ok', child_session_id: run.childSessionId })
     expect(root.session.seq).toBe(before)
+  })
+
+  it('bounds the obligation payload to one task and marks it runtime-only', () => {
+    const store = new ObligationStore()
+    const item = store.recordFailure({ sessionId: 's1', taskStartSeq: 100, scope: 'task:s1:100', seq: 110, at: 1000, validationKey: 'k-auth', summary: 'x'.repeat(500) })
+    store.recordFailure({ sessionId: 's1', taskStartSeq: 500, scope: 'task:s1:500', seq: 510, at: 1100, validationKey: 'k-lint', summary: 'another task failure' })
+    store.recordFailure({ sessionId: 's2', taskStartSeq: 100, scope: 'task:s2:100', seq: 110, at: 1200, validationKey: 'k-auth', summary: 'another session failure' })
+    store.recordDisposition('s1', 100, item.id, { kind: 'accept-risk', basis: 'accepted for this run', at: 2000, seq: 120 })
+    for (let attempt = 0; attempt < MAX_AUTO_REMINDERS_PER_TASK + 2; attempt += 1) store.consumeReminder('s1', 100)
+    const payload = advisorObligationSnapshot(store, 's1', 100)
+    expect(payload).toMatchObject({ retention: 'runtime-only', taskStartSeq: 100, remindersUsed: MAX_AUTO_REMINDERS_PER_TASK, remindersLimit: MAX_AUTO_REMINDERS_PER_TASK, exhausted: true, openCount: 1 })
+    expect(payload.note).toContain('restart keeps no record')
+    expect(payload.items).toHaveLength(1)
+    expect(payload.items[0]).toMatchObject({ id: item.id, kind: 'validation-failure', state: 'open', repeatCount: 1, disposition: 'accept-risk' })
+    expect(payload.items[0]!.summary.length).toBeLessThanOrEqual(300)
+    expect(payload.items[0]).not.toHaveProperty('resolution')
+    // A task the store never observed still states the retention rule instead of implying an all-clear.
+    expect(advisorObligationSnapshot(store, 's1', 900)).toMatchObject({ retention: 'runtime-only', remindersUsed: 0, remindersLimit: MAX_AUTO_REMINDERS_PER_TASK, exhausted: false, openCount: 0, items: [] })
+    // A witness resolves the item; the earlier disposition never did.
+    store.recordValidation({ sessionId: 's1', taskStartSeq: 100, scope: 'task:s1:100', validationKey: 'k-auth', callId: 'call-1', startedSeq: 130, completedSeq: 135, succeeded: true })
+    expect(advisorObligationSnapshot(store, 's1', 100).items[0]).toMatchObject({ state: 'resolved', resolution: 'reverified', disposition: 'accept-risk' })
+  })
+
+  it('publishes the current task obligations through the live remote snapshot', async () => {
+    harness = await createIntegrationHarness({ weak: [toolCallResponse('auth-run', 'bash', { command: 'pnpm test auth' }), textResponse('done')] })
+    const { ctx, root } = harness
+    ctx.tools.register(defineContentToolFixture({ name: 'bash', description: 'Fails a validation command', parameters: { command: { type: 'string' } }, async execute() { throw new Error('auth test failed') } }))
+    await harness.runRoot('Run the auth tests')
+    const snapshot = JSON.parse(ctx.advisor.snapshot(String(root.id)))
+    expect(Object.keys(snapshot.obligations).sort()).toEqual(['exhausted', 'items', 'note', 'openCount', 'remindersLimit', 'remindersUsed', 'retention', 'taskStartSeq'])
+    // The turn-end reminder path consumed exactly one of the fixed task budget.
+    expect(snapshot.obligations).toMatchObject({ retention: 'runtime-only', remindersUsed: 1, remindersLimit: MAX_AUTO_REMINDERS_PER_TASK, exhausted: false, openCount: 1 })
+    expect(snapshot.obligations.note).toContain('restart keeps no record')
+    expect(snapshot.obligations.items).toEqual([expect.objectContaining({ kind: 'validation-failure', state: 'open', repeatCount: 1, summary: expect.stringContaining('auth test failed') })])
   })
 })

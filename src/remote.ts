@@ -9,6 +9,8 @@ import type { AdvisorTaskLimiter } from './task-limiter.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { advisorModelConfig, configuredModel, parseModelSelection, sessionModelSelection, updateModelSelection } from './model-selection.js'
+import { truncateUtf8 } from './redact.js'
+import { MAX_AUTO_REMINDERS_PER_TASK, type Disposition, type ObligationKind, type ObligationState, type ObligationStore, type Resolution } from './obligations.js'
 import { textContent } from './context.js'
 
 declare module '@deepseek-ai/cordis' { interface Context { advisor: AdvisorRemoteService } }
@@ -30,7 +32,54 @@ export const ADVISOR_REMOTE_DESCRIPTORS: InvocationDescriptor[] = [
   parameters: args.map(name => ({ name, wire: name, source: 'json' as const, codec: stringCodec })), result: stringCodec,
 }))
 
-interface RemoteConfig { currentConfig: () => Config; limiter: AdvisorTaskLimiter; guidanceFor: (agent: Agent) => { available: boolean; reason: string; text: string } }
+/** Runtime-only records must never be read as a statement that verification passed. */
+const OBLIGATION_RETENTION_NOTE = 'Verification obligations are runtime-only: a restart keeps no record, so an empty list is not evidence that anything passed.'
+
+/** One current-task item, bounded for display. Raw tool output is never included. */
+export interface AdvisorObligationView {
+  readonly id: string
+  readonly kind: ObligationKind
+  readonly state: ObligationState
+  readonly summary: string
+  readonly repeatCount: number
+  readonly disposition?: Disposition['kind']
+  readonly resolution?: Resolution['kind']
+}
+
+/** The current root task's obligations plus the reminder budget that governs them. */
+export interface AdvisorObligationSnapshot {
+  readonly retention: 'runtime-only'
+  readonly note: string
+  readonly taskStartSeq: number
+  readonly remindersUsed: number
+  readonly remindersLimit: number
+  readonly exhausted: boolean
+  readonly openCount: number
+  readonly items: readonly AdvisorObligationView[]
+}
+
+/** Scoped to one root task: another task's records must never appear here. */
+export function advisorObligationSnapshot(store: ObligationStore, sessionId: string, taskStartSeq: number): AdvisorObligationSnapshot {
+  const remindersUsed = store.remindersUsed(sessionId, taskStartSeq)
+  return {
+    retention: 'runtime-only',
+    note: OBLIGATION_RETENTION_NOTE,
+    taskStartSeq,
+    remindersUsed,
+    remindersLimit: MAX_AUTO_REMINDERS_PER_TASK,
+    exhausted: remindersUsed >= MAX_AUTO_REMINDERS_PER_TASK,
+    openCount: store.open(sessionId, taskStartSeq).length,
+    items: store.list(sessionId, taskStartSeq).map(item => ({
+      id: truncateUtf8(item.id, 64), kind: item.kind, state: item.state, summary: truncateUtf8(item.summary, 300), repeatCount: item.repeatCount,
+      ...(item.disposition ? { disposition: item.disposition.kind } : {}),
+      ...(item.resolution ? { resolution: item.resolution.kind } : {}),
+    })),
+  }
+}
+
+/** Obligation reads handed to the Remote snapshot from the plugin's apply() body. */
+interface RemoteObligations { store: ObligationStore; taskStartSeq: (agent: Agent) => number }
+interface RemoteConfig { currentConfig: () => Config; limiter: AdvisorTaskLimiter; guidanceFor: (agent: Agent) => { available: boolean; reason: string; text: string }; obligations: RemoteObligations }
 export class AdvisorRemoteService extends TypertRemoteService {
   static inject = ['agents', 'llm']
   constructor(ctx: Context, private readonly config: RemoteConfig) {
@@ -51,9 +100,11 @@ export class AdvisorRemoteService extends TypertRemoteService {
   snapshot(sessionId: string): string {
     const root = this.root(sessionId)
     const defaults = this.config.currentConfig()
+    const obligations = this.config.obligations
     return JSON.stringify({ ...catalogFor(defaults, root),
       model: configuredModel(advisorModelConfig(defaults, root.session)), modelDefault: configuredModel(defaults), modelOverridden: sessionModelSelection(root.session) !== null,
-      guidance: this.config.guidanceFor(root), runs: advisorRunHistory(root).map(({ responseText: _responseText, ...run }) => run), budget: this.config.limiter.snapshot(String(root.id)) })
+      guidance: this.config.guidanceFor(root), runs: advisorRunHistory(root).map(({ responseText: _responseText, ...run }) => run), budget: this.config.limiter.snapshot(String(root.id)),
+      obligations: advisorObligationSnapshot(obligations.store, String(root.id), obligations.taskStartSeq(root)) })
   }
 
   /** Read the exact injected message when retained, including pre-alpha.5 logs. */

@@ -346,6 +346,32 @@ window.__ModuleLoader__.load({
         h('p', { style: css.hint }, '单次尝试的总时限，重试重新计时。修改从下一次咨询生效。'))
     }
 
+    // Runtime-only verification obligations. This section is a reminder, never a
+    // gate, and a missing or empty record is never presented as an all-clear,
+    // because a restart keeps no record at all.
+    const OBLIGATION_KINDS = { 'validation-failure': '验证失败 validation-failure', 'claim-contradicted': '发布结论被反例推翻 claim-contradicted' }
+    const OBLIGATION_DISPOSITIONS = { 'not-applicable': '不适用 not-applicable', 'accept-risk': '接受风险 accept-risk' }
+
+    function AdvisorObligations({ obligations }) {
+      if (!obligations) return h('p', { role: 'status', style: css.hint }, 'Host 未提供 obligation 记录，且 runtime-only 记录不跨重启保留：这不能视为验证全部通过。')
+      const items = (Array.isArray(obligations.items) ? obligations.items : []).filter(item => item && item.state === 'open')
+      const used = Number.isSafeInteger(obligations.remindersUsed) ? obligations.remindersUsed : 0
+      const limit = Number.isSafeInteger(obligations.remindersLimit) ? obligations.remindersLimit : 0
+      return h(React.Fragment, null,
+        h('p', { style: css.hint }, '提醒（reminder），不是阻断：未完成的验证项不阻止继续执行，也不因预算、评分或冷却而消失。'),
+        h('p', { style: css.hint }, '提醒预算 ' + used + ' / ' + limit + (obligations.exhausted ? (items.length ? ' · 提醒预算已用尽（reminders exhausted; still open）' : '（提醒预算已用尽，本轮没有未完成验证项）') : '')),
+        h('p', { style: css.hint }, '记录保留 ' + String(obligations.retention || 'unknown') + '：' + String(obligations.note || '重启后不保留任何记录。')),
+        items.length === 0
+          ? h('p', { role: 'status', style: css.hint }, '本轮没有未完成验证的记录：runtime-only 记录不跨重启保留，空列表不代表验证全部通过。')
+          : items.map(item => h('div', { key: String(item.id), style: css.toolRow },
+            h('span', { style: css.badge }, String(item.id)),
+            h('div', { style: { minWidth: 0 } },
+              h('div', { style: { fontWeight: 600, overflowWrap: 'anywhere' } }, OBLIGATION_KINDS[item.kind] || String(item.kind)),
+              h('div', { style: { ...css.hint, overflowWrap: 'anywhere' } }, String(item.summary || '')),
+              item.disposition && h('span', { style: css.badge }, '处置：' + (OBLIGATION_DISPOSITIONS[item.disposition] || String(item.disposition)) + '（处置不关闭验证项）')),
+            h('span', { style: css.badge }, '重复 ×' + (Number.isSafeInteger(item.repeatCount) ? item.repeatCount : 0)))))
+    }
+
     function AdvisorSessionAction({ ctx, sessionId }) {
       const [open, setOpen] = React.useState(false)
       const [catalog, setCatalog] = React.useState(null)
@@ -456,6 +482,8 @@ window.__ModuleLoader__.load({
               h('p', { style: css.hint }, '预算占用 ' + (catalog.budget?.used ?? 0) + ' · 活跃 ' + (catalog.budget?.active ?? 0) + ' · 排队 ' + (catalog.budget?.queued ?? 0)),
               h('button', { type: 'button', style: css.mini, disabled: !!busy, onClick: load }, '刷新状态'),
               ...(catalog.runs ?? []).slice(-10).reverse().map(run => h(AdvisorReview, { key: sessionId + ':' + run.id + ':' + run.attempt, ctx, sessionId, run })))),
+            catalog && h('details', { open: true, style: { marginTop: 12, fontSize: 13 } }, h('summary', { style: { cursor: 'pointer' } }, '未完成验证（提醒，非阻断）（' + (catalog.obligations?.openCount ?? 0) + '）'),
+              h(AdvisorObligations, { obligations: catalog.obligations })),
           !catalog && !error && h('p', { style: css.hint }, '正在读取当前会话设置…')))
     }
 

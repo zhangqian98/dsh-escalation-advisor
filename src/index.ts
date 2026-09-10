@@ -13,7 +13,8 @@ import { buildCasePacket, textContent } from './context.js'
 import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, type AdvisorRunResult } from './model-runner.js'
 import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
 import { toolGuidance } from './prompts.js'
-import { EscalationTracker, type EscalationDecision } from './state.js'
+import { EscalationTracker, classifyToolOutcome, mutationKey, type EscalationDecision } from './state.js'
+import { MAX_AUTO_REMINDERS_PER_TASK, ObligationStore, opensObligation, type Obligation } from './obligations.js'
 import { AdvisorTaskLimiter, AdvisorTaskLimitError } from './task-limiter.js'
 import { AdvisorWorkspaceLock } from './workspace-lock.js'
 import { AdvisorRegistry } from './registry.js'
@@ -58,6 +59,23 @@ function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child:
     source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor · ' + verdict.summary },
   })
 }
+
+/** Open obligations, stated as a reminder rather than as a block. */
+function obligationMessage(items: readonly Obligation[]): UserMessage {
+  const lines = items.map(item => {
+    const closure = item.validationKey
+      ? 'a later pass of the same command in this scope with no related change since'
+      : 'this failure carries no validation identity, so it cannot be closed automatically'
+    const options = item.kind === 'claim-contradicted'
+      ? 'A) ask the Advisor with the claim and the counterexample; B) back it with a verification witness; C) record a correction naming document, claim and change.'
+      : 'A) ask the Advisor with the evidence; B) fix it and re-run the same command; C) record not-applicable or accept-risk with a checkable basis.'
+    return '- ' + item.id + ' [' + item.kind + ', seen ' + item.repeatCount + 'x' + (item.disposition ? ', disposition=' + item.disposition.kind : '') + '] ' + item.summary + '\n  Closes only through: ' + closure + '.\n  ' + options
+  })
+  return createUserMessage({
+    content: [{ type: 'text', text: '[Advisor obligations - open verification items. No score reset, cooldown or consultation budget clears these.]\n' + lines.join('\n') + '\n\nThis is a reminder, not a block. An explanation of why a failure happened is not a verification witness and does not close an item.' }],
+    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + items.length + ' open obligation(s)' },
+  })
+}
 function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor unavailable', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
 function toolAnswer(answer: AdvisorRunResult) {
   const verdict = answer.verdict
@@ -77,6 +95,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     return { ...config, mode: policy.mode, timeoutMs: policy.timeoutMs }
   }
   const tracker = new EscalationTracker()
+  const obligations = new ObligationStore()
+  /** Dispatch seq per tool call: the only trustworthy bound on a validation window. */
+  const dispatchSeq = new Map<string, { seq: number; taskStartSeq: number }>()
   const limiter = new AdvisorTaskLimiter()
   const workspace = new AdvisorWorkspaceLock()
   const registry = new AdvisorRegistry(ctx)
@@ -117,7 +138,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     if (ctx.tools.get(ADVISOR_TOOL_NAME, agent) === undefined) return { available: false, reason: '当前 agent 无权使用咨询工具', text: '' }
     return { available: true, reason: '使用指导已启用', text: toolGuidance(config.mode) }
   }
-  await ctx.plugin(AdvisorRemoteService, { currentConfig, limiter, guidanceFor })
+  await ctx.plugin(AdvisorRemoteService, { currentConfig, limiter, guidanceFor, obligations: { store: obligations, taskStartSeq: (agent: Agent) => taskStarts.get(String(agent.id)) ?? 0 } })
   const revisionOf = (agent: Agent): string => {
     const root = taskRootAgent(ctx, agent)
     const latestUser = (subject: Agent) => subject.session.snapshotEvents().findLast(event => event.type === 'user/message' && event.data.source.kind === 'user')?.seq ?? 0
@@ -280,6 +301,58 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     },
   }))
 
+  ctx.tools.register(defineTool({
+    name: 'advisor_obligation',
+    description: 'Inspect and disposition open Advisor verification obligations. A disposition or a correction never closes an obligation: only a verification witness later than the latest failure, in the same scope and with no related change since, closes one. Use this to register a counterexample against a published claim, which no automatic classification can detect.',
+    parameters: {
+      action: { type: 'string', required: true },
+      id: { type: 'string' }, claim_id: { type: 'string' }, summary: { type: 'string' },
+      disposition: { type: 'string' }, basis: { type: 'string' },
+      document: { type: 'string' }, change: { type: 'string' }, evidence: { type: 'string' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: {
+        action: { type: 'string', required: true },
+        message: { type: 'string', required: true },
+        obligations: { type: 'array', required: true, items: { type: 'string' } },
+      } },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    isConcurrencySafe: () => false,
+    async execute(raw: unknown, exec: ToolRunContext) {
+      const args = (raw ?? {}) as Record<string, unknown>
+      const text = (name: string) => typeof args[name] === 'string' ? String(args[name]).trim() : ''
+      const action = text('action') || 'list'
+      if (!exec.agent || roleOf(exec.agent) !== 'root') return { action, message: 'Advisor obligations are tracked for root tasks only.', obligations: [] }
+      const key = String(exec.agent.id), taskStartSeq = taskStarts.get(key) ?? 0
+      const scope = 'task:' + key + ':' + taskStartSeq
+      const describe = (item: Obligation) => item.id + ' [' + item.kind + '/' + item.state + ', seen ' + item.repeatCount + 'x' + (item.disposition ? ', disposition=' + item.disposition.kind : '') + (item.resolution ? ', resolved=' + item.resolution.kind : '') + '] ' + item.summary
+      const listed = () => obligations.list(key, taskStartSeq).map(describe)
+      const id = text('id'), seq = exec.agent.session.seq
+      if (action === 'list') return { action, message: listed().length ? 'Current-run obligations (runtime only: a restart keeps no record).' : 'No current-run obligation record.', obligations: listed() }
+      if (action === 'register') {
+        const claimId = text('claim_id'), summary = text('summary')
+        if (!claimId || !summary) return { action, message: 'register requires claim_id and summary.', obligations: listed() }
+        const item = obligations.recordClaimContradiction({ sessionId: key, taskStartSeq, scope, seq, at: Date.now(), claimId, summary: redactSecrets(summary).slice(0, 300) })
+        return { action, message: 'Registered ' + item.id + '. It stays open until a verification witness and a correction record both exist.', obligations: listed() }
+      }
+      if (action === 'disposition') {
+        const kind = text('disposition'), basis = text('basis')
+        if (kind !== 'not-applicable' && kind !== 'accept-risk') return { action, message: 'disposition must be not-applicable or accept-risk.', obligations: listed() }
+        if (!basis) return { action, message: 'A disposition requires a checkable basis.', obligations: listed() }
+        const item = obligations.recordDisposition(key, taskStartSeq, id, { kind, basis: redactSecrets(basis).slice(0, 300), at: Date.now(), seq })
+        return { action, message: item ? 'Recorded ' + kind + ' on ' + item.id + '. It remains open and is listed at the end of the turn.' : 'No such obligation.', obligations: listed() }
+      }
+      if (action === 'correct') {
+        const claimId = text('claim_id'), document = text('document'), change = text('change'), evidence = text('evidence')
+        if (!claimId || !document || !change || !evidence) return { action, message: 'correct requires claim_id, document, change and evidence.', obligations: listed() }
+        const item = obligations.recordCorrection(key, taskStartSeq, id, { claimId, document: redactSecrets(document).slice(0, 200), change: redactSecrets(change).slice(0, 300), evidence: redactSecrets(evidence).slice(0, 300), at: Date.now(), seq })
+        return { action, message: item ? 'Recorded the correction on ' + item.id + '. A correction alone does not close it; a verification witness must still follow the failure.' : 'No such obligation, or the claim id does not match.', obligations: listed() }
+      }
+      return { action, message: 'Unknown action. Use list, register, disposition or correct.', obligations: listed() }
+    },
+  }))
+
   for (const agent of ctx.agents.list()) refreshTool(agent)
   ctx.on('agent/created', ({ agent }) => refreshTool(agent))
   ctx.on('settings/updated', namespace => { if (namespace === SETTINGS_NAMESPACE) { suppressed.clear(); retryableStarts.clear(); for (const agent of ctx.agents.list()) refreshTool(agent) } })
@@ -291,14 +364,47 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     taskStarts.set(key, agent.session.seq)
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
   })
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec.agent) {
+      const agentKey = String(exec.agent.id)
+      dispatchSeq.set(String(exec.callId), { seq: exec.agent.session.seq, taskStartSeq: taskStarts.get(agentKey) ?? 0 })
+      // Expire by sequence distance so in-flight calls keep their start boundary.
+      const oldest = exec.agent.session.seq - 512
+      for (const [id, entry] of dispatchSeq) if (entry.seq < oldest) dispatchSeq.delete(id)
+    }
+    return await next()
+  })
+
   ctx.on('tools/result', (exec, result: Readonly<ToolExecutionResult>) => {
     if (!exec.agent || exec.name === ADVISOR_TOOL_NAME || roleOf(exec.agent) === 'advisor') return
     const config = configFor(exec.agent)
     if (!routeConfigured(config)) return
-    tracker.observe(String(exec.agent.id), {
-      callId: String(exec.callId), name: exec.name, arguments: exec.arguments, isError: result.isError,
+    const agentKey = String(exec.agent.id), callId = String(exec.callId)
+    // Task identity is captured at dispatch so a task change mid-call cannot
+    // re-attribute the run.
+    const dispatched = dispatchSeq.get(callId)
+    dispatchSeq.delete(callId)
+    const taskStartSeq = dispatched?.taskStartSeq ?? taskStarts.get(agentKey) ?? 0
+    const scope = 'task:' + agentKey + ':' + taskStartSeq
+    const observed = {
+      callId, name: exec.name, arguments: exec.arguments, isError: result.isError, scope,
       ...(result.isError ? { errorMessage: result.error.message, errorCode: result.error.info?.code } : { value: result.value }), contentText: textContent(result.content),
-    }, config)
+    }
+    const startedSeq = dispatched?.seq
+    const completedSeq = exec.agent.session.seq
+    tracker.observe(agentKey, observed, config)
+    if (mutationKey(exec.name, exec.arguments)) obligations.recordMutation({ sessionId: agentKey, taskStartSeq, scope, seq: completedSeq, applied: !result.isError })
+    if (roleOf(exec.agent) !== 'root') return
+    const outcome = classifyToolOutcome(observed)
+    if (opensObligation(outcome.class)) {
+      obligations.recordFailure({
+        sessionId: agentKey, taskStartSeq, scope, seq: completedSeq, at: Date.now(), callId,
+        ...(outcome.validationKey ? { validationKey: outcome.validationKey } : {}),
+        summary: redactSecrets((result.isError ? result.error.message : observed.contentText) || exec.name).slice(0, 300),
+      })
+    } else if (outcome.class === 'success' && outcome.validationKey && outcome.exitCode === 0) {
+      obligations.recordValidation({ sessionId: agentKey, taskStartSeq, scope, validationKey: outcome.validationKey, callId, ...(startedSeq === undefined ? {} : { startedSeq }), completedSeq, succeeded: true })
+    }
   })
 
   const automatic = async (agent: Agent, turn: number, step: number | undefined, signal: AbortSignal, preStep: boolean): Promise<UserMessage | undefined> => {
@@ -365,12 +471,27 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     }))
     futureNotes.delete(key)
     const advice = await automatic(request.agent, request.turn, request.step, request.signal, true)
-    return advice || notes.length ? { ...nextStep, messages: [...nextStep.messages, ...notes, ...(advice ? [advice] : [])] } : nextStep
+    const taskStartSeq = taskStarts.get(key) ?? 0
+    const due = roleOf(request.agent) === 'root' ? obligations.pendingInjection(key, taskStartSeq) : []
+    const obligationNote = due.length ? obligationMessage(due) : undefined
+    return advice || notes.length || obligationNote ? { ...nextStep, messages: [...nextStep.messages, ...notes, ...(obligationNote ? [obligationNote] : []), ...(advice ? [advice] : [])] } : nextStep
   })
-  ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => { await automatic(agent, turn, undefined, signal, false) })
+  ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
+    await automatic(agent, turn, undefined, signal, false)
+    if (roleOf(agent) !== 'root') return
+    const key = String(agent.id), taskStartSeq = taskStarts.get(key) ?? 0
+    const open = obligations.open(key, taskStartSeq)
+    if (!open.length) return
+    // One reminder per obligation revision, under a fixed per-task budget that
+    // neither repeats nor the reminder itself can extend.
+    const due = obligations.pendingReminder(key, taskStartSeq)
+    if (!due.length || !obligations.consumeReminder(key, taskStartSeq)) return
+    for (const item of due) obligations.markReminded(item)
+    agent.steer(obligationMessage(open))
+  })
   ctx.on('agent/disposed', ({ agent }) => {
     const key = String(agent.id)
-    tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key)
+    tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key); obligations.clear(key)
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
     hiddenTools.get(agent)?.(); hiddenTools.delete(agent)
     for (const controller of controllers.get(key) ?? []) controller.abort()

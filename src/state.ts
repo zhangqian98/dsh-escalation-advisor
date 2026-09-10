@@ -3,6 +3,8 @@ import type { Config } from './config.js'
 
 export interface ObservedToolResult {
   callId?: string
+  /** Execution scope the call belongs to: the task identity of its requester. */
+  scope?: string
   name: string
   arguments: unknown
   isError: boolean
@@ -91,7 +93,7 @@ function flattenArgumentStrings(value: unknown, out: string[] = [], depth = 0): 
   return out
 }
 function argumentText(args: unknown): string { return flattenArgumentStrings(args).join(' ') }
-function validationKey(name: string, args: unknown): string | undefined {
+function validationKey(name: string, args: unknown, scope?: string): string | undefined {
   if (!VALIDATION_TOOL.test(name)) return undefined
   const command = argumentText(args).toLowerCase()
   if (/^\s*(?:echo|printf|write-output|cat)\b/.test(command)) return undefined
@@ -100,7 +102,9 @@ function validationKey(name: string, args: unknown): string | undefined {
   else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?lint\b/.test(command)) kind = 'lint'
   else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(command)) kind = 'build'
   else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?typecheck\b/.test(command) || /\btsc\b/.test(command)) kind = 'typecheck'
-  return kind ? hash(`validation:${kind}\n${normalizeFailureText(command)}`) : undefined
+  // The key identifies a validation target inside one execution scope; a pass in
+  // another scope or task must never be mistaken for the same check.
+  return kind ? hash(`validation:${kind}\n${scope ?? ''}\n${normalizeFailureText(command)}`) : undefined
 }
 function isExpectedNegativeExit(name: string, args: unknown, exitCode: number | undefined): boolean {
   if (exitCode !== 1) return false
@@ -141,7 +145,7 @@ function structuredOutcome(observed: ObservedToolResult): OutcomeClass | undefin
   return undefined
 }
 export function classifyToolOutcome(observed: ObservedToolResult): ToolOutcome {
-  const exitCode = findExitCode(observed.value), validation = validationKey(observed.name, observed.arguments)
+  const exitCode = findExitCode(observed.value), validation = validationKey(observed.name, observed.arguments, observed.scope)
   const exclusion = structuredOutcome(observed)
   if (exclusion) return { class: exclusion, exitCode, validationKey: validation }
   if (!observed.isError && isExpectedNegativeExit(observed.name, observed.arguments, exitCode)) return { class: 'expected-negative', exitCode, validationKey: validation }
@@ -153,7 +157,7 @@ function mutationPaths(args: unknown): string[] {
   if (record) for (const key of ['file_path', 'filePath', 'path', 'filename', 'target', 'destination']) { const value = record[key]; if (typeof value === 'string' && value.trim()) candidates.push(value.trim()) }
   return candidates
 }
-function mutationKey(name: string, args: unknown): string | undefined {
+export function mutationKey(name: string, args: unknown): string | undefined {
   if (!MUTATION_TOOL.test(name)) return undefined
   const candidates = mutationPaths(args)
   const body = candidates.length ? candidates.sort().join('|') : JSON.stringify(args).slice(0, 1500)

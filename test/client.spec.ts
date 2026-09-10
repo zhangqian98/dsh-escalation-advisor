@@ -76,3 +76,116 @@ describe('Advisor Web companion', () => {
     } finally { await ctx.fiber.dispose() }
   })
 })
+
+// The obligations reminder section is a SIBLING of the `catalog && h(React.Fragment, ...)` block,
+// so its arguments are evaluated on every open-panel render — including the first one, which
+// happens while the async load() is still in flight and `catalog` is still null.
+describe('Advisor session header action — null catalog safety', () => {
+  const CONVERSATION_HEADER_SLOT = 'conversation.session.header.actions'
+  const GUARDED = "            catalog && h('details', { open: true, style: { marginTop: 12, fontSize: 13 } }, h('summary'"
+  const UNGUARDED = "            h('details', { open: true, style: { marginTop: 12, fontSize: 13 } }, h('summary'"
+  // Verbatim pre-fix text: the same two lines with the `catalog && ` guard deleted.
+  const PRE_FIX_BLOCK = "            h('details', { open: true, style: { marginTop: 12, fontSize: 13 } }, h('summary', { style: { cursor: 'pointer' } }, '未完成验证（提醒，非阻断）（' + (catalog.obligations?.openCount ?? 0) + '）'),\n              h(AdvisorObligations, { obligations: catalog.obligations })),"
+
+  const readClientSource = () => readFileSync(new URL('../client/index.js', import.meta.url), 'utf8')
+
+  // Same fixture as the test above: the plugin registers one render function for the
+  // conversation session header slot, and 'root' is a root (non-subagent) session.
+  async function mountCompanion(source: string) {
+    let plugin: any
+    runInNewContext(source, { window: { __ModuleLoader__: { load({ factory }: any) { plugin = factory(require) } } } })
+    const renders = new Map<string, (props: any) => unknown>()
+    const nativeEntries = ['context', 'steering'].map(key => ({ options: { key }, component: () => React.createElement('div', null, 'native ' + key), locale: 'chat' }))
+    const ctx = new Context()
+    const endpoints = { snapshot: () => 'catalog' }
+    class FixtureRemote extends Service {
+      constructor(context: Context) { super(context, 'remote' as any) }
+      get advisor() { return (this.ctx as any)['remote.advisor'] }
+      async $mount() { return this.ctx.provide('remote.advisor' as any, endpoints) }
+    }
+    await ctx.plugin(FixtureRemote)
+    for (const [name, value] of Object.entries({
+      'remote.session': {}, 'remote.llm': {}, 'remote.commands': {},
+      settingsScope: { bind: () => ({}) },
+      slots: { inject: (_slot: unknown, fn: () => void) => fn(), register: (slot: any, render: any) => { renders.set(slot.name, render) }, entries: () => nativeEntries, subscribe: () => () => {} },
+      uiConversation: { events: { register: () => {} } },
+      sessions: { subagentAddress: (id: string) => id === 'root' ? undefined : { parentSessionId: 'root' }, binding: () => undefined },
+      commandUi: { decorate: () => () => {} },
+      locale: { bind: () => (key: string) => key },
+    })) ctx.provide(name as any, value)
+    await ctx.plugin(plugin)
+    await ctx.fiber.await()
+    return { ctx, render: renders.get(CONVERSATION_HEADER_SLOT)! }
+  }
+
+  // `open` and `catalog` are internal state, so the only way to reach the open-with-null-catalog
+  // render is to answer the component's first two React.useState calls directly. Every later call,
+  // and every other React export, is the real implementation; both patches are restored in finally.
+  function renderWithForcedState(render: (props: object) => unknown, states: unknown[], { stubExternalStore = false } = {}) {
+    const mutable = React as unknown as {
+      useState: (initial: unknown) => [unknown, () => void]
+      useSyncExternalStore: (subscribe: () => void, getSnapshot: () => unknown) => unknown
+    }
+    const realUseState = mutable.useState
+    const realUseSyncExternalStore = mutable.useSyncExternalStore
+    let calls = 0
+    mutable.useState = initial => {
+      calls += 1
+      if (calls <= states.length) return [states[calls - 1], () => {}]
+      return realUseState.call(React, initial)
+    }
+    // AdvisorModelPicker (rendered only once the catalog is truthy) calls useSyncExternalStore
+    // without a getServerSnapshot, which react-dom/server rejects; the real DSH client runtime is
+    // not present here, so read the snapshot directly for this render.
+    if (stubExternalStore) mutable.useSyncExternalStore = (_subscribe, getSnapshot) => getSnapshot()
+    try { return renderToString(render({ sessionId: 'root' }) as any) }
+    finally { mutable.useState = realUseState; mutable.useSyncExternalStore = realUseSyncExternalStore }
+  }
+
+  it('keeps the header control mounted when the panel opens before the catalog has loaded', async () => {
+    const mounted = await mountCompanion(readClientSource())
+    try {
+      const html = renderWithForcedState(mounted.render, [true])
+      expect(html).toContain('Advisor')
+      expect(html).toContain('正在读取当前会话设置…')
+      expect(html).not.toContain('未完成验证')
+    } finally { await mounted.ctx.fiber.dispose() }
+  })
+
+  it('pins the crash the guard prevents: the pre-fix text dereferences a null catalog', async () => {
+    const source = readClientSource()
+    expect(source).toContain(GUARDED)
+    const preFix = source.replace(GUARDED, UNGUARDED)
+    expect(preFix).not.toBe(source)
+    expect(preFix).toContain(PRE_FIX_BLOCK)
+    const mounted = await mountCompanion(preFix)
+    try {
+      // Exactly the body of the first test, run against the pre-fix text: the render throws before
+      // any assertion is reached. That a real client root then drops the subtree (which is what hid
+      // the button) follows from React's no-error-boundary behaviour and is NOT executed here.
+      expect(() => {
+        const html = renderWithForcedState(mounted.render, [true])
+        expect(html).toContain('正在读取当前会话设置…')
+      }).toThrowError(new TypeError("Cannot read properties of null (reading 'obligations')"))
+    } finally { await mounted.ctx.fiber.dispose() }
+  })
+
+  it('renders the obligations reminder with the open item when the catalog carries a payload', async () => {
+    const catalog = {
+      tools: [], mode: 'manual', modelOverridden: false, model: null,
+      obligations: {
+        openCount: 1, remindersUsed: 2, remindersLimit: 5, exhausted: false, retention: 'runtime-only', note: '重启后不保留任何记录。',
+        items: [{ id: 'ob-1', state: 'open', kind: 'validation-failure', summary: 'Need to prove the crash', repeatCount: 3 }],
+      },
+    }
+    const mounted = await mountCompanion(readClientSource())
+    try {
+      const html = renderWithForcedState(mounted.render, [true, catalog], { stubExternalStore: true })
+      expect(html).toContain('未完成验证（提醒，非阻断）（1）')
+      expect(html).toContain('ob-1')
+      expect(html).toContain('提醒预算 2 / 5')
+      expect(html).toContain('记录保留 runtime-only')
+      expect(html).not.toContain('正在读取当前会话设置…')
+    } finally { await mounted.ctx.fiber.dispose() }
+  })
+})
