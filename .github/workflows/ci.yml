@@ -11,6 +11,9 @@ permissions:
 
 jobs:
   check:
+    strategy:
+      matrix:
+        node: ['22.19.0', '24']
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -19,10 +22,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v5
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
       # DSH packages currently require a newer npm resolver than the npm 11.3
       # bundled by some Node 24 images. Match the working community-plugin CI.
       - run: npm install --global npm@11.7.0
-      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
       - run: npm run build

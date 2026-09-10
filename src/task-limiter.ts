@@ -1,5 +1,5 @@
 export class AdvisorTaskLimitError extends Error {
-  constructor(message: string, readonly code: 'task_budget_exhausted' | 'task_queue_aborted') {
+  constructor(message: string, readonly code: 'task_budget_exhausted' | 'task_budget_reserved' | 'task_queue_aborted') {
     super(message)
     this.name = 'AdvisorTaskLimitError'
   }
@@ -15,6 +15,7 @@ interface Waiter {
 
 interface TaskState {
   used: number
+  pendingStarts: number
   active: number
   waiters: Waiter[]
 }
@@ -26,7 +27,7 @@ export class AdvisorTaskLimiter {
   private state(taskId: string): TaskState {
     let state = this.tasks.get(taskId)
     if (!state) {
-      state = { used: 0, active: 0, waiters: [] }
+      state = { used: 0, pendingStarts: 0, active: 0, waiters: [] }
       this.tasks.set(taskId, state)
     }
     return state
@@ -82,25 +83,28 @@ export class AdvisorTaskLimiter {
 
   async run<T>(
     taskId: string,
-    limits: { maxTotal: number; maxConcurrent: number },
+    limits: { maxTotal: number; maxConcurrent: number; trackStart?: boolean },
     signal: AbortSignal,
-    task: () => Promise<T>,
+    task: (markStarted: () => void) => Promise<T>,
   ): Promise<T> {
     const state = this.state(taskId)
     if (limits.maxTotal <= 0 || state.used >= limits.maxTotal) {
+      if (limits.maxTotal > 0 && state.used - state.pendingStarts < limits.maxTotal) throw new AdvisorTaskLimitError('Advisor task budget is temporarily reserved by consultations that have not dispatched.', 'task_budget_reserved')
       throw new AdvisorTaskLimitError(`Advisor task budget reached (${limits.maxTotal} consultations for this task tree).`, 'task_budget_exhausted')
     }
     state.used += 1
+    state.pendingStarts += 1
     let acquired = false
+    let started = false
+    const markStarted = () => { if (!started) { started = true; state.pendingStarts -= 1 } }
     try {
       await this.acquire(state, Math.max(1, limits.maxConcurrent), signal)
       acquired = true
-      return await task()
-    } catch (error) {
-      // A queued consultation that never started should not consume the task budget.
-      if (!acquired) state.used = Math.max(0, state.used - 1)
-      throw error
+      if (!limits.trackStart) markStarted()
+      return await task(markStarted)
     } finally {
+      // Only actual model dispatch consumes the reserved task budget.
+      if (!started) { state.used = Math.max(0, state.used - 1); state.pendingStarts -= 1 }
       if (acquired) this.release(state)
     }
   }

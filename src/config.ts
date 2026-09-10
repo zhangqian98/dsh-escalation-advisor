@@ -6,6 +6,12 @@ export const SEVERITIES = ['none', 'nit', 'concern', 'blocker'] as const
 export type AdvisorSeverity = (typeof SEVERITIES)[number]
 export const WAIT_MODES = ['block', 'background'] as const
 export type AdvisorWaitMode = (typeof WAIT_MODES)[number]
+export const DEFAULT_TIMEOUT_MS = 600000
+export const MIN_TIMEOUT_MS = 1000
+export const MAX_TIMEOUT_MS = 3600000
+export function isAdvisorTimeout(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= MIN_TIMEOUT_MS && value <= MAX_TIMEOUT_MS
+}
 
 /** Conservative defaults: repository inspection is on; every other tool starts off. */
 export const DEFAULT_ENABLED_TOOLS = ['read', 'read_image', 'glob', 'grep'] as const
@@ -15,9 +21,16 @@ export interface Config {
   mode: AdvisorMode
   provider: string
   model: string
+  /** Empty uses the selected model's own reasoning default. */
+  reasoningEffort: string
   subagentProvider: string
   /** Exact tool names enabled by default for sessions that have no per-tool override. */
   defaultEnabledTools: string[]
+  /** Unknown effects require exclusive blocking execution. */
+  readOnlyTools: string[]
+  mutatingTools: string[]
+  retryDelayMs: number
+  capabilityAmplifierTools: string[]
   /** Whether the root/main agent can explicitly call consult_advisor. */
   manualMainAgent: boolean
   /** Whether local DSH subagents can explicitly call consult_advisor. */
@@ -32,8 +45,6 @@ export interface Config {
   continuousLocalSubagents: boolean
   escalationWait: AdvisorWaitMode
   continuousWait: AdvisorWaitMode
-  maxInputBytes: number
-  maxOutputTokens: number
   timeoutMs: number
   /** Per-agent explicit consultation budget. */
   maxManualConsultsPerSession: number
@@ -59,8 +70,13 @@ export const Config = z.object({
   mode: z.union([...ADVISOR_MODES]).default('escalate'),
   provider: z.string().default(''),
   model: z.string().default(''),
+  reasoningEffort: z.string().default(''),
   subagentProvider: z.string().default('spawn'),
   defaultEnabledTools: z.array(String).default([...DEFAULT_ENABLED_TOOLS]),
+  readOnlyTools: z.array(String).default([]),
+  mutatingTools: z.array(String).default(['edit', 'write', 'bash', 'pwsh']),
+  retryDelayMs: z.number().step(1).min(0).max(60000).default(1000),
+  capabilityAmplifierTools: z.array(String).default([]),
   manualMainAgent: z.boolean().default(true),
   manualLocalSubagents: z.boolean().default(true),
   escalationMainAgent: z.boolean().default(true),
@@ -69,9 +85,7 @@ export const Config = z.object({
   continuousLocalSubagents: z.boolean().default(false),
   escalationWait: z.union([...WAIT_MODES]).default('block'),
   continuousWait: z.union([...WAIT_MODES]).default('background'),
-  maxInputBytes: z.number().step(1).min(4096).max(131072).default(24576),
-  maxOutputTokens: z.number().step(1).min(128).max(32768).default(2048),
-  timeoutMs: z.number().step(1).min(1000).max(600000).default(120000),
+  timeoutMs: z.number().step(1).min(MIN_TIMEOUT_MS).max(MAX_TIMEOUT_MS).default(DEFAULT_TIMEOUT_MS),
   maxManualConsultsPerSession: z.number().step(1).min(0).max(100).default(8),
   maxAdvisorConsultsPerTask: z.number().step(1).min(0).max(1000).default(12),
   maxConcurrentAdvisorRuns: z.number().step(1).min(1).max(32).default(2),

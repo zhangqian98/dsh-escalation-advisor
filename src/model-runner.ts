@@ -1,86 +1,112 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-subagent'
-import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { Config } from './config.js'
 import type { EffectiveAdvisorPolicy } from './policy.js'
 import { ADVISOR_SYSTEM_PROMPT } from './prompts.js'
-import { redactSecrets, truncateUtf8 } from './redact.js'
-import { parseVerdict, verdictFromStructured, type AdvisorVerdict } from './verdict.js'
+import { redactSecrets } from './redact.js'
+import { VERDICT_SCHEMA, parseVerdict, verdictFromStructured, type AdvisorVerdict } from './verdict.js'
+import { isCapabilityAmplifier } from './capabilities.js'
+import type { AdvisorRegistry } from './registry.js'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 
 export class AdvisorUnavailableError extends Error {
-  constructor(message: string, readonly code = 'advisor_unavailable') { super(message); this.name = 'AdvisorUnavailableError' }
-}
-
-const VERDICT_SCHEMA: ObjectJsonSchema = {
-  type: 'object',
-  properties: {
-    severity: { type: 'string', enum: ['none', 'nit', 'concern', 'blocker'] },
-    summary: { type: 'string' },
-    diagnosis: { type: 'string' },
-    next_actions: { type: 'array', items: { type: 'string' } },
-    confidence: { type: 'number' },
-  },
-  required: ['severity', 'summary', 'diagnosis', 'next_actions', 'confidence'],
-  additionalProperties: false,
+  constructor(message: string, readonly code = 'advisor_unavailable', readonly transient = false) { super(redactSecrets(message)); this.name = 'AdvisorUnavailableError' }
 }
 
 export interface AdvisorRunResult {
   verdict: AdvisorVerdict
   childSessionId: string
+  usage?: { inputTokens: number; outputTokens: number }
+  structuredFallback: boolean
 }
 
-/** Run one visible one-shot DSH child beneath the exact requesting agent. */
-export async function callAdvisor(
-  ctx: Context,
-  config: Config,
-  parent: Agent,
-  prompt: string,
-  signal: AbortSignal,
-  policy: EffectiveAdvisorPolicy,
-  label: string,
-): Promise<AdvisorRunResult> {
-  if (!config.provider.trim() || !config.model.trim()) throw new AdvisorUnavailableError('Advisor provider/model is not configured. Configure a model already available in DSH.')
-  const subagents = parent.ctx.get('subagents') ?? ctx.get('subagents')
-  if (!subagents) throw new AdvisorUnavailableError('DSH subagent runtime is unavailable for this session.', 'subagents_unavailable')
-
-  // Root/task policy is a ceiling; the requesting agent's actual tool surface is
-  // the second half of the intersection. A subagent therefore cannot borrow an
-  // Advisor to reach a tool it could not itself see.
+export function advisorToolSurface(ctx: Context, parent: Agent, policy: EffectiveAdvisorPolicy, amplifierTools: readonly string[] = []) {
   const visible = new Set(ctx.tools.schemas(parent).map(tool => tool.name))
-  const requestedTools = policy.allowedTools.filter(name => name !== 'consult_advisor')
-  const allowedTools = requestedTools.filter(name => visible.has(name))
-  const unavailableTools = requestedTools.filter(name => !visible.has(name))
-  const toolPolicyNote = `\n\nADVISOR TOOL POLICY:\nExposed: ${allowedTools.length ? allowedTools.join(', ') : '(none)'}\nRequested by the root Advisor policy but unavailable in the requesting agent's DSH tool surface: ${unavailableTools.length ? unavailableTools.join(', ') : '(none)'}. Do not claim to have used unavailable tools.`
-  const boundedPrompt = truncateUtf8(redactSecrets(prompt + toolPolicyNote), config.maxInputBytes)
+  const global = new Set(ctx.tools.schemas().map(tool => tool.name))
+  const requested = policy.allowedTools.filter(name => !isCapabilityAmplifier(ctx, name, amplifierTools))
+  return { allowedTools: requested.filter(name => visible.has(name) && global.has(name)), unavailableTools: requested.filter(name => !visible.has(name) || !global.has(name)) }
+}
+
+export function advisorPolicyNote(allowedTools: string[], unavailableTools: string[]): string {
+  return 'ADVISOR TOOL POLICY:\nExposed: ' + (allowedTools.join(', ') || '(none)') + '\nUnavailable: ' + (unavailableTools.join(', ') || '(none)') + '. Never claim to use unavailable tools. Never delegate or create execution scopes.\n\n'
+}
+
+/** Run a visible child, with identity attached before its first model request. */
+export async function callAdvisor(
+  ctx: Context, config: Config, parent: Agent, prompt: string, signal: AbortSignal,
+  policy: EffectiveAdvisorPolicy, label: string,
+  lifecycle: { registry: AdvisorRegistry; root: Agent; onStarted: () => void; onPublished: (id: string) => void },
+): Promise<AdvisorRunResult> {
+  if (!config.provider.trim() || !config.model.trim()) throw new AdvisorUnavailableError('Advisor provider/model is not configured.', 'configuration')
+  const subagents = parent.ctx.get('subagents') ?? ctx.get('subagents')
+  if (!subagents) throw new AdvisorUnavailableError('DSH subagent runtime is unavailable.', 'configuration')
+  const { allowedTools, unavailableTools } = advisorToolSurface(ctx, parent, policy, config.capabilityAmplifierTools)
+  const prefix = advisorPolicyNote(allowedTools, unavailableTools)
+  const timeoutMessage = 'Advisor consultation timed out (configured per-attempt limit: ' + config.timeoutMs / 1000 + ' seconds).'
   const callSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
+  const identity = lifecycle.registry.reserve(parent, lifecycle.root, allowedTools)
+  let started = false
+  // The loop prepares authentication before entering this stream. Unlike
+  // agent/assistant-stream, this boundary also exists in DSH 0.1.2-rc.1 and
+  // counts failures before the first chunk without charging preparation errors.
+  const stopObserve = ctx.on('llm/stream', async function* (options, next) {
+    const agent = options.sessionId === undefined ? undefined : ctx.agents.get(options.sessionId)
+    const owner = agent === undefined ? undefined : lifecycle.registry.identity(agent)
+    if (!started && !options.purpose && owner?.invocationId === identity.invocationId && owner.advisorId === String(agent?.id)) {
+      options.signal?.throwIfAborted()
+      started = true
+      lifecycle.onStarted()
+    }
+    yield* next()
+  })
   let run
   try {
     run = await subagents.start(config.subagentProvider.trim() || 'spawn', {
-      label,
-      prompt: [{ type: 'text', text: boundedPrompt }],
-      parent,
-      signal: callSignal,
-      agentOptions: { provider: config.provider.trim(), model: config.model.trim(), maxTokens: config.maxOutputTokens },
-      outputSchema: VERDICT_SCHEMA,
-      // Do not impose a fixed absolute maxDepth here: a requester can itself be
-      // a local subagent. Advisor recursion is prevented by this plugin's role
-      // guard; any ordinary subagent tool explicitly exposed to the Advisor
-      // continues to enforce its own DSH depth policy.
-      toolFilter: { allow: allowedTools },
-      persona: ADVISOR_SYSTEM_PROMPT,
+      label, prompt: [{ type: 'text', text: prefix + prompt }], parent, signal: callSignal,
+      // Explicit undefined clears the spawn provider's inherited parent cap;
+      // DSH then resolves the selected Advisor model's own output default.
+      agentOptions: { provider: config.provider.trim(), model: config.model.trim(), maxTokens: undefined,
+        reasoningEffort: config.reasoningEffort.trim() ? ReasoningEffortId(config.reasoningEffort.trim()) : undefined,
+        advisorInvocation: identity.invocationId },
+      outputSchema: VERDICT_SCHEMA, toolFilter: { allow: allowedTools }, persona: ADVISOR_SYSTEM_PROMPT,
     })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new AdvisorUnavailableError(`Unable to start Advisor child session: ${message}`, 'child_start_failed')
-  }
-  try {
+    lifecycle.onPublished(String(run.id))
     const result = await run.result
-    if (result.stopReason !== 'completed') throw new AdvisorUnavailableError(`Advisor child ended with ${result.stopReason}${result.diagnostic ? `: ${result.diagnostic}` : ''}`, 'child_failed')
-    const raw = result.output.filter(block => block.type === 'text').map(block => block.text).join('\n')
-    const verdict = result.structured === undefined ? parseVerdict(raw) : verdictFromStructured(result.structured, raw)
-    return { verdict, childSessionId: String(run.id) }
+    const child = ctx.agents.get(run.id)
+    const events = child?.session.snapshotEvents() ?? []
+    const ending = events.findLast(event => event.type === 'turn/end')
+    const raw = redactSecrets(result.output.filter(block => block.type === 'text').map(block => block.text).join('\n'))
+    // A missing structured_output is an error at the spawn seam even when the turn completed.
+    const structuredFallback = result.structured === undefined && raw.trim().length > 0 && ending?.type === 'turn/end' && ending.data.reason.kind === 'completed'
+    if (result.stopReason !== 'completed' && !structuredFallback) {
+      const detail = result.diagnostic ?? JSON.stringify(ending?.type === 'turn/end' ? ending.data.reason : result.stopReason)
+      if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor request cancelled.', signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled', signal.reason?.name === 'TimeoutError')
+      if (callSignal.aborted) throw new AdvisorUnavailableError(timeoutMessage, 'timeout', true)
+      const transient = /timeout|timed out|rate.limit|overload|unavailable|server|network|econn|concurrenc|429|50[0234]/i.test(detail)
+      throw new AdvisorUnavailableError('Advisor child ended with ' + result.stopReason + ': ' + detail, 'child_failed', transient)
+    }
+    if (result.structured === undefined && !raw.trim()) throw new AdvisorUnavailableError('Advisor returned no usable result.', 'empty_output')
+    const usage = { inputTokens: 0, outputTokens: 0 }
+    let usageKnown = false, usageMissing = false
+    for (const event of events) if (event.type === 'assistant/message') {
+      if (typeof event.data.usage?.inputTokens !== 'number' || typeof event.data.usage?.outputTokens !== 'number') { usageMissing = true; continue }
+      usageKnown = true
+      usage.inputTokens += event.data.usage.inputTokens
+      usage.outputTokens += event.data.usage.outputTokens
+    } else if (event.type === 'assistant/attempt') {
+      usageMissing = true
+    }
+    return { verdict: result.structured === undefined ? parseVerdict(raw) : verdictFromStructured(result.structured, raw), childSessionId: String(run.id), ...(usageKnown && !usageMissing ? { usage } : {}), structuredFallback }
+  } catch (error) {
+    if (error instanceof AdvisorUnavailableError) throw error
+    if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor request cancelled.', signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled', signal.reason?.name === 'TimeoutError')
+    if (callSignal.aborted) throw new AdvisorUnavailableError(timeoutMessage, 'timeout', true)
+    const message = error instanceof Error ? error.message : String(error)
+    throw new AdvisorUnavailableError('Unable to run Advisor: ' + message, 'child_start_failed', /timeout|timed out|rate.limit|overload|network|econn|concurrenc|429|50[0234]/i.test(message))
   } finally {
-    await run.dispose()
+    stopObserve()
+    identity.release()
+    await run?.dispose()
   }
 }

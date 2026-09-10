@@ -1,6 +1,18 @@
+import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { AdvisorSeverity } from './config.js'
 import { SEVERITIES } from './config.js'
 import { redactSecrets } from './redact.js'
+
+export interface AdvisorEvidence {
+  kind: string
+  reference: string
+}
+
+export interface AdvisorChange {
+  paths: string[]
+  reason: string
+  validation: string[]
+}
 
 export interface AdvisorVerdict {
   severity: AdvisorSeverity
@@ -8,20 +20,127 @@ export interface AdvisorVerdict {
   diagnosis: string
   nextActions: string[]
   confidence?: number
+  disposition?: string
+  evidenceUsed?: AdvisorEvidence[]
+  assumptions?: string[]
+  recommendedNextAction?: string
+  validationPlan?: string[]
+  needsMoreEvidence?: boolean
+  changesMade?: AdvisorChange[]
   raw: string
 }
 
-function asString(value: unknown): string { return typeof value === 'string' ? value.trim() : '' }
-function asStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  return value.filter((item): item is string => typeof item === 'string').map(item => item.trim()).filter(Boolean).slice(0, 8)
+export const VERDICT_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  properties: {
+    severity: { type: 'string', enum: ['none', 'nit', 'concern', 'blocker'] },
+    disposition: { type: 'string' },
+    summary: { type: 'string' },
+    diagnosis: { type: 'string' },
+    next_actions: { type: 'array', items: { type: 'string' } },
+    evidence_used: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string' },
+          reference: { type: 'string' },
+        },
+        required: ['kind', 'reference'],
+        additionalProperties: false,
+      },
+    },
+    assumptions: { type: 'array', items: { type: 'string' } },
+    recommended_next_action: { type: 'string' },
+    validation_plan: { type: 'array', items: { type: 'string' } },
+    needs_more_evidence: { type: 'boolean' },
+    confidence: { type: 'number' },
+    changes_made: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          paths: { type: 'array', items: { type: 'string' } },
+          reason: { type: 'string' },
+          validation: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['paths', 'reason', 'validation'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: [
+    'severity',
+    'disposition',
+    'summary',
+    'diagnosis',
+    'next_actions',
+    'evidence_used',
+    'assumptions',
+    'recommended_next_action',
+    'validation_plan',
+    'needs_more_evidence',
+    'confidence',
+    'changes_made',
+  ],
+  additionalProperties: false,
 }
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? redactSecrets(value).trim() : ''
+}
+
+function asStringArray(value: unknown, limit = 12): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map(asString)
+    .filter(Boolean)
+    .slice(0, limit)
+}
+
+function evidenceFrom(value: unknown): AdvisorEvidence[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(item => {
+    const evidence = asRecord(item)
+    const kind = asString(evidence?.kind)
+    const reference = asString(evidence?.reference)
+    return kind && reference ? [{ kind, reference }] : []
+  }).slice(0, 16)
+}
+
+function changesFrom(value: unknown): AdvisorChange[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(item => {
+    const change = asRecord(item)
+    if (!change) return []
+    const paths = asStringArray(change.paths)
+    const path = asString(change.path)
+    if (path && !paths.includes(path)) paths.push(path)
+    const reason = asString(change.reason)
+    const validationValue = change.validation ?? change.validation_result
+    const validation = typeof validationValue === 'string'
+      ? [asString(validationValue)].filter(Boolean)
+      : asStringArray(validationValue)
+    if (paths.length === 0 && !reason && validation.length === 0) return []
+    return [{ paths, reason, validation }]
+  }).slice(0, 12)
+}
+
 function findJsonObject(text: string): string | null {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim()
   if (fenced?.startsWith('{') && fenced.endsWith('}')) return fenced
   const start = text.indexOf('{')
   if (start < 0) return null
-  let depth = 0, quoted = false, escaped = false
+  let depth = 0
+  let quoted = false
+  let escaped = false
   for (let i = start; i < text.length; i++) {
     const char = text[i]!
     if (quoted) {
@@ -38,19 +157,46 @@ function findJsonObject(text: string): string | null {
 }
 
 export function verdictFromStructured(value: unknown, rawInput = ''): AdvisorVerdict {
-  const parsed = value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const parsed = asRecord(value) ?? {}
   const severityRaw = asString(parsed.severity).toLowerCase()
-  const severity = (SEVERITIES as readonly string[]).includes(severityRaw) ? severityRaw as AdvisorSeverity : 'concern'
-  const confidenceRaw = typeof parsed.confidence === 'number' ? parsed.confidence : undefined
+  const severity = (SEVERITIES as readonly string[]).includes(severityRaw)
+    ? severityRaw as AdvisorSeverity
+    : 'concern'
+  const confidenceRaw = typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
+    ? parsed.confidence
+    : undefined
   const raw = redactSecrets(rawInput).trim()
+  const disposition = asString(parsed.disposition)
+  const evidenceUsed = evidenceFrom(parsed.evidence_used ?? parsed.evidenceUsed)
+  const assumptions = asStringArray(parsed.assumptions)
+  const recommendedNextAction = asString(parsed.recommended_next_action ?? parsed.recommendedNextAction)
+  const validationPlan = asStringArray(parsed.validation_plan ?? parsed.validationPlan)
+  const needsMoreEvidenceValue = parsed.needs_more_evidence ?? parsed.needsMoreEvidence
+  const needsMoreEvidence = typeof needsMoreEvidenceValue === 'boolean' ? needsMoreEvidenceValue : undefined
+  const changesMade = changesFrom(parsed.changes_made ?? parsed.changesMade)
   return {
     severity,
     summary: asString(parsed.summary) || 'Advisor review',
     diagnosis: asString(parsed.diagnosis) || raw || 'No diagnosis returned.',
-    nextActions: asStringArray(parsed.next_actions ?? parsed.nextActions ?? parsed.actions),
+    nextActions: asStringArray(parsed.next_actions ?? parsed.nextActions ?? parsed.actions, 8),
     ...(confidenceRaw === undefined ? {} : { confidence: Math.max(0, Math.min(1, confidenceRaw)) }),
+    ...(disposition ? { disposition } : {}),
+    ...(evidenceUsed.length ? { evidenceUsed } : {}),
+    ...(assumptions.length ? { assumptions } : {}),
+    ...(recommendedNextAction ? { recommendedNextAction } : {}),
+    ...(validationPlan.length ? { validationPlan } : {}),
+    ...(needsMoreEvidence === undefined ? {} : { needsMoreEvidence }),
+    ...(changesMade.length ? { changesMade } : {}),
     raw,
   }
+}
+
+function fallbackSeverity(raw: string): AdvisorSeverity {
+  if (!raw) return 'none'
+  const explicit = raw.match(/^\s*(?:severity\s*[:=-]\s*)?(none|nit|concern|blocker)\b/im)?.[1]?.toLowerCase()
+  if (explicit && (SEVERITIES as readonly string[]).includes(explicit)) return explicit as AdvisorSeverity
+  if (/^\s*no (?:meaningful )?(?:issues?|concerns?)(?: found)?[.!]?\s*$/i.test(raw)) return 'none'
+  return 'concern'
 }
 
 export function parseVerdict(rawInput: string): AdvisorVerdict {
@@ -59,7 +205,12 @@ export function parseVerdict(rawInput: string): AdvisorVerdict {
   if (candidate) {
     try { return verdictFromStructured(JSON.parse(candidate), raw) } catch {}
   }
-  const lower = raw.toLowerCase()
-  const severity: AdvisorSeverity = lower.includes('blocker') ? 'blocker' : lower.includes('concern') ? 'concern' : lower.includes('nit') ? 'nit' : raw.length === 0 ? 'none' : 'concern'
-  return { severity, summary: severity === 'none' ? 'No issue found' : 'Advisor returned unstructured guidance', diagnosis: raw || 'No advisor text was returned.', nextActions: [], raw }
+  const severity = fallbackSeverity(raw)
+  return {
+    severity,
+    summary: severity === 'none' ? 'No issue found' : 'Advisor returned unstructured guidance',
+    diagnosis: raw || 'No advisor text was returned.',
+    nextActions: [],
+    raw,
+  }
 }

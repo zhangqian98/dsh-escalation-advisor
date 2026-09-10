@@ -9,6 +9,24 @@ function deferred<T>() {
 }
 
 describe('AdvisorTaskLimiter', () => {
+  it('distinguishes temporary reservations from a consumed task budget', async () => {
+    const limiter = new AdvisorTaskLimiter(), gate = deferred<void>(), signal = new AbortController().signal
+    const limits = { maxTotal: 1, maxConcurrent: 1, trackStart: true }
+    const first = limiter.run('root', limits, signal, () => gate.promise)
+    await expect(limiter.run('root', limits, signal, async () => undefined)).rejects.toMatchObject({ code: 'task_budget_reserved' })
+    gate.resolve(); await first
+    expect(limiter.snapshot('root').used).toBe(0)
+    await limiter.run('root', limits, signal, async started => { started() })
+    await expect(limiter.run('root', limits, signal, async () => undefined)).rejects.toMatchObject({ code: 'task_budget_exhausted' })
+  })
+  it('refunds a published child that fails before model dispatch, but counts a dispatched timeout', async () => {
+    const limiter = new AdvisorTaskLimiter(), signal = new AbortController().signal
+    const limits = { maxTotal: 1, maxConcurrent: 1, trackStart: true }
+    await expect(limiter.run('root', limits, signal, async () => { throw new Error('auth configuration') })).rejects.toThrow('auth configuration')
+    expect(limiter.snapshot('root').used).toBe(0)
+    await expect(limiter.run('root', limits, signal, async started => { started(); throw new Error('provider timeout') })).rejects.toThrow('provider timeout')
+    expect(limiter.snapshot('root').used).toBe(1)
+  })
   it('caps the total consultations for one task tree', async () => {
     const limiter = new AdvisorTaskLimiter()
     const signal = new AbortController().signal
