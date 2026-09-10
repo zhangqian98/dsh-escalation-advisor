@@ -1,3 +1,8 @@
+import { createRequire } from 'node:module'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent, type AgentOptions } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -48,6 +53,8 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { ADVISOR_VERDICT_TOOL } from '../src/verdict-tool.js'
 import * as Advisor from '../src/index.js'
 import type { Config } from '../src/config.js'
+
+export type { GenerateOptions }
 
 export type ScriptEntry =
   | StreamChunk[]
@@ -351,7 +358,7 @@ export async function createIntegrationHarness(
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
-  if (options.sessionPersistence === true) await ctx.plugin(MemorySessionPersistence)
+  if (options.sessionPersistence !== false) await ctx.plugin(MemorySessionPersistence)
   ctx.llm.registerAdapter(['mock'], adapter)
   await ctx.plugin(Advisor, { ...TEST_CONFIG, ...config })
 
@@ -687,4 +694,165 @@ export function waitForTurnEnd(agent: Agent, turn: number, timeoutMs = 5000): Pr
       resolve({ turn: data.turn, reason: String(data.reason?.kind ?? '') })
     })
   })
+}
+
+// ---------------------------------------------------------------------------
+// The DEPLOYED runtime harness (isolated config only)
+//
+// `createIntegrationHarness` above composes the repository's own dependency set
+// and its in-memory persistence stand-in. A test that must prove a COLD RESUME
+// cannot use it: cold resume needs `ctx.sessionQuery`, which the installed set
+// does not provide, and it must run against the durable backends the deployment
+// actually loads. This harness therefore resolves every `@deepseek-ai/*`
+// specifier through `createRequire(DSH_RUNTIME_PACKAGE_JSON)` — the same anchor
+// `vitest.runtime.config.ts` aliases with — and mounts the REAL
+// `dsh-session-persistence-jsonl` and `dsh-session-query-sqlite` plugins.
+//
+// It is inert unless that variable is set, so importing this module from any
+// other spec (whose factories are never called from a skipped block) changes
+// nothing there.
+// ---------------------------------------------------------------------------
+
+const runtimeAnchor = process.env.DSH_RUNTIME_PACKAGE_JSON
+const runtimeRequire = runtimeAnchor === undefined ? undefined : createRequire(runtimeAnchor)
+
+/**
+ * Load one module from the DEPLOYED install rather than from the installed
+ * dependency set. The anchor is required: a caller that reached here without it
+ * would silently measure the wrong runtime, so it fails loud instead.
+ */
+async function loadDeployed(specifier: string): Promise<any> {
+  if (runtimeRequire === undefined) throw new Error('DSH_RUNTIME_PACKAGE_JSON must be set to load the deployed runtime.')
+  return import(pathToFileURL(runtimeRequire.resolve(specifier)).href)
+}
+
+/** The `default ?? namespace` shape every DSH plugin module publishes. */
+const pluginOf = (module: any): any => module.default ?? module
+
+export interface DeployedRuntimeHarness {
+  readonly ctx: Context
+  readonly root: Agent
+  readonly adapter: ScriptedAdapter
+  /** Durable on-disk session root this harness mounted. */
+  readonly sessionRoot: string
+  /** Every `agent/created` id in arrival order, for "nothing new was created" claims. */
+  readonly agentsCreated: string[]
+  /** One more live ROOT Agent in the same context (used for cross-task refusals). */
+  secondRoot(id: string): Promise<Agent>
+  /** The live Agent for a durable session id, or `undefined` once it is released. */
+  liveAgent(sessionId: string): Agent | undefined
+  /** The live Session for a durable session id, or `undefined` once it is released. */
+  liveSession(sessionId: string): unknown
+  /** Run one registered tool through the runtime tool pipeline, as a model call would. */
+  runTool(name: string, args: unknown, agent: Agent, signal?: AbortSignal): Promise<{ value?: unknown; isError: boolean; text: string }>
+  /** Read one persisted session back through the mounted query service. */
+  readPersisted(sessionId: string): Promise<{ id: string; parentSession: string; events: readonly { type: string; seq: number; data: unknown }[] }>
+  dispose(): Promise<void>
+}
+
+export async function createDeployedRuntimeHarness(
+  scripts: Record<string, ScriptEntry[]>,
+  config: Partial<Config> = {},
+  sessionRoot: string = mkdtempSync(join(tmpdir(), 'dsh-deployed-runtime-sessions-')),
+): Promise<DeployedRuntimeHarness> {
+  const [Cordis, LlmRuntime, SessionStore, SessionProjection, SystemPrompt, ToolRuntime, AgentRegistry,
+    Invariants, AgentInvariant, AgentLoopInvariant, SessionInvariant, AgentLoop, SubagentRuntime, Spawn] =
+    await Promise.all([
+      loadDeployed('@deepseek-ai/cordis'),
+      loadDeployed('@deepseek-ai/dsh-llm'),
+      loadDeployed('@deepseek-ai/dsh-session'),
+      loadDeployed('@deepseek-ai/dsh-session-projection'),
+      loadDeployed('@deepseek-ai/dsh-system-prompt'),
+      loadDeployed('@deepseek-ai/dsh-tools'),
+      loadDeployed('@deepseek-ai/dsh-agent'),
+      loadDeployed('@deepseek-ai/dsh-invariants'),
+      loadDeployed('@deepseek-ai/dsh-agent/invariant'),
+      loadDeployed('@deepseek-ai/dsh-agent-loop/invariant'),
+      loadDeployed('@deepseek-ai/dsh-session/invariant'),
+      loadDeployed('@deepseek-ai/dsh-agent-loop'),
+      loadDeployed('@deepseek-ai/dsh-subagent'),
+      loadDeployed('@deepseek-ai/dsh-subagent-spawn-in-process'),
+    ])
+
+  const ctx = new (Cordis.Context ?? Cordis.default)() as Context
+  const adapter = new ScriptedAdapter(scripts)
+  const agentsCreated: string[] = []
+
+  await ctx.plugin(pluginOf(LlmRuntime))
+  await ctx.plugin(pluginOf(SessionStore))
+  await ctx.plugin(pluginOf(SessionProjection))
+  await ctx.plugin(pluginOf(SystemPrompt), {})
+  await ctx.plugin(pluginOf(ToolRuntime), {})
+  await ctx.plugin(pluginOf(AgentRegistry))
+  await ctx.plugin(pluginOf(Invariants))
+  await ctx.plugin(SessionInvariant)
+  await ctx.plugin(AgentInvariant)
+  await ctx.plugin(AgentLoopInvariant)
+  await ctx.plugin(pluginOf(AgentLoop), { agents: [] })
+  await ctx.plugin(pluginOf(SubagentRuntime))
+  await ctx.plugin(pluginOf(Spawn), { providerName: 'spawn' })
+  // The REAL durable backend and the REAL query service, configured exactly as
+  // the deployment configures them (`openAt: never`).
+  await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-session-persistence-jsonl')), { root: sessionRoot })
+  await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-session-query-sqlite')), { path: ':memory:', openAt: 'never' })
+  // The plugin declares `settings` as a hard dependency, so a missing provider
+  // would leave `apply` unrun and register nothing. The deployment's own
+  // provider, pointed at this test's temp directory (no watcher).
+  await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-settings-file')), { path: join(sessionRoot, 'settings.json'), watch: false })
+
+  const llm = ctx.get('llm') as any
+  llm.registerAdapter(['mock'], adapter)
+
+  const Advisor = await import('../src/index.js')
+  await ctx.plugin(Advisor, { ...TEST_CONFIG, ...config })
+  // Fail loud rather than silently measuring a context the plugin never extended.
+  const toolRegistry = ctx.get('tools') as any
+  for (const required of ['consult_advisor', 'advisor_verdict']) {
+    if (toolRegistry.get(required) === undefined) throw new Error(`the Advisor plugin did not register ${required}`)
+  }
+
+  ctx.on('agent/created', ({ agent }) => { agentsCreated.push(String(agent.id)) })
+
+  const createRoot = async (id: string): Promise<Agent> => ctx.agentLoop.create(SessionId(id), { provider: 'mock', model: 'weak' })
+  const root = await createRoot('deployed-runtime-root')
+
+  let callSeq = 0
+  return {
+    ctx,
+    root,
+    adapter,
+    sessionRoot,
+    agentsCreated,
+    secondRoot: (id: string) => createRoot(id),
+    liveAgent: (sessionId: string) => ctx.agents.get(SessionId(sessionId)),
+    liveSession: (sessionId: string) => ctx.sessions.get(SessionId(sessionId)),
+    async runTool(name, args, agent, signal = new AbortController().signal) {
+      const tools = ctx.get('tools') as any
+      const result = await tools.execute({ callId: ToolCallId(`deployed-${++callSeq}`), name, arguments: args, agent, signal })
+      const text = (result.content as readonly unknown[])
+        .flatMap(block => (block as { type?: string; text?: string }).type === 'text' ? [String((block as { text?: string }).text ?? '')] : [])
+        .join('')
+      // Owned leaf data only: `result.value` is the tool's own JSON DTO, and a
+      // failure is reported as `text`. The runtime's failure object is a live
+      // value and is deliberately never returned.
+      return {
+        ...(result.isError ? {} : { value: result.value }),
+        isError: Boolean(result.isError),
+        text,
+      }
+    },
+    async readPersisted(sessionId: string) {
+      const query = ctx.get('sessionQuery') as any
+      const read = await query.readSession(SessionId(sessionId))
+      return {
+        id: String(read.session.id),
+        parentSession: String(read.session.parentSession ?? ''),
+        events: (read.events as readonly { type: string; seq: number; data: unknown }[]),
+      }
+    },
+    async dispose(): Promise<void> {
+      await ctx.fiber.dispose()
+      rmSync(sessionRoot, { recursive: true, force: true })
+    },
+  }
 }

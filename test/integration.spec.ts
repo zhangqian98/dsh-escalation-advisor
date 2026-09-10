@@ -171,7 +171,9 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const advisors = advisorChildren(h)
     expect(advisors).toHaveLength(1)
     expect(advisors[0]!.agent.session.header.parentSession).toBe(h.root.session.id)
-    expect(descriptorOf(advisors[0]!.agent)?.mode).toBe('one-shot')
+    // The transport is continuable by construction: a follow-up turn needs the
+    // same child session to be resumable with its context intact.
+    expect(descriptorOf(advisors[0]!.agent)?.mode).toBe('continuable')
     expect(JSON.stringify(h.root.session.snapshotEvents())).toContain('Independent review found a concrete issue.')
   })
 
@@ -183,6 +185,10 @@ describe('real DSH AgentLoop and spawn integration', () => {
           question: 'Check the worker plan.',
         }),
         textResponse('worker completed after review'),
+        // The Advisor child settles between turns, so the runtime queues one
+        // `subagent-settled` notice into the requester's inbox and the worker
+        // takes one further step to consume it.
+        textResponse('worker after the settle notice'),
       ],
       advisor: advisorScript(advisorVerdictResponse()),
     })
@@ -219,7 +225,9 @@ describe('real DSH AgentLoop and spawn integration', () => {
 
     const weakRequests = h.adapter.forModel('weak')
     const advisorRequests = h.adapter.forModel('advisor')
-    expect(weakRequests).toHaveLength(3)
+    // The third weak step is still the first one to read the delivered advice;
+    // the fourth is the settle-notice step the continuable transport adds.
+    expect(weakRequests).toHaveLength(4)
     expect(advisorRequests).toHaveLength(2)
     expect(advisorRequests[0]!.sequence).toBeLessThan(weakRequests[2]!.sequence)
     expect(advisorRequests.at(-1)!.sequence).toBeLessThan(weakRequests[2]!.sequence)
@@ -314,6 +322,8 @@ describe('real DSH AgentLoop and spawn integration', () => {
         toolCallResponse('stale-failure', 'stale_fixture', {}),
         textResponse('first task done'),
         textResponse('new task done'),
+        // The settle notice of the abandoned Advisor child is consumed here.
+        textResponse('after the settle notice'),
       ],
       advisor: advisorScript(async request => {
         started.resolve()
@@ -343,7 +353,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
     await waitUntil(() => advisorChildren(h).some(record => record.disposedEvents !== undefined))
     await h.root.whenIdle()
 
-    expect(h.adapter.forModel('weak')).toHaveLength(3)
+    expect(h.adapter.forModel('weak')).toHaveLength(4)
     expect(requestText(h.adapter.forModel('weak')[2]!.request)).not.toContain('Advice for the obsolete first task.')
     const deliveredPluginMessages = h.root.session.snapshotEvents()
       .filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
@@ -357,6 +367,8 @@ describe('real DSH AgentLoop and spawn integration', () => {
           goal: 'Review the implementation.', question: 'What should change?',
         }),
         textResponse('continued without a review'),
+        // The settle notice of the Advisor child is consumed in one more step.
+        textResponse('after the settle notice'),
       ],
       advisor: [textResponse('Concern: preserve the lock until the write is durable.')],
     })
@@ -370,7 +382,27 @@ describe('real DSH AgentLoop and spawn integration', () => {
       status: 'failed-permanent',
       error: expect.stringContaining('no usable verdict'),
     })
-    expect(JSON.stringify(h.root.session.snapshotEvents())).not.toContain('preserve the lock until the write is durable')
+    // Nothing the plugin authors carries the prose. The only place it can appear is
+    // the runtime's own `subagent-settled` notice, which quotes the child's closing
+    // output verbatim: once as the queued inbox message and once as the splice that
+    // surfaces it to the requester. Both are pinned so the prose cannot silently
+    // grow into a delivered review.
+    const events = h.root.session.snapshotEvents()
+    const carriesProse = (event: (typeof events)[number]): boolean => JSON.stringify(event).includes('preserve the lock until the write is durable')
+    const proseEvents = events.filter(carriesProse)
+    expect(proseEvents.length).toBeGreaterThan(0)
+    for (const event of proseEvents) {
+      if (event.type === 'user/message') {
+        expect((event.data as { source?: { kind?: string } }).source?.kind).toBe('subagent-settled')
+        continue
+      }
+      // The splice that hands the notice to the requester must quote exactly the
+      // notice the runtime queued, and nothing else.
+      expect(event.type).toBe('agent/inbox/spliced')
+      const inserted = (event.data as { inserted?: { source?: { kind?: string } }[] }).inserted ?? []
+      expect(inserted.length).toBeGreaterThan(0)
+      for (const message of inserted) expect(message.source?.kind).toBe('subagent-settled')
+    }
     const toolResults = h.adapter.forModel('weak')[1]!.request.messages
       .flatMap(message => message.content)
       .filter(block => block.type === 'tool-result')

@@ -199,10 +199,18 @@ export class AdvisorVerdictCollector {
     consultation.refusal = reason
   }
 
-  /** Drop the record; the consultation id is single-use. */
+  /**
+   * Drop ONE record and the child index it created.
+   *
+   * A turn's record is its own: the index is removed only when it still points to
+   * the record being released, so releasing a finished turn — or a turn that never
+   * bound anything — can never clear the index of a turn that is live. Successive
+   * turns of one durable child therefore each resolve to their own record, and the
+   * consultation id stays single-use per turn.
+   */
   release(id: string): void {
     const consultation = this.consultations.get(id)
-    if (consultation?.childSessionId !== undefined) this.byChild.delete(consultation.childSessionId)
+    if (consultation?.childSessionId !== undefined && this.byChild.get(consultation.childSessionId) === id) this.byChild.delete(consultation.childSessionId)
     this.consultations.delete(id)
   }
 

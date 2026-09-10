@@ -13,10 +13,11 @@ function failingTool(h: IntegrationHarness) {
 
 describe('Advisor lifecycle accounting and delivery', () => {
   it('delivers actual Advisor changes even when the verdict has no remaining concern', async () => {
-    const h = await harness({ weak: [toolCallResponse('changed', 'write', {}), textResponse('Implemented the task.'), textResponse('Verified the Advisor changes.')], advisor: advisorScript(advisorVerdictResponse({ severity: 'none', changes_made: [{ paths: ['auth.ts'], reason: 'Corrected the guard', validation: ['auth test passed'] }] })) }, { mode: 'continuous', defaultEnabledTools: ['write'] })
+    const h = await harness({ weak: [toolCallResponse('changed', 'write', {}), textResponse('Implemented the task.'), textResponse('Verified the Advisor changes.'), textResponse('Settled after the Advisor result.')], advisor: advisorScript(advisorVerdictResponse({ severity: 'none', changes_made: [{ paths: ['auth.ts'], reason: 'Corrected the guard', validation: ['auth test passed'] }] })) }, { mode: 'continuous', defaultEnabledTools: ['write'] })
     h.ctx.tools.register(defineContentToolFixture({ name: 'write', description: 'Fixture mutation', parameters: {}, async execute() { return [{ type: 'text', text: 'changed' }] } }))
     await h.runRoot('Implement and review')
-    expect(h.adapter.forModel('weak')).toHaveLength(3)
+    // Three requester steps plus the step that consumes the child-settle notice.
+    expect(h.adapter.forModel('weak')).toHaveLength(4)
     expect(JSON.stringify(h.adapter.forModel('weak')[2]!.request.messages)).toContain('Corrected the guard')
   })
   it('reports an ancestor lease conflict without deadlocking or spending model budget', async () => {
@@ -77,7 +78,7 @@ describe('Advisor lifecycle accounting and delivery', () => {
 
   it('retries a transient automatic failure once and only deduplicates after delivery', async () => {
     let retryableFailures = 0
-    const h = await harness({ weak: [toolCallResponse('f1', 'fails', {}), toolCallResponse('f2', 'fails', {}), textResponse('done')], advisor: [() => { retryableFailures += 1; throw new Error('provider timeout') }, ...advisorScript(advisorVerdictResponse())] }, { mode: 'escalate', retryDelayMs: 0 })
+    const h = await harness({ weak: [toolCallResponse('f1', 'fails', {}), toolCallResponse('f2', 'fails', {}), textResponse('done'), textResponse('Settled after the Advisor result.')], advisor: [() => { retryableFailures += 1; throw new Error('provider timeout') }, ...advisorScript(advisorVerdictResponse())] }, { mode: 'escalate', retryDelayMs: 0 })
     failingTool(h)
     await h.runRoot('Fix the failures')
     expect(retryableFailures).toBe(1)
@@ -85,15 +86,18 @@ describe('Advisor lifecycle accounting and delivery', () => {
     expect(h.adapter.forModel('advisor')).toHaveLength(3)
     expect(advisorRunHistory(h.root).map(run => run.status)).toEqual(['failed-transient', 'delivered'])
     expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).budget.used).toBe(2)
-    expect(h.adapter.forModel('weak')).toHaveLength(3)
+    // The two failing steps, the step that reads the advice, and the settle notice.
+    expect(h.adapter.forModel('weak')).toHaveLength(4)
   })
   it('keeps automatic retry eligibility after refunded auth startup failures', async () => {
+    // The startup failure is repaired before the retry, so the refunded attempt is the
+    // one that proves eligibility was restored rather than spent.
     let authenticated = false, preparations = 0
-    const h = await harness({ weak: [toolCallResponse('f1', 'fails', {}), toolCallResponse('f2', 'fails', {}), () => { authenticated = true; return textResponse('The credentials have been repaired.') }, textResponse('Applied the Advisor result.')], advisor: advisorScript(advisorVerdictResponse()) }, { mode: 'escalate', retryDelayMs: 0, maxAdvisorConsultsPerTask: 1 })
+    const h = await harness({ weak: [toolCallResponse('f1', 'fails', {}), toolCallResponse('f2', 'fails', {}), textResponse('Applied the Advisor result.'), textResponse('Settled after the Advisor result.')], advisor: advisorScript(advisorVerdictResponse()) }, { mode: 'escalate', retryDelayMs: 0, maxAdvisorConsultsPerTask: 1 })
     failingTool(h)
     const prepare = h.adapter.prepareCall.bind(h.adapter)
     vi.spyOn(h.adapter, 'prepareCall').mockImplementation(async (provider, model, signal) => {
-      if (model === 'advisor') { preparations++; if (!authenticated) throw new Error('Authentication credentials temporarily unavailable') }
+      if (model === 'advisor') { preparations++; if (!authenticated) { authenticated = true; throw new Error('Authentication credentials temporarily unavailable') } }
       return prepare(provider, model, signal)
     })
     await h.runRoot('Fix this problem')

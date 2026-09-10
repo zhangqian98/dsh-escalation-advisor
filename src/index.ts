@@ -10,7 +10,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import { Config as ConfigSchema, routeConfigured, severityRank, type Config as AdvisorConfig } from './config.js'
 import { coverageEnabled, type AdvisorAgentRole } from './coverage.js'
 import { buildCasePacket, textContent } from './context.js'
-import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, type AdvisorRunResult } from './model-runner.js'
+import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, requesterSeq, START_REJECTED, type AdvisorRunResult, type AdvisorContinuation } from './model-runner.js'
 import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
 import { toolGuidance } from './prompts.js'
 import { EscalationTracker, classifyToolOutcome, mutationKey, type EscalationDecision } from './state.js'
@@ -34,9 +34,18 @@ export type PluginConfig = AdvisorConfig
 export const SETTINGS_NAMESPACE = 'escalation-advisor'
 export const ADVISOR_TOOL_NAME = 'consult_advisor'
 const INTERNAL_TOOLS = new Set(['structured_output', 'run_code', ADVISOR_VERDICT_TOOL])
-interface AskAdvisorArgs { question: string; goal?: string; current_hypothesis?: string; decision_needed?: string; evidence?: string[]; failed_attempts?: string[]; attempts?: string; context?: string }
+interface AskAdvisorArgs { question: string; goal?: string; current_hypothesis?: string; decision_needed?: string; evidence?: string[]; failed_attempts?: string[]; attempts?: string; context?: string; consultation_id?: string }
 interface ReviewTrigger { turn: number; step?: number; decision?: EscalationDecision }
 
+/**
+ * The PUBLIC conversation handle is `<uuid>#<turn>.<attempt>`: the string a
+ * consumer receives as `consultation_id` and the string it must be able to send
+ * back. The record store is keyed by the bare uuid instead, so the handle stays
+ * the SAME string for every turn of one conversation while each turn still gets
+ * its own internal channel identity.
+ */
+const handleBase = (handle: string): string => handle.replace(/#.*$/, '')
+const handleOf = (base: string, turn: number): string => base + '#' + turn + '.1'
 function taskRootAgent(ctx: Context, agent: Agent): Agent {
   let current = agent
   const seen = new Set<string>()
@@ -49,14 +58,18 @@ function taskRootAgent(ctx: Context, agent: Agent): Agent {
   return current
 }
 
-function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child: string): UserMessage {
+function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child: string, consultationId?: string): UserMessage {
   const blocker = verdict.severity === 'blocker' ? '\nDo not continue the original approach until this finding has been checked and resolved.' : ''
   const actions = verdict.nextActions.map((item, index) => (index + 1) + '. ' + item).join('\n')
   const evidence = verdict.evidenceUsed?.map(item => item.kind + ': ' + item.reference).join('\n') ?? ''
   const validation = verdict.validationPlan?.join('\n') ?? ''
   const changes = verdict.changesMade?.map(item => item.paths.join(', ') + ': ' + item.reason + '\nValidation: ' + (item.validation.join('; ') || 'not reported')).join('\n') ?? ''
+  // The consultation id is the only way to continue this same Advisor
+  // conversation. It is durable identity, not a label, so it travels with the
+  // advice the requesting agent sees.
+  const follow = consultationId === undefined ? '' : '\n\nConsultation id: ' + consultationId + '\nTo continue this SAME Advisor conversation with its earlier context, call consult_advisor again with consultation_id="' + consultationId + '".'
   return createUserMessage({
-    content: [{ type: 'text', text: '[Strong advisor — ' + origin + '; severity=' + verdict.severity + '; child=' + child + ']\n' + verdict.summary + '\n\n' + verdict.diagnosis + '\n' + actions + blocker + '\nEvidence used:\n' + (evidence || 'not reported') + '\nValidation plan:\n' + (validation || 'not reported') + '\nChanges made by Advisor:\n' + (changes || 'none reported') + '\n\nVerify this independent review against repository evidence and validation results.' }],
+    content: [{ type: 'text', text: '[Strong advisor — ' + origin + '; severity=' + verdict.severity + '; child=' + child + ']\n' + verdict.summary + '\n\n' + verdict.diagnosis + '\n' + actions + blocker + '\nEvidence used:\n' + (evidence || 'not reported') + '\nValidation plan:\n' + (validation || 'not reported') + '\nChanges made by Advisor:\n' + (changes || 'none reported') + follow + '\n\nVerify this independent review against repository evidence and validation results.' }],
     source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor · ' + verdict.summary },
   })
 }
@@ -77,10 +90,12 @@ function obligationMessage(items: readonly Obligation[]): UserMessage {
     source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + items.length + ' open obligation(s)' },
   })
 }
-function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor unavailable', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
-function toolAnswer(answer: AdvisorRunResult) {
+function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor unavailable', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', consultation_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
+function toolAnswer(answer: AdvisorRunResult, consultationId: string) {
   const verdict = answer.verdict
   return { status: 'ok' as const, severity: verdict.severity, summary: verdict.summary, diagnosis: verdict.diagnosis, next_actions: verdict.nextActions, confidence: verdict.confidence ?? 0, child_session_id: answer.childSessionId,
+    // The durable handle for delivering a follow-up turn in the SAME Advisor conversation.
+    consultation_id: consultationId,
     disposition: verdict.disposition ?? 'review', evidence_used: verdict.evidenceUsed ?? [], assumptions: verdict.assumptions ?? [], recommended_next_action: verdict.recommendedNextAction ?? '', validation_plan: verdict.validationPlan ?? [], needs_more_evidence: verdict.needsMoreEvidence ?? false, changes_made: verdict.changesMade ?? [] }
 }
 
@@ -193,11 +208,50 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     return assembly
   })
 
-  const consult = async (agent: Agent, mode: ConsultationMode, trigger: ReviewTrigger, args: AskAdvisorArgs, signal: AbortSignal, revision: string, onStarted?: () => void) => {
-    const root = taskRootAgent(ctx, agent), id = randomUUID()
+  /**
+   * Continuable Advisor conversations, by the durable consultation id the
+   * requesting agent sends back to continue one. Only ids issued by THIS live
+   * root task are honored: an unknown or foreign id is refused, never silently
+   * started as a fresh consultation.
+   */
+  const consultations = new Map<string, { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number }>()
+  const rememberConsultation = (value: { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number }): void => {
+    // Keyed by the BARE uuid: the handle a caller holds is `<uuid>#<turn>.<attempt>`,
+    // but one conversation is ONE record whatever handle form addresses it — the id
+    // the FIRST turn minted, or that same uuid on its own.
+    consultations.set(handleBase(value.consultationId), value)
+    while (consultations.size > 64) {
+      const oldest = consultations.keys().next().value
+      if (oldest === undefined) break
+      consultations.delete(oldest)
+    }
+  }
+  ctx.on('agent/disposed', ({ agent }) => {
+    if (agent.session.header.parentSession !== undefined) return
+    const rootId = String(agent.id)
+    for (const [requested, value] of consultations) if (value.rootId === rootId) consultations.delete(requested)
+  })
+  ctx.effect(() => () => consultations.clear(), 'advisor: drop continuation records')
+
+  const consult = async (agent: Agent, mode: ConsultationMode, trigger: ReviewTrigger, args: AskAdvisorArgs, signal: AbortSignal, revision: string, options: { onStarted?: () => void; continuation?: { consultationId: string; publicId: string; childSessionId: string; turns: number } } = {}) => {
+    const root = taskRootAgent(ctx, agent), id = options.continuation?.consultationId ?? randomUUID()
+    // The handle the FIRST turn minted, reused verbatim by every later turn: a caller
+    // that continues with the id it was handed gets that same id back.
+    const publicId = options.continuation?.publicId ?? handleOf(id, 0)
     const config = configFor(agent)
     const sinceSeq = mode === 'continuous' ? reviewed.get(String(agent.id))?.seq : undefined
+    const turns = options.continuation?.turns ?? 0
+    let continuation: AdvisorContinuation = options.continuation === undefined
+      ? { kind: 'start', prompt: '' }
+      : { kind: 'continue', childSessionId: options.continuation.childSessionId, prompt: '' }
+    // One retry per consultation: a second full attempt recovers a transient failure
+    // or an authentication repair, and a consultation that still cannot be delivered
+    // leaves eligibility to the next consultation instead of exhausting this one.
     for (let attempt = 1; attempt <= 2; attempt++) {
+      // The collector record is single-use per turn: one record with one candidate
+      // slot cannot hold turn 2 without refusing a legitimate second verdict as
+      // 'duplicate' or 'conflicting'.
+      const collectorId = id + '#' + turns + '.' + attempt
       const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
       const runRecord: AdvisorRunRecord = {
         version: 1, id, requesterId: String(agent.id), mode, turn: trigger.turn, ...(trigger.step === undefined ? {} : { step: trigger.step }),
@@ -205,7 +259,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         attempt, status: 'reserved', timestamp: new Date().toISOString(), question: redactSecrets(args.question),
       }
       const record = (patch: Partial<AdvisorRunRecord>) => { Object.assign(runRecord, Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)), { timestamp: new Date().toISOString() }); recordRun(agent, root, runRecord) }
-      record({})
+      // Every attempt is tracked from `reserved`: an attempt that never reached the
+      // model must not leave `started` behind for the next one to inherit.
+      record({ status: 'reserved' })
       try {
         const result = await limiter.run(String(root.id), { maxTotal: config.maxAdvisorConsultsPerTask, maxConcurrent: config.maxConcurrentAdvisorRuns, trackStart: true }, attemptSignal, async markStarted => {
           if (!fresh(agent, revision)) throw new AdvisorUnavailableError('Task changed before Advisor started.', 'stale')
@@ -222,7 +278,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
           return workspace.run(String(root.id), exclusive, attemptSignal, async () => {
             if (!fresh(agent, revision)) throw new AdvisorUnavailableError('Task changed before Advisor started.', 'stale')
             const packet = buildCasePacket({
-              requester: agent, root, mode, question: args.question, consultationId: id,
+              requester: agent, root, mode, question: args.question, consultationId: publicId,
               currentHypothesis: args.current_hypothesis, decisionNeeded: args.decision_needed,
               evidence: [...args.evidence ?? [], ...args.context ? [args.context] : []],
               failedAttempts: [...args.failed_attempts ?? [], ...args.attempts ? [args.attempts] : []],
@@ -232,24 +288,35 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
               taskStartSeq: taskStarts.get(String(agent.id)),
             })
             if (mode === 'continuous' && !packet.meaningful) return undefined
-            const answer = await callAdvisor(ctx, config, agent, packet.prompt, attemptSignal, policy, 'Advisor · ' + mode + ' · turn ' + trigger.turn, {
-              registry, root, collector: verdicts, consultationId: id, onStarted: () => { markStarted(); onStarted?.(); record({ status: 'started' }) },
-              onPublished: childSessionId => record({ childSessionId }),
+            // Every attempt delivers this turn's own packet: a fresh consultation carries
+            // it as its first prompt, and a follow-up carries it as the new turn's content.
+            if (continuation.kind === 'start') continuation = { kind: 'start', prompt: packet.prompt }
+            else continuation = { kind: 'continue', childSessionId: continuation.childSessionId, prompt: packet.prompt }
+            const answer = await callAdvisor(ctx, config, agent, continuation, attemptSignal, policy, 'Advisor · ' + mode + ' · turn ' + trigger.turn, {
+              registry, root, collector: verdicts, publicId, collectorId, ...(options.continuation === undefined ? {} : { followUp: true }), onStarted: () => { markStarted(); options.onStarted?.(); record({ status: 'started' }) },
+              onPublished: childSessionId => { continuation = { kind: 'continue', childSessionId, prompt: '' }; record({ childSessionId }) },
             })
+
             return { answer, lastSeq: packet.lastSeq }
           })
         })
         if (!result) { record({ status: 'skipped' }); return undefined }
         if (!fresh(agent, revision)) { record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity }); return undefined }
         record({ status: 'delivered', childSessionId: result.answer.childSessionId, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, usage: result.answer.usage, verdictTool: ADVISOR_VERDICT_TOOL,
-          responseText: mode === 'manual' ? JSON.stringify(toolAnswer(result.answer), null, 2) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId).content) })
+          responseText: mode === 'manual' ? JSON.stringify(toolAnswer(result.answer, publicId), null, 2) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId, publicId).content) })
         if (mode === 'continuous') reviewed.set(String(agent.id), { turn: trigger.turn, seq: result.lastSeq })
+        // The id stays stable for the whole conversation so a follow-up turn can
+        // address the SAME child session instead of starting a new consultation.
+        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1 })
         return result.answer
+
       } catch (error) {
         const message = truncateUtf8(redactSecrets(error instanceof Error ? error.message : String(error)), 1500)
         const cancelled = signal.aborted || error instanceof AdvisorUnavailableError && error.code === 'cancelled'
         const stale = !fresh(agent, revision) || error instanceof AdvisorUnavailableError && error.code === 'stale'
-        const retryableStart = runRecord.status !== 'started' && (error instanceof AdvisorUnavailableError && ['child_start_failed', 'child_failed', 'retryable_start'].includes(error.code) || error instanceof AdvisorTaskLimitError && error.code === 'task_budget_reserved')
+        // A start the runtime refused is retryable: the retry either continues the
+        // established conversation or falls back to a fresh one.
+        const retryableStart = runRecord.status !== 'started' && (error instanceof AdvisorUnavailableError && ['child_start_failed', 'child_failed', 'retryable_start', START_REJECTED].includes(error.code) || error instanceof AdvisorTaskLimitError && error.code === 'task_budget_reserved')
         const transient = retryableStart || error instanceof AdvisorUnavailableError && error.transient || error instanceof Error && error.name === 'TimeoutError'
         record({ status: stale ? 'stale' : cancelled ? 'cancelled' : transient ? 'failed-transient' : 'failed-permanent', error: message })
         if (!transient || cancelled || stale || attempt === 2 || mode === 'manual') {
@@ -269,6 +336,10 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     parameters: {
       question: { type: 'string', required: true }, goal: { type: 'string' }, current_hypothesis: { type: 'string' }, decision_needed: { type: 'string' },
       evidence: { type: 'array', items: { type: 'string' } }, failed_attempts: { type: 'array', items: { type: 'string' } }, attempts: { type: 'string' }, context: { type: 'string' },
+      // Continue an EXISTING consultation as a new turn of the SAME Advisor
+      // conversation: earlier context, persona and tool policy stay intact.
+      consultation_id: { type: 'string' },
+
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
@@ -282,7 +353,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         } } },
         status: { type: 'string', required: true, enum: ['ok', 'unavailable', 'error'] }, severity: { type: 'string', required: true, enum: ['none', 'nit', 'concern', 'blocker'] },
         summary: { type: 'string', required: true }, diagnosis: { type: 'string', required: true }, next_actions: { type: 'array', required: true, items: { type: 'string' } },
-        confidence: { type: 'number', required: true }, child_session_id: { type: 'string', required: true },
+        confidence: { type: 'number', required: true }, child_session_id: { type: 'string', required: true }, consultation_id: { type: 'string', required: true },
       } },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
@@ -293,12 +364,33 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       if ((manualCalls.get(key) ?? 0) + (manualReserved.get(key) ?? 0) >= config.maxManualConsultsPerSession) return unavailable('Manual Advisor consultation budget reached.')
       manualReserved.set(key, (manualReserved.get(key) ?? 0) + 1)
       let started = false
+      const args = raw as AskAdvisorArgs
+      // A follow-up must address a consultation THIS exact live requester opened
+      // on the same root task: an unknown or foreign id is refused outright and
+      // never silently restarted as a fresh consultation. The id is RESOLVED to its
+      // bare uuid — the store's key — while the id the caller supplied is echoed
+      // back verbatim: the handle a caller was handed always continues its own
+      // conversation, and always comes back to it unchanged.
+      const refundReservation = (): void => { manualReserved.set(key, Math.max(0, (manualReserved.get(key) ?? 1) - 1)) }
+      let continuation: { consultationId: string; publicId: string; childSessionId: string; turns: number } | undefined
+      if (typeof args.consultation_id === 'string' && args.consultation_id.trim()) {
+        const requested = handleBase(args.consultation_id.trim())
+        const found = consultations.get(requested)
+        if (!found) { refundReservation(); return unavailable('Unknown consultation id: this agent has no open consultation with that id. Start a new consultation by omitting consultation_id.') }
+        if (found.requesterId !== key || found.rootId !== String(taskRootAgent(ctx, agent).id)) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
+        continuation = { consultationId: found.consultationId, publicId: args.consultation_id.trim(), childSessionId: found.childSessionId, turns: found.turns }
+      }
       try {
         const ending = agent.session.snapshotEvents().findLast(event => event.type === 'step/start')
-        const answer = await consult(agent, 'manual', { turn: ending?.type === 'step/start' ? ending.data.turn : 0 }, raw as AskAdvisorArgs, AbortSignal.any([exec.signal, disposed.signal]), revisionOf(agent), () => {
-          if (!started) { started = true; manualCalls.set(key, (manualCalls.get(key) ?? 0) + 1) }
+        const answer = await consult(agent, 'manual', { turn: ending?.type === 'step/start' ? ending.data.turn : 0 }, args, AbortSignal.any([exec.signal, disposed.signal]), revisionOf(agent), {
+          onStarted: () => { if (!started) { started = true; manualCalls.set(key, (manualCalls.get(key) ?? 0) + 1) } },
+          ...(continuation === undefined ? {} : { continuation }),
         })
-        return answer ? toolAnswer(answer) : unavailable('Advisor result expired after the task changed.')
+        // The id is returned for a FRESH consultation too: it is the handle a later
+        // follow-up turn addresses, and it stays stable for the whole conversation.
+        // It is the PUBLIC id — never this turn's internal collector identity, which
+        // no map accepts as a continuation id.
+        return answer ? toolAnswer(answer, answer.consultationId) : unavailable('Advisor result expired after the task changed.')
       } catch (error) { return unavailable(error instanceof Error ? error.message : String(error)) }
       finally { manualReserved.set(key, Math.max(0, (manualReserved.get(key) ?? 1) - 1)) }
     },
@@ -435,7 +527,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         const verdict = answer.verdict
         const changed = (verdict.changesMade?.length ?? 0) > 0
         if (verdict.severity === 'none' && !changed) return
-        const message = adviceMessage(verdict, mode, answer.childSessionId)
+        const message = adviceMessage(verdict, mode, answer.childSessionId, answer.consultationId)
         const threshold = mode === 'continuous' ? Math.max(severityRank('concern'), severityRank(config.continuousMinSeverity)) : severityRank('concern')
         if (!changed && severityRank(verdict.severity) < threshold) {
           if (config.injectNits && role === 'root') futureNotes.set(key, [...futureNotes.get(key) ?? [], message].slice(-4))
