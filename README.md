@@ -102,7 +102,7 @@ The Advisor child receives a DSH `toolFilter.allow`. A monotonic `tools.guard` a
 
 `subagent`, `subagent_fork`, `subagent_control`, `workflow`, `ralph`, and their reserved variants are always disabled for Advisor. The host also reads trusted Cordis plugin configurations to recognize renamed built-in delegation tools. `capabilityAmplifierTools` adds custom/MCP delegators to the denylist. A child created by an unrecognized local wrapper cannot enter a model step, so it cannot spend unbudgeted model calls. Requester-local tools that do not exist in a fresh spawn scope are reported as unavailable.
 
-`structured_output` and the PTC transport `run_code` are internal exceptions. `consult_advisor` is never exposed to an Advisor child.
+`structured_output`, the plugin's own `advisor_verdict` channel, and the PTC transport `run_code` are internal exceptions; the verdict exception covers that single tool name and grants no other permission. `consult_advisor` is never exposed to an Advisor child.
 
 ## Model input and output limits
 
@@ -193,7 +193,7 @@ This coverage applies to **local DSH agents** that participate in the DSH agent/
 
 ## Advisor result
 
-The Advisor child returns structured output, including evidence and any actual changes it reports:
+The Advisor child submits its review through the plugin's own `advisor_verdict` tool. That tool is the only authoritative source: a submission is recorded as a candidate and is published only once the run reports `completed` and the child session records a closing turn boundary at or after the submission. A run that never calls it fails explicitly rather than being read from the Advisor's prose. The review includes evidence and any actual changes the Advisor reports:
 
 ```json
 {
@@ -212,7 +212,7 @@ The Advisor child returns structured output, including evidence and any actual c
 }
 ```
 
-A material automatic result is steered only into the requester. `none` does not interrupt; `nit` is held for a naturally occurring next step, without extending a closing turn; concern/blocker findings request verification or correction. A completed child turn with useful text but no `structured_output` has an explicit text fallback. Cancelled, timed-out, or failed turns are not presented as successful reviews.
+A material automatic result is steered only into the requester. `none` does not interrupt; `nit` is held for a naturally occurring next step, without extending a closing turn; concern/blocker findings request verification or correction. A completed child turn whose verdict was never submitted through `advisor_verdict`, or whose closing turn boundary cannot be reconciled with the submission, is a failure rather than a review; prose is never promoted into a verdict. Cancelled, timed-out, or failed turns are not presented as successful reviews.
 
 Nits accepted before new user input are delivered as explicitly historical, optional context on the next normal step. They never instruct the agent to resume the prior task. Background results that arrive after new user intent are rejected by the revision guard.
 

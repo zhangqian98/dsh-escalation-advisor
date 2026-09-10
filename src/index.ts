@@ -22,6 +22,7 @@ import { isCapabilityAmplifier, toolEffect } from './capabilities.js'
 import { recordRun, type AdvisorRunRecord, type ConsultationMode } from './telemetry.js'
 import { redactSecrets, truncateUtf8 } from './redact.js'
 import type { AdvisorVerdict } from './verdict.js'
+import { ADVISOR_VERDICT_TOOL, AdvisorVerdictCollector, registerAdvisorVerdictTool } from './verdict-tool.js'
 import { AdvisorRemoteService } from './remote.js'
 import { installAdvisorEventCompatibility } from './session-events.js'
 import { advisorModelConfig } from './model-selection.js'
@@ -32,7 +33,7 @@ export { ConfigSchema as Config }
 export type PluginConfig = AdvisorConfig
 export const SETTINGS_NAMESPACE = 'escalation-advisor'
 export const ADVISOR_TOOL_NAME = 'consult_advisor'
-const INTERNAL_TOOLS = new Set(['structured_output', 'run_code'])
+const INTERNAL_TOOLS = new Set(['structured_output', 'run_code', ADVISOR_VERDICT_TOOL])
 interface AskAdvisorArgs { question: string; goal?: string; current_hypothesis?: string; decision_needed?: string; evidence?: string[]; failed_attempts?: string[]; attempts?: string; context?: string }
 interface ReviewTrigger { turn: number; step?: number; decision?: EscalationDecision }
 
@@ -80,11 +81,12 @@ function unavailable(message: string) { return { status: 'unavailable' as const,
 function toolAnswer(answer: AdvisorRunResult) {
   const verdict = answer.verdict
   return { status: 'ok' as const, severity: verdict.severity, summary: verdict.summary, diagnosis: verdict.diagnosis, next_actions: verdict.nextActions, confidence: verdict.confidence ?? 0, child_session_id: answer.childSessionId,
-    disposition: verdict.disposition ?? 'review', evidence_used: verdict.evidenceUsed ?? [], assumptions: verdict.assumptions ?? [], recommended_next_action: verdict.recommendedNextAction ?? '', validation_plan: verdict.validationPlan ?? [], needs_more_evidence: verdict.needsMoreEvidence ?? answer.structuredFallback, changes_made: verdict.changesMade ?? [] }
+    disposition: verdict.disposition ?? 'review', evidence_used: verdict.evidenceUsed ?? [], assumptions: verdict.assumptions ?? [], recommended_next_action: verdict.recommendedNextAction ?? '', validation_plan: verdict.validationPlan ?? [], needs_more_evidence: verdict.needsMoreEvidence ?? false, changes_made: verdict.changesMade ?? [] }
 }
 
 export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<void> {
   installAdvisorEventCompatibility(ctx)
+  const verdicts = new AdvisorVerdictCollector()
   const logger = ctx.logger(name)
   const settings = ctx.settings.register(SETTINGS_NAMESPACE, ConfigSchema, { base: entryConfig })
   const currentConfig = (): AdvisorConfig => settings.get()
@@ -231,7 +233,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
             })
             if (mode === 'continuous' && !packet.meaningful) return undefined
             const answer = await callAdvisor(ctx, config, agent, packet.prompt, attemptSignal, policy, 'Advisor · ' + mode + ' · turn ' + trigger.turn, {
-              registry, root, onStarted: () => { markStarted(); onStarted?.(); record({ status: 'started' }) },
+              registry, root, collector: verdicts, consultationId: id, onStarted: () => { markStarted(); onStarted?.(); record({ status: 'started' }) },
               onPublished: childSessionId => record({ childSessionId }),
             })
             return { answer, lastSeq: packet.lastSeq }
@@ -239,7 +241,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         })
         if (!result) { record({ status: 'skipped' }); return undefined }
         if (!fresh(agent, revision)) { record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity }); return undefined }
-        record({ status: 'delivered', childSessionId: result.answer.childSessionId, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, usage: result.answer.usage, structuredFallback: result.answer.structuredFallback,
+        record({ status: 'delivered', childSessionId: result.answer.childSessionId, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, usage: result.answer.usage, verdictTool: ADVISOR_VERDICT_TOOL,
           responseText: mode === 'manual' ? JSON.stringify(toolAnswer(result.answer), null, 2) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId).content) })
         if (mode === 'continuous') reviewed.set(String(agent.id), { turn: trigger.turn, seq: result.lastSeq })
         return result.answer
@@ -260,6 +262,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     return undefined
   }
 
+  registerAdvisorVerdictTool(ctx, { registry, collector: verdicts })
   ctx.tools.register(defineTool({
     name: ADVISOR_TOOL_NAME,
     description: 'Ask a stronger model for an independent engineering review in a visible child session. Supply the question, hypothesis, evidence and failed attempts; the harness supplies the task.',

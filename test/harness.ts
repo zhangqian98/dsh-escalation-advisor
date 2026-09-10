@@ -20,6 +20,7 @@ import SubagentRuntime, { type SubagentRun, type SubagentStartRequest } from '@d
 import * as Spawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { ADVISOR_VERDICT_TOOL } from '../src/verdict-tool.js'
 import * as Advisor from '../src/index.js'
 import type { Config } from '../src/config.js'
 
@@ -223,7 +224,7 @@ export function toolCallResponse(callId: string, name: string, args: object): St
 }
 
 export function advisorVerdictResponse(overrides: Record<string, unknown> = {}): StreamChunk[] {
-  return toolCallResponse('advisor-verdict', 'structured_output', {
+  return toolCallResponse('advisor-verdict', ADVISOR_VERDICT_TOOL, {
     severity: 'concern',
     disposition: 'revise',
     summary: 'Independent review found a concrete issue.',
@@ -238,6 +239,16 @@ export function advisorVerdictResponse(overrides: Record<string, unknown> = {}):
     changes_made: [],
     ...overrides,
   })
+}
+
+/**
+ * One Advisor consultation now costs two model requests: the verdict tool call,
+ * then the closing response the model produces after the tool result. The
+ * verdict channel is an ordinary tool, unlike the one-shot structured_output
+ * runtime, which ended the run at capture.
+ */
+export function advisorScript(...entries: ScriptEntry[]): ScriptEntry[] {
+  return entries.flatMap(entry => [entry, textResponse('Verdict submitted.')])
 }
 
 export function descriptorOf(agent: Agent): Record<string, unknown> | undefined {

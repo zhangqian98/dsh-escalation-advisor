@@ -6,6 +6,15 @@ Advisor work is not a hidden auxiliary LLM request. Each consultation starts a s
 
 The implementation deliberately uses a **fresh one-shot child per consultation**. This gives every review a clean evidence boundary and avoids ordinary continuable-child settlement notices waking a parent when a background review finds `severity=none`. Session reuse should only be added behind an explicit strategy whose notification behavior remains correct.
 
+### Verdict channel
+
+The Advisor's review is not read from its prose. The plugin registers its own `advisor_verdict` tool host-wide before any child is composed, includes it in the child's tool allow-list regardless of the configurable tool policy, and treats that tool as the only authoritative verdict source. The tool is registered first because `tools.restrict()` rejects an unknown tool name, so a child composed before registration would fail to start rather than silently lose the channel.
+
+A submission is a **candidate**, not a verdict. It is recorded against a consultation keyed by the host-generated consultation id and indexed by child session, and the calling child is resolved from the live agent rather than from anything the model supplies; the invocation identity is checked against the registry's host-created record. The candidate is published only when the run reports `completed` **and** the child session records a closing turn boundary whose seq is at or after the submission. Inbox acceptance, quiescence and a pre-close boundary are not terminal evidence on their own.
+
+A run that ends without a reconciled verdict raises `no_verdict`. Prose is never promoted into an authoritative review, and no approval-shaped fallback object is manufactured. A conflicting second submission is refused rather than overwriting the first; an identical repeat is a duplicate. A consultation that did not publish is closed on the way out, so a late submission resolves to a refusal instead of reviving it.
+
+`advisor_verdict` is an ordinary tool and does not end the turn, unlike the one-shot `structured_output` runtime it replaces. A consultation therefore costs one additional closing model request.
 ## Agent-tree coverage
 
 Advisor distinguishes three DSH agent roles:
@@ -139,7 +148,7 @@ Prompt text is not the permission boundary.
 1. Before creating an Advisor child, the root effective allowlist is intersected with the requesting agent's visible tools and passed as DSH `toolFilter.allow`.
 2. A monotonic `tools.guard` recognizes registered Advisor identities and repeats the original ceiling + current root-policy + requester-visibility check at execution time.
 
-The second layer closes the gap where child-scoped tools are not covered by a global-tool restriction. Descendants receive the same global restriction and execution guard, and their pre-step is rejected unless their session ID is the originally budgeted Advisor ID. Known delegation tools, including `toolName` aliases from trusted Cordis plugin runtime configurations, are reserved and cannot be enabled. Additional custom/MCP delegators can be classified through `capabilityAmplifierTools`. `structured_output` and PTC `run_code` are internal runtime exceptions. `consult_advisor` is never exposed to an Advisor child.
+The second layer closes the gap where child-scoped tools are not covered by a global-tool restriction. Descendants receive the same global restriction and execution guard, and their pre-step is rejected unless their session ID is the originally budgeted Advisor ID. Known delegation tools, including `toolName` aliases from trusted Cordis plugin runtime configurations, are reserved and cannot be enabled. Additional custom/MCP delegators can be classified through `capabilityAmplifierTools`. `structured_output`, the internal `advisor_verdict` channel, and PTC `run_code` are internal runtime exceptions; the verdict exception is scoped to that one tool name and authorizes nothing else. `consult_advisor` is never exposed to an Advisor child.
 
 ## External provider boundary
 

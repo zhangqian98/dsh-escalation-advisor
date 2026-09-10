@@ -12,7 +12,7 @@ Severity semantics:
 - concern: likely mistake, missing evidence, or wrong hypothesis; the requesting agent should act before finishing.
 - blocker: high-confidence correctness/safety issue or repeated failed approach; the requesting agent should change course now.
 
-When the runtime provides a structured_output tool, finish by calling it exactly once with severity, disposition, summary, diagnosis, next_actions, evidence_used, assumptions, recommended_next_action, validation_plan, needs_more_evidence, confidence, and changes_made. Use empty arrays when a list has no entries.`
+Finish every turn by calling the advisor_verdict tool exactly once with severity, disposition, summary, diagnosis, next_actions, evidence_used, assumptions, recommended_next_action, validation_plan, needs_more_evidence, confidence, and changes_made. Use empty arrays when a list has no entries. The verdict is recorded only if you call that tool: a turn that ends without it returns no review at all, so never substitute prose for it.`
 
 export function toolGuidance(mode: AdvisorMode): string {
   const automatic = mode === 'continuous'

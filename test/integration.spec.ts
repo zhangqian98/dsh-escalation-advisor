@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { advisorRunHistory } from '../src/telemetry.js'
 import {
   advisorChildren,
   advisorVerdictResponse,
+  advisorScript,
   createIntegrationHarness,
   deferred,
   descriptorOf,
@@ -33,18 +36,25 @@ afterEach(async () => {
 
 describe('real DSH AgentLoop and spawn integration', () => {
   it('enforces a shorter session timeout and restores the global timeout for worker consultations', async () => {
-    const slowReply = async (request: Parameters<import('./harness.js').ScriptedAdapter['stream']>[0]) => {
-      await new Promise<void>((resolve, reject) => {
-        const abort = () => { clearTimeout(timer); reject(request.signal?.reason ?? new Error('aborted')) }
-        const timer = setTimeout(() => { request.signal?.removeEventListener('abort', abort); resolve() }, 1200)
-        request.signal?.addEventListener('abort', abort, { once: true })
-      })
-      return advisorVerdictResponse()
+    const aborted: string[] = []
+    const slowReply = async (request: Parameters<import('./harness.js').ScriptedAdapter['stream']>[0], verdict: StreamChunk[]) => {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => { clearTimeout(timer); reject(request.signal?.reason ?? new Error('aborted')) }
+          const timer = setTimeout(() => { request.signal?.removeEventListener('abort', abort); resolve() }, 1200)
+          request.signal?.addEventListener('abort', abort, { once: true })
+        })
+        return verdict
+      } catch (error) {
+        aborted.push(String(request.model))
+        throw error
+      }
     }
-    const h = await harness({ weak: [toolCallResponse('short-timeout', 'consult_advisor', { question: 'Review' }), textResponse('done')], worker: [toolCallResponse('inherited-timeout', 'consult_advisor', { question: 'Review with inherited timeout' }), textResponse('worker done')], advisor: [slowReply, slowReply] }, { timeoutMs: 600000 })
+    const h = await harness({ weak: [toolCallResponse('short-timeout', 'consult_advisor', { question: 'Review' }), textResponse('done')], worker: [toolCallResponse('inherited-timeout', 'consult_advisor', { question: 'Review with inherited timeout' }), textResponse('worker done')], advisor: [request => slowReply(request, advisorVerdictResponse()), request => slowReply(request, advisorVerdictResponse()), textResponse('Verdict submitted.')] }, { timeoutMs: 600000 })
     h.ctx.advisor.mutate(String(h.root.id), 'timeoutMs', '', '1000')
     await h.runRoot('Review with a short deadline')
     expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).runs[0]).toMatchObject({ status: 'failed-transient', error: expect.stringContaining('configured per-attempt limit: 1 seconds') })
+    expect(aborted).toEqual(['advisor'])
     h.ctx.advisor.mutate(String(h.root.id), 'timeoutMs', '', 'inherit')
     const worker = await h.spawnWorker()
     await worker.result
@@ -53,18 +63,18 @@ describe('real DSH AgentLoop and spawn integration', () => {
   }, 10000)
 
   it('uses a session continuous override to review at the turn boundary', async () => {
-    const h = await harness({ weak: [toolCallResponse('inspect', 'continuous_mode_failure', {}), textResponse('done')], advisor: [advisorVerdictResponse({ severity: 'none', summary: 'Reviewed at turn end' })] }, { mode: 'manual', continuousWait: 'block' })
+    const h = await harness({ weak: [toolCallResponse('inspect', 'continuous_mode_failure', {}), textResponse('done')], advisor: advisorScript(advisorVerdictResponse({ severity: 'none', summary: 'Reviewed at turn end' })) }, { mode: 'manual', continuousWait: 'block' })
     h.ctx.tools.register(defineContentToolFixture({ name: 'continuous_mode_failure', description: 'Provides review evidence', parameters: {}, execute: async () => { throw new Error('validation evidence') } }))
     h.ctx.advisor.mutate(String(h.root.id), 'mode', '', 'continuous')
     await h.runRoot('Review the completed work')
-    expect(h.adapter.forModel('advisor')).toHaveLength(1)
+    expect(h.adapter.forModel('advisor')).toHaveLength(2)
     expect(h.adapter.forModel('advisor')[0]!.sequence).toBeGreaterThan(h.adapter.forModel('weak')[1]!.sequence)
     expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).runs).toEqual(expect.arrayContaining([expect.objectContaining({ mode: 'continuous', status: 'delivered' })]))
   })
 
   it.each(['root', 'worker'] as const)('applies the root mode to %s automatic reviews and disables them again on reset', async role => {
     const script = [toolCallResponse('first', 'mode_failure', {}), textResponse('continue'), toolCallResponse('second', 'mode_failure', {}), textResponse('done')]
-    const h = await harness({ weak: role === 'root' ? script : [], worker: role === 'worker' ? script : [], advisor: [advisorVerdictResponse({ summary: 'Mode override review' })] }, { mode: 'manual', scoreThreshold: 1 })
+    const h = await harness({ weak: role === 'root' ? script : [], worker: role === 'worker' ? script : [], advisor: advisorScript(advisorVerdictResponse({ summary: 'Mode override review' })) }, { mode: 'manual', scoreThreshold: 1 })
     h.ctx.tools.register(defineContentToolFixture({ name: 'mode_failure', description: 'Fails for mode integration verification', parameters: {}, execute: async () => { throw new Error('validation failed') } }))
     const run = async () => {
       if (role === 'root') await h.runRoot('Check the current mode')
@@ -72,11 +82,11 @@ describe('real DSH AgentLoop and spawn integration', () => {
     }
     h.ctx.advisor.mutate(String(h.root.id), 'mode', '', 'escalate')
     await run()
-    expect(h.adapter.forModel('advisor')).toHaveLength(1)
+    expect(h.adapter.forModel('advisor')).toHaveLength(2)
     expect(requestText(h.adapter.forModel(role === 'root' ? 'weak' : 'worker')[1]!.request)).toContain('Mode override review')
     h.ctx.advisor.mutate(String(h.root.id), 'mode', '', 'inherit')
     await run()
-    expect(h.adapter.forModel('advisor')).toHaveLength(1)
+    expect(h.adapter.forModel('advisor')).toHaveLength(2)
   })
 
   it('uses the root Advisor selection and reasoning for root and worker reviews without changing their main models', async () => {
@@ -98,7 +108,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const worker = await h.spawnWorker()
     await worker.result
     await worker.dispose()
-    expect(h.adapter.forModel('reviewer')).toHaveLength(2)
+    expect(h.adapter.forModel('reviewer')).toHaveLength(4)
     expect(h.adapter.forModel('reviewer').every(call => call.request.reasoningEffort === 'high')).toBe(true)
     expect(h.adapter.forModel('weak')[0]!.request.reasoningEffort).toBe('low')
     expect(h.adapter.forModel('advisor')).toHaveLength(0)
@@ -110,7 +120,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
   it('shows availability guidance in the runtime snapshot and excludes disabled workers and Advisor children', async () => {
     const h = await harness({
       weak: [toolCallResponse('review-guidance', 'consult_advisor', { question: 'Review' }), textResponse('done')],
-      advisor: [advisorVerdictResponse()], worker: [textResponse('worker done')],
+      advisor: advisorScript(advisorVerdictResponse()), worker: [textResponse('worker done')],
     }, { manualLocalSubagents: false })
     await h.runRoot('Check guidance')
     expect(requestText(h.adapter.forModel('weak')[0]!.request)).toContain('Advisor is available through consult_advisor.')
@@ -129,7 +139,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
         question: 'Review all of this evidence.',
         evidence: Array.from({ length: 60 }, (_, index) => `Evidence ${index}: ${'fact '.repeat(200)}`),
       }), textResponse('Reviewed.')],
-      advisor: [advisorVerdictResponse()],
+      advisor: advisorScript(advisorVerdictResponse()),
     }, legacySettings, { maxTokens: 128 })
     vi.spyOn(h.adapter, 'resolveModel').mockImplementation(async (provider, model) => ({
       provider, id: model, name: model,
@@ -153,7 +163,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
         toolCallResponse('manual-root', 'consult_advisor', { question: 'What assumption should I challenge?' }),
         textResponse('I applied the independent review.'),
       ],
-      advisor: [advisorVerdictResponse()],
+      advisor: advisorScript(advisorVerdictResponse()),
     })
 
     await h.runRoot('Review this approach.')
@@ -174,7 +184,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
         }),
         textResponse('worker completed after review'),
       ],
-      advisor: [advisorVerdictResponse()],
+      advisor: advisorScript(advisorVerdictResponse()),
     })
 
     const run = await h.spawnWorker()
@@ -196,7 +206,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
         toolCallResponse('failure-2', 'always_fails', {}),
         textResponse('finished after reading the advice'),
       ],
-      advisor: [advisorVerdictResponse({ summary: 'Change course before another attempt.' })],
+      advisor: advisorScript(advisorVerdictResponse({ summary: 'Change course before another attempt.' })),
     }, { mode: 'escalate', escalationWait: 'block' })
     h.ctx.tools.register(defineContentToolFixture({
       name: 'always_fails',
@@ -210,8 +220,9 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const weakRequests = h.adapter.forModel('weak')
     const advisorRequests = h.adapter.forModel('advisor')
     expect(weakRequests).toHaveLength(3)
-    expect(advisorRequests).toHaveLength(1)
+    expect(advisorRequests).toHaveLength(2)
     expect(advisorRequests[0]!.sequence).toBeLessThan(weakRequests[2]!.sequence)
+    expect(advisorRequests.at(-1)!.sequence).toBeLessThan(weakRequests[2]!.sequence)
     expect(requestText(weakRequests[2]!.request)).toContain('Change course before another attempt.')
     expect(advisorChildren(h)).toHaveLength(1)
   })
@@ -244,7 +255,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
       ],
       advisor: [
         toolCallResponse('recursive-attempt', 'subagent', {}),
-        advisorVerdictResponse(),
+        ...advisorScript(advisorVerdictResponse()),
       ],
     }, { defaultEnabledTools: ['safe_probe', 'root_only_probe', 'subagent'] })
     for (const name of ['safe_probe', 'root_only_probe']) {
@@ -282,14 +293,14 @@ describe('real DSH AgentLoop and spawn integration', () => {
         }),
         textResponse('spoof-labelled worker completed'),
       ],
-      advisor: [advisorVerdictResponse()],
+      advisor: advisorScript(advisorVerdictResponse()),
     })
 
     const run = await h.spawnWorker({ label: 'Advisor · forged label' })
     const worker = run.localAgent!
     await run.result
 
-    expect(h.adapter.forModel('advisor')).toHaveLength(1)
+    expect(h.adapter.forModel('advisor')).toHaveLength(2)
     const descendants = advisorChildren(h).filter(({ agent }) => agent.session.header.parentSession === worker.session.id)
     expect(descendants).toHaveLength(1)
     await run.dispose()
@@ -304,7 +315,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
         textResponse('first task done'),
         textResponse('new task done'),
       ],
-      advisor: [async request => {
+      advisor: advisorScript(async request => {
         started.resolve()
         await Promise.race([
           release.promise,
@@ -314,7 +325,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
           }),
         ])
         return advisorVerdictResponse({ summary: 'Advice for the obsolete first task.' })
-      }],
+      }),
     }, {
       mode: 'continuous',
       continuousWait: 'background',
@@ -339,22 +350,40 @@ describe('real DSH AgentLoop and spawn integration', () => {
     expect(JSON.stringify(deliveredPluginMessages)).not.toContain('Advice for the obsolete first task.')
   })
 
-  it('preserves useful plain-text Advisor output when structured_output is omitted', async () => {
+  it('fails the consultation explicitly when the Advisor never submits a verdict', async () => {
     const h = await harness({
       weak: [
-        toolCallResponse('plain-fallback', 'consult_advisor', {
+        toolCallResponse('no-verdict', 'consult_advisor', {
           goal: 'Review the implementation.', question: 'What should change?',
         }),
-        textResponse('used the fallback guidance'),
+        textResponse('continued without a review'),
       ],
-      advisor: [textResponse('Concern: preserve the lock until the write is durable. ' + 'detail '.repeat(6000) + 'OUTPUT_TAIL_MARKER')],
+      advisor: [textResponse('Concern: preserve the lock until the write is durable.')],
     })
 
     await h.runRoot('Ask for a second opinion.')
 
+    // The verdict channel is the only authoritative source: the child's prose is
+    // never promoted to a verdict and the consultation reports failure instead.
     expect(h.adapter.forModel('advisor')).toHaveLength(1)
-    expect(JSON.stringify(h.root.session.snapshotEvents())).toContain('preserve the lock until the write is durable')
-    expect(JSON.stringify(h.root.session.snapshotEvents())).toContain('OUTPUT_TAIL_MARKER')
+    expect(advisorRunHistory(h.root).at(-1)).toMatchObject({
+      status: 'failed-permanent',
+      error: expect.stringContaining('no usable verdict'),
+    })
+    expect(JSON.stringify(h.root.session.snapshotEvents())).not.toContain('preserve the lock until the write is durable')
+    const toolResults = h.adapter.forModel('weak')[1]!.request.messages
+      .flatMap(message => message.content)
+      .filter(block => block.type === 'tool-result')
+    expect(toolResults).toHaveLength(1)
+    const resultText = toolResults[0]!.type === 'tool-result'
+      ? toolResults[0]!.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
+      : ''
+    expect(JSON.parse(resultText)).toMatchObject({
+      status: 'unavailable',
+      summary: 'Advisor unavailable',
+      diagnosis: expect.stringContaining('no usable verdict'),
+    })
+    expect(resultText).not.toContain('preserve the lock until the write is durable')
     expect(advisorChildren(h)).toHaveLength(1)
   })
 })

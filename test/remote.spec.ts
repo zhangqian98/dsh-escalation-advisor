@@ -3,7 +3,7 @@ import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import TypertGateway from '@deepseek-ai/dsh-api-gateway'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { createIntegrationHarness, textResponse, toolCallResponse, advisorVerdictResponse, type IntegrationHarness } from './harness.js'
+import { createIntegrationHarness, advisorScript, textResponse, toolCallResponse, advisorVerdictResponse, type IntegrationHarness } from './harness.js'
 import { advisorObligationSnapshot } from '../src/remote.js'
 import { MAX_AUTO_REMINDERS_PER_TASK, ObligationStore } from '../src/obligations.js'
 
@@ -97,7 +97,7 @@ describe('Advisor Remote policy API', () => {
   })
 
   it('keeps a complete manual reply available without inflating the snapshot', async () => {
-    harness = await createIntegrationHarness({ weak: [toolCallResponse('ask', 'consult_advisor', { question: 'Does this assumption hold?' }), textResponse('done')], advisor: [advisorVerdictResponse()] })
+    harness = await createIntegrationHarness({ weak: [toolCallResponse('ask', 'consult_advisor', { question: 'Does this assumption hold?' }), textResponse('done')], advisor: advisorScript(advisorVerdictResponse()) })
     await harness.runRoot('Review this design')
     const { ctx, root } = harness
     const snapshot = JSON.parse(ctx.advisor.snapshot(String(root.id)))

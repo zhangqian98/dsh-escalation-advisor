@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { installAdvisorEventCompatibility } from '../src/session-events.js'
 import { sessionPolicyOverride, updateToolOverride } from '../src/policy.js'
 import { sessionModelSelection, updateModelSelection } from '../src/model-selection.js'
-import { advisorChildren, advisorVerdictResponse, createIntegrationHarness, textResponse, toolCallResponse } from './harness.js'
+import { advisorChildren, advisorScript, advisorVerdictResponse, createIntegrationHarness, textResponse, toolCallResponse } from './harness.js'
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap { 'fixture/required': { value: string } }
@@ -32,7 +32,7 @@ async function coldRead(ctx: Context, stored: SessionInspection): Promise<Sessio
 
 describe('Advisor persistent session compatibility', () => {
   it('cold-loads real root and Advisor logs while preserving required policy, identity, and verdict records', async () => {
-    const h = await createIntegrationHarness({ weak: [toolCallResponse('ask', 'consult_advisor', { question: 'Review' }), textResponse('done')], advisor: [advisorVerdictResponse()] })
+    const h = await createIntegrationHarness({ weak: [toolCallResponse('ask', 'consult_advisor', { question: 'Review' }), textResponse('done')], advisor: advisorScript(advisorVerdictResponse()) })
     let childId!: SessionId
     let storedRoot!: SessionInspection, storedChild!: SessionInspection
     try {

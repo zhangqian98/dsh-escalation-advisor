@@ -5,7 +5,8 @@ import type { Config } from './config.js'
 import type { EffectiveAdvisorPolicy } from './policy.js'
 import { ADVISOR_SYSTEM_PROMPT } from './prompts.js'
 import { redactSecrets } from './redact.js'
-import { VERDICT_SCHEMA, parseVerdict, verdictFromStructured, type AdvisorVerdict } from './verdict.js'
+import { type AdvisorVerdict } from './verdict.js'
+import { ADVISOR_VERDICT_TOOL, type AdvisorVerdictCollector } from './verdict-tool.js'
 import { isCapabilityAmplifier } from './capabilities.js'
 import type { AdvisorRegistry } from './registry.js'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
@@ -18,7 +19,6 @@ export interface AdvisorRunResult {
   verdict: AdvisorVerdict
   childSessionId: string
   usage?: { inputTokens: number; outputTokens: number }
-  structuredFallback: boolean
 }
 
 export function advisorToolSurface(ctx: Context, parent: Agent, policy: EffectiveAdvisorPolicy, amplifierTools: readonly string[] = []) {
@@ -36,16 +36,20 @@ export function advisorPolicyNote(allowedTools: string[], unavailableTools: stri
 export async function callAdvisor(
   ctx: Context, config: Config, parent: Agent, prompt: string, signal: AbortSignal,
   policy: EffectiveAdvisorPolicy, label: string,
-  lifecycle: { registry: AdvisorRegistry; root: Agent; onStarted: () => void; onPublished: (id: string) => void },
+  lifecycle: { registry: AdvisorRegistry; root: Agent; collector: AdvisorVerdictCollector; consultationId: string; onStarted: () => void; onPublished: (id: string) => void },
 ): Promise<AdvisorRunResult> {
   if (!config.provider.trim() || !config.model.trim()) throw new AdvisorUnavailableError('Advisor provider/model is not configured.', 'configuration')
   const subagents = parent.ctx.get('subagents') ?? ctx.get('subagents')
   if (!subagents) throw new AdvisorUnavailableError('DSH subagent runtime is unavailable.', 'configuration')
   const { allowedTools, unavailableTools } = advisorToolSurface(ctx, parent, policy, config.capabilityAmplifierTools)
-  const prefix = advisorPolicyNote(allowedTools, unavailableTools)
+  // The verdict channel is host-owned and is always exposed to the Advisor; it is
+  // not part of the configurable tool policy.
+  const advisorTools = [...allowedTools, ADVISOR_VERDICT_TOOL]
+  const prefix = advisorPolicyNote(advisorTools, unavailableTools)
   const timeoutMessage = 'Advisor consultation timed out (configured per-attempt limit: ' + config.timeoutMs / 1000 + ' seconds).'
   const callSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
-  const identity = lifecycle.registry.reserve(parent, lifecycle.root, allowedTools)
+  const identity = lifecycle.registry.reserve(parent, lifecycle.root, advisorTools)
+  lifecycle.collector.open({ id: lifecycle.consultationId, invocationId: identity.invocationId, requesterId: String(parent.id), rootId: String(lifecycle.root.id) })
   let started = false
   // The loop prepares authentication before entering this stream. Unlike
   // agent/assistant-stream, this boundary also exists in DSH 0.1.2-rc.1 and
@@ -69,24 +73,28 @@ export async function callAdvisor(
       agentOptions: { provider: config.provider.trim(), model: config.model.trim(), maxTokens: undefined,
         reasoningEffort: config.reasoningEffort.trim() ? ReasoningEffortId(config.reasoningEffort.trim()) : undefined,
         advisorInvocation: identity.invocationId },
-      outputSchema: VERDICT_SCHEMA, toolFilter: { allow: allowedTools }, persona: ADVISOR_SYSTEM_PROMPT,
+      toolFilter: { allow: advisorTools }, persona: ADVISOR_SYSTEM_PROMPT,
     })
     lifecycle.onPublished(String(run.id))
+    lifecycle.collector.bind(lifecycle.consultationId, String(run.id))
     const result = await run.result
     const child = ctx.agents.get(run.id)
     const events = child?.session.snapshotEvents() ?? []
     const ending = events.findLast(event => event.type === 'turn/end')
-    const raw = redactSecrets(result.output.filter(block => block.type === 'text').map(block => block.text).join('\n'))
-    // A missing structured_output is an error at the spawn seam even when the turn completed.
-    const structuredFallback = result.structured === undefined && raw.trim().length > 0 && ending?.type === 'turn/end' && ending.data.reason.kind === 'completed'
-    if (result.stopReason !== 'completed' && !structuredFallback) {
+    if (result.stopReason !== 'completed') {
       const detail = result.diagnostic ?? JSON.stringify(ending?.type === 'turn/end' ? ending.data.reason : result.stopReason)
       if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor request cancelled.', signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled', signal.reason?.name === 'TimeoutError')
       if (callSignal.aborted) throw new AdvisorUnavailableError(timeoutMessage, 'timeout', true)
       const transient = /timeout|timed out|rate.limit|overload|unavailable|server|network|econn|concurrenc|429|50[0234]/i.test(detail)
       throw new AdvisorUnavailableError('Advisor child ended with ' + result.stopReason + ': ' + detail, 'child_failed', transient)
     }
-    if (result.structured === undefined && !raw.trim()) throw new AdvisorUnavailableError('Advisor returned no usable result.', 'empty_output')
+    // The verdict channel is the only authoritative source. A run that closes
+    // without a reconciled verdict is a failure, not advice.
+    const reconciled = lifecycle.collector.reconcile(lifecycle.consultationId, {
+      stopReason: result.stopReason,
+      ...(ending?.type === 'turn/end' ? { turnEnd: { seq: ending.seq, kind: ending.data.reason.kind } } : {}),
+    })
+    if (!reconciled.published) throw new AdvisorUnavailableError('Advisor returned no usable verdict: ' + reconciled.reason, 'no_verdict')
     const usage = { inputTokens: 0, outputTokens: 0 }
     let usageKnown = false, usageMissing = false
     for (const event of events) if (event.type === 'assistant/message') {
@@ -97,7 +105,7 @@ export async function callAdvisor(
     } else if (event.type === 'assistant/attempt') {
       usageMissing = true
     }
-    return { verdict: result.structured === undefined ? parseVerdict(raw) : verdictFromStructured(result.structured, raw), childSessionId: String(run.id), ...(usageKnown && !usageMissing ? { usage } : {}), structuredFallback }
+    return { verdict: reconciled.verdict, childSessionId: String(run.id), ...(usageKnown && !usageMissing ? { usage } : {}) }
   } catch (error) {
     if (error instanceof AdvisorUnavailableError) throw error
     if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor request cancelled.', signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled', signal.reason?.name === 'TimeoutError')
@@ -107,6 +115,9 @@ export async function callAdvisor(
   } finally {
     stopObserve()
     identity.release()
+    // A run that did not publish leaves a closed, unusable record: a late or
+    // late-arriving verdict submission resolves to 'closed' instead of reviving it.
+    lifecycle.collector.invalidate(lifecycle.consultationId, 'Advisor run ended without publishing a verdict.')
     await run?.dispose()
   }
 }

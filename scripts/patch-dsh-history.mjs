@@ -10,7 +10,7 @@ export const ADVISOR_HISTORY_FIELDS = {
   'advisor/policy': { required: [], optional: ['version', 'mode', 'timeoutMs', 'inheritDefaultTools', 'allowTools', 'denyTools', 'escalationWait', 'continuousWait', 'toolPreset', 'tools'] },
   'advisor/model': { required: ['version', 'selection'], optional: [] },
   'advisor/identity': { required: ['version', 'invocationId', 'advisorId', 'requesterId', 'rootId', 'allowedTools'], optional: [] },
-  'advisor/run': { required: ['version', 'id', 'requesterId', 'mode', 'turn', 'taskRevision', 'attempt', 'status', 'timestamp'], optional: ['step', 'fingerprint', 'score', 'childSessionId', 'severity', 'summary', 'question', 'responseText', 'error', 'usage', 'structuredFallback'] },
+  'advisor/run': { required: ['version', 'id', 'requesterId', 'mode', 'turn', 'taskRevision', 'attempt', 'status', 'timestamp'], optional: ['step', 'fingerprint', 'score', 'childSessionId', 'severity', 'summary', 'question', 'responseText', 'error', 'usage', 'verdictTool', 'structuredFallback'] },
 }
 
 export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIELDS) {

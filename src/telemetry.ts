@@ -22,7 +22,7 @@ export interface AdvisorRunRecord {
   responseText?: string
   error?: string
   usage?: { inputTokens: number; outputTokens: number }
-  structuredFallback?: boolean
+  verdictTool?: string
 }
 
 declare module '@deepseek-ai/dsh-session/types' {
