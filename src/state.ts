@@ -93,18 +93,55 @@ function flattenArgumentStrings(value: unknown, out: string[] = [], depth = 0): 
   return out
 }
 function argumentText(args: unknown): string { return flattenArgumentStrings(args).join(' ') }
+const VALIDATION_FAMILY = /\b(?:pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+test|gradle\w*\s+test|(?:pnpm|npm|yarn)\s+(?:run\s+)?(?:typecheck|test|lint|build)|tsc)\b/
+
+/**
+ * The validation statement a shell call performs: the segment that names the
+ * check, with its reporting plumbing removed.
+ *
+ * Only the plugin's own identity uses this. `2>&1 | Select-Object -First 40`,
+ * an appended `; "TSC_EXIT=$LASTEXITCODE"`, a trailing `Select-String` stage and
+ * a leading `$env:VAR = ...` assignment only control how one and the same check
+ * is observed. Hashing them made every retry a new validation identity, so an
+ * obligation opened by a failing run could never be matched by the passing run
+ * that verified the repair, and the item stayed open forever.
+ *
+ * The statement is located rather than assumed to come first: a compound
+ * command such as `grep needle file; npm test` still validates. The match starts
+ * at the family word, so `npm run test -- x` and `npx vitest run a.spec.ts`
+ * remain distinct targets, and a command that only mentions a family inside a
+ * longer word (`npm testx`) is not a validation at all.
+ */
+function validationStatement(command: string): string | undefined {
+  const match = VALIDATION_FAMILY.exec(command)
+  if (!match) return undefined
+  const rest = command.slice(match.index)
+  const boundary = rest.search(/[|;\r\n]|\d?>>?\s*&?\S|<\s*&?\S/)
+  let statement = boundary >= 0 ? rest.slice(0, boundary) : rest
+  // A recording prefix such as `$env:DSH_RUNTIME_PACKAGE_JSON = "...";` or
+  // `FOO=1 npm test` configures the run; the check is what remains.
+  let previous: string
+  do {
+    previous = statement
+    statement = statement.replace(/^\s*(?:\$env:[\w:]+|\$[\w:]+|[a-z_][\w-]*=\S*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;|&]+)\s*;?\s*/i, '')
+  } while (statement !== previous)
+  return statement.trim() || undefined
+}
+
 function validationKey(name: string, args: unknown, scope?: string): string | undefined {
   if (!VALIDATION_TOOL.test(name)) return undefined
   const command = argumentText(args).toLowerCase()
   if (/^\s*(?:echo|printf|write-output|cat)\b/.test(command)) return undefined
+  const statement = validationStatement(command)
+  if (!statement) return undefined
   let kind: string | undefined
-  if (/\b(?:pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+test|gradle\w*\s+test)\b/.test(command) || /\b(?:pnpm|npm|yarn)\s+(?:run\s+)?test\b/.test(command)) kind = 'test'
-  else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?lint\b/.test(command)) kind = 'lint'
-  else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(command)) kind = 'build'
-  else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?typecheck\b/.test(command) || /\btsc\b/.test(command)) kind = 'typecheck'
+  if (/\b(?:pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+test|gradle\w*\s+test)\b/.test(statement) || /\b(?:pnpm|npm|yarn)\s+(?:run\s+)?test\b/.test(statement)) kind = 'test'
+  else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?lint\b/.test(statement)) kind = 'lint'
+  else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(statement)) kind = 'build'
+  else if (/\b(?:pnpm|npm|yarn)\s+(?:run\s+)?typecheck\b/.test(statement) || /\btsc\b/.test(statement)) kind = 'typecheck'
   // The key identifies a validation target inside one execution scope; a pass in
   // another scope or task must never be mistaken for the same check.
-  return kind ? hash(`validation:${kind}\n${scope ?? ''}\n${normalizeFailureText(command)}`) : undefined
+  return kind ? hash(`validation:${kind}\n${scope ?? ''}\n${normalizeFailureText(statement)}`) : undefined
 }
 function isExpectedNegativeExit(name: string, args: unknown, exitCode: number | undefined): boolean {
   if (exitCode !== 1) return false
