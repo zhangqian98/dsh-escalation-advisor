@@ -386,4 +386,35 @@ describe('verification obligations through the real plugin chain', () => {
     expect(snapshot.openCount).toBe(1)
     expect(snapshot.items[0]).toMatchObject({ state: 'open' })
   }, 10000)
+
+  it('does not let a SUCCESSFUL mention falsely resolve the obligation', async () => {
+    // The more dangerous direction, and the one a denylist would have kept: if a
+    // command that merely names the check carried its identity, a SUCCESSFUL one
+    // would close the open obligation for a check that never ran - the mechanism
+    // would absolve the failure without any verification having happened.
+    const check = 'npm test'
+    const mention = 'git commit -m "npm test passes now"'
+    const h = await harness({ weak: [
+      toolCallResponse('resolve-fail', 'bash', { command: check }),
+      toolCallResponse('resolve-prose', 'bash', { command: mention }),
+      textResponse('Committed the notes.'),
+      textResponse('Nothing else to verify.'),
+    ] })
+    const executed = registerShellFixture(h, new Map([
+      [check, [{ exitCode: 1, output: FAILURE_OUTPUT }]],
+      [mention, [{ exitCode: 0, output: '[main 1a2b3c4] notes' }]],
+    ]))
+
+    await h.runRoot('Make the suite pass.')
+
+    expect(executed).toEqual([check, mention])
+    const mentionOutcome = classified(mention, 0)
+    expect(mentionOutcome.validationKey).toBeUndefined()
+    expect(mentionOutcome.class).toBe('success')
+    // The successful mention therefore resolves nothing.
+    const snapshot = obligationSnapshot(h)
+    expect(snapshot.openCount).toBe(1)
+    expect(snapshot.items[0]).toMatchObject({ state: 'open' })
+    expect(obligationNotices(h.root).length).toBeGreaterThan(0)
+  }, 10000)
 })

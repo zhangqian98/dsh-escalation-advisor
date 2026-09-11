@@ -102,12 +102,59 @@ const VALIDATION_FAMILY_SCAN = new RegExp(VALIDATION_FAMILY.source, 'g')
 interface CommandSpan { readonly start: number; readonly end: number }
 
 /**
- * Launchers whose OPERAND is the check: `npx vitest run` invokes a check while
- * naming none itself. The set is deliberately small and explicit, because a
- * missing launcher loses a genuine invocation - a silent false negative, which
- * is the worse error here.
+ * A wrapper's operand grammar: how to find the command it runs WITHOUT mistaking
+ * one of the wrapper's own option VALUES for that command.
  */
-const LAUNCHERS = new Set(['npx', 'npx.cmd', 'env'])
+interface WrapperGrammar {
+  /** Flags that consume the FOLLOWING token as a value, which is not a command. */
+  readonly valueOptions: readonly string[]
+  /** Flags whose operand is itself a command STRING to scan. */
+  readonly commandOptions: readonly string[]
+  /** Flags after which no command runs at all, such as `command -v`. */
+  readonly queryOptions: readonly string[]
+  /** Subcommands standing between the wrapper and the command it runs. */
+  readonly subcommands: readonly string[]
+  /** True when a bare operand names a script FILE the wrapper reads, not a check. */
+  readonly scriptOperand: boolean
+}
+
+const wrapper = (overrides: Partial<WrapperGrammar> = {}): WrapperGrammar => ({
+  valueOptions: [], commandOptions: [], queryOptions: [], subcommands: [], scriptOperand: false, ...overrides,
+})
+
+/**
+ * Commands that run ANOTHER command given as an operand, enumerated rather than
+ * guessed, because a missing entry loses a genuine invocation SILENTLY. Measured
+ * gaps in an earlier revision, each recognized before the position rule existed:
+ * `time npm test`, `sudo npm test`, `nice -n 5 npm test`, `pnpm exec vitest run`,
+ * `yarn dlx vitest run`, `cross-env CI=1 npm test` and `command npm test`.
+ */
+const WRAPPERS: Record<string, WrapperGrammar> = {
+  // Shells: the command is the -c/-Command string, never a bare script operand.
+  bash: wrapper({ commandOptions: ['-c'], scriptOperand: true }),
+  sh: wrapper({ commandOptions: ['-c'], scriptOperand: true }),
+  zsh: wrapper({ commandOptions: ['-c'], scriptOperand: true }),
+  pwsh: wrapper({ commandOptions: ['-c', '-command'], scriptOperand: true }),
+  powershell: wrapper({ commandOptions: ['-c', '-command'], scriptOperand: true }),
+  cmd: wrapper({ commandOptions: ['/c', '/k'], scriptOperand: true }),
+  // Runners whose operand IS the check, or the binary that provides it.
+  npx: wrapper({ valueOptions: ['-p', '--package'], commandOptions: ['-c', '--call'] }),
+  env: wrapper({ valueOptions: ['-u', '--unset', '-c', '--chdir'], commandOptions: ['-s', '--split-string'] }),
+  time: wrapper({ valueOptions: ['-f', '--format', '-o', '--output'] }),
+  sudo: wrapper({
+    valueOptions: ['-u', '--user', '-g', '--group', '-p', '--prompt', '-c', '--close-from', '-h', '--host', '-r', '--role', '-t', '--type', '-d', '--chdir'],
+    // `sudo -v` refreshes the timestamp and runs nothing.
+    queryOptions: ['-v', '--validate', '-l', '--list', '-e', '--edit', '-k', '--reset-timestamp'],
+  }),
+  nice: wrapper({ valueOptions: ['-n', '--adjustment'] }),
+  'cross-env': wrapper(),
+  // `command -v npm` REPORTS where npm is; it does not run it.
+  command: wrapper({ queryOptions: ['-v', '-p'] }),
+  // Package managers that can execute a check through a subcommand.
+  pnpm: wrapper({ subcommands: ['exec', 'dlx'] }),
+  yarn: wrapper({ subcommands: ['exec', 'dlx'] }),
+  npm: wrapper({ subcommands: ['exec'] }),
+}
 
 /** Split a command at UNQUOTED separators, keeping every token's exact span. */
 function shellSegments(command: string): CommandSpan[][] {
@@ -159,9 +206,6 @@ function shellSegments(command: string): CommandSpan[][] {
  * would be read as argument text and lost - the false-negative direction, which is
  * the more expensive one here.
  */
-const SHELL_WRAPPERS = new Set(['bash', 'sh', 'zsh', 'pwsh', 'powershell', 'cmd'])
-/** The flags that make a shell wrapper treat its next operand as a command line. */
-const COMMAND_FLAGS = new Set(['-c', '-command', '/c'])
 /** Nesting deeper than this is not worth resolving; treat it as not a check. */
 const MAX_WRAPPER_DEPTH = 3
 
@@ -186,31 +230,41 @@ function executableSpans(segment: CommandSpan[], command: string, depth = 0): Co
   const executable = segment[cursor]
   if (executable === undefined) return []
   const spans: CommandSpan[] = [executable]
-  const base = (textAt(executable).replace(/^["']|["']$/g, '').split(/[\\/]/).pop() ?? '').toLowerCase()
+  const base = (textAt(executable).replace(/^["']|["']$/g, '').split(/[\\/]/).pop() ?? '').toLowerCase().replace(/\.(?:exe|cmd|bat)$/, '')
   const operands = segment.slice(cursor + 1)
-  if (SHELL_WRAPPERS.has(base)) {
-    for (let index = 0; index < operands.length; index++) {
-      const operand = operands[index]
-      if (operand === undefined) break
-      const text = textAt(operand).toLowerCase()
-      if (!COMMAND_FLAGS.has(text)) {
-        // A shell invoked with a script file, not with a command string.
-        if (!text.startsWith('-') && !text.startsWith('/')) break
-        continue
+  const grammar = WRAPPERS[base]
+  return grammar === undefined ? spans : spans.concat(wrapperSpans(grammar, operands, command, depth))
+}
+
+/** Walk a wrapper's operands to the command it actually runs, if it runs one. */
+function wrapperSpans(grammar: WrapperGrammar, operands: CommandSpan[], command: string, depth: number): CommandSpan[] {
+  const textAt = (span: CommandSpan): string => command.slice(span.start, span.end)
+  for (let index = 0; index < operands.length; index++) {
+    const operand = operands[index]
+    if (operand === undefined) return []
+    const raw = textAt(operand)
+    const name = (raw.split('=')[0] ?? '').toLowerCase()
+    const inline = raw.includes('=')
+    if (raw === '--') continue
+    if (name.startsWith('-') || name.startsWith('/')) {
+      // A flag that only REPORTS something runs no command at all.
+      if (grammar.queryOptions.includes(name)) return []
+      if (grammar.commandOptions.includes(name)) {
+        if (inline) return []
+        const inner = operands[index + 1]
+        return inner === undefined ? [] : nestedSpans(inner, command, depth)
       }
-      const inner = operands[index + 1]
-      return inner === undefined ? spans : spans.concat(nestedSpans(inner, command, depth))
+      // An option that takes a VALUE must not leave that value looking like a check.
+      index += grammar.valueOptions.includes(name) && !inline ? 1 : 0
+      continue
     }
-    return spans
+    if (grammar.subcommands.includes(name)) continue
+    // `cross-env CI=1 npm test`: a bare assignment configures the run.
+    if (/^[A-Za-z_][\w-]*=/.test(raw)) continue
+    // A shell invoked with a bare operand reads a FILE, which is not a check.
+    return grammar.scriptOperand ? [] : [operand]
   }
-  if (!LAUNCHERS.has(base)) return spans
-  for (const operand of operands) {
-    const text = textAt(operand)
-    if (text.startsWith('-') || /^[A-Za-z_][\w-]*=/.test(text)) continue
-    spans.push(operand)
-    break
-  }
-  return spans
+  return []
 }
 
 /**

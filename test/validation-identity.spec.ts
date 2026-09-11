@@ -96,6 +96,46 @@ describe('validation identity', () => {
     expect(key('bash scripts/check.sh')).toBeUndefined()
   })
 
+  it('still recognizes the check through every supported wrapper', () => {
+    // Each of these was recognized before the invocation-position rule and was
+    // SILENTLY lost by a first revision that enumerated only npx and env. A lost
+    // invocation is invisible, so the shapes are pinned individually.
+    for (const command of [
+      'npm test',
+      'time npm test',
+      'sudo npm test',
+      'sudo -u root npm test',
+      'nice -n 5 npm test',
+      'pnpm exec vitest run',
+      'yarn dlx vitest run',
+      'cross-env CI=1 npm test',
+      'command npm test',
+      'env CI=1 npm test',
+      'npx vitest run',
+      'npx tsc --noEmit',
+      'pytest',
+    ]) expect(key(command), command).toBeDefined()
+  })
+
+  it('never mistakes a wrapper option VALUE for the check', () => {
+    // `command -v` REPORTS where the check is; `-p/--package` NAMES a package to
+    // install. Neither runs the check it names.
+    for (const command of [
+      'command -v npm test',
+      'sudo -v npm test',
+      'npx --package vitest node script.js',
+      'npx -p vitest node script.js',
+      'sudo -u vitest true',
+    ]) expect(key(command), command).toBeUndefined()
+  })
+
+  it('never mistakes DATA for an invocation', () => {
+    // Quoting is not the boundary: these carry unquoted data that merely looks
+    // like a check.
+    for (const command of ['touch vitest', 'cp vitest.log backup', 'echo npm test', 'cat vitest.log', 'echo ok > vitest'])
+      expect(key(command), command).toBeUndefined()
+  })
+
   it('does not leak scan state between calls', () => {
     // The family is scanned with ONE shared global RegExp, so a missing reset
     // would make later calls skip matches depending on the previous command.
