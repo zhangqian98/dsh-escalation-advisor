@@ -46,6 +46,10 @@ interface ReviewTrigger { turn: number; step?: number; decision?: EscalationDeci
  */
 const handleBase = (handle: string): string => handle.replace(/#.*$/, '')
 const handleOf = (base: string, turn: number): string => base + '#' + turn + '.1'
+// Spares a caller from carrying the uuid across a compacted context. It is a
+// convenience for addressing ONE conversation, not a relatedness detector: it
+// never guesses, and it resolves to nothing rather than to some older record.
+const LATEST_ALIAS = 'last'
 function taskRootAgent(ctx: Context, agent: Agent): Agent {
   let current = agent
   const seen = new Set<string>()
@@ -214,17 +218,35 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
    * root task are honored: an unknown or foreign id is refused, never silently
    * started as a fresh consultation.
    */
-  const consultations = new Map<string, { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number }>()
-  const rememberConsultation = (value: { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number }): void => {
+  type ConsultationRecord = { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number; mode: ConsultationMode; deliveredSeq: number }
+  const consultations = new Map<string, ConsultationRecord>()
+  // A delivery counter, not wall-clock time and not map insertion order: "latest" has
+  // to be deterministic, and a follow-up delivered into an OLDER conversation must
+  // become the latest one. Only a delivered consultation is ever recorded, so failed
+  // and in-flight attempts cannot move it.
+  let delivered = 0
+  const rememberConsultation = (value: Omit<ConsultationRecord, 'deliveredSeq'>): void => {
     // Keyed by the BARE uuid: the handle a caller holds is `<uuid>#<turn>.<attempt>`,
     // but one conversation is ONE record whatever handle form addresses it — the id
     // the FIRST turn minted, or that same uuid on its own.
-    consultations.set(handleBase(value.consultationId), value)
+    consultations.set(handleBase(value.consultationId), { ...value, deliveredSeq: ++delivered })
     while (consultations.size > 64) {
       const oldest = consultations.keys().next().value
       if (oldest === undefined) break
       consultations.delete(oldest)
     }
+  }
+  // The `last` alias resolves only inside the calling agent's own scope: its own
+  // delivered MANUAL consultations on this exact root task. Automatic consultations
+  // never move it, and a sibling agent can never reach another agent's conversation
+  // through it.
+  const latestManualConsultation = (requesterId: string, rootId: string): ConsultationRecord | undefined => {
+    let latest: ConsultationRecord | undefined
+    for (const record of consultations.values()) {
+      if (record.mode !== 'manual' || record.requesterId !== requesterId || record.rootId !== rootId) continue
+      if (latest === undefined || record.deliveredSeq > latest.deliveredSeq) latest = record
+    }
+    return latest
   }
   ctx.on('agent/disposed', ({ agent }) => {
     if (agent.session.header.parentSession !== undefined) return
@@ -307,7 +329,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         if (mode === 'continuous') reviewed.set(String(agent.id), { turn: trigger.turn, seq: result.lastSeq })
         // The id stays stable for the whole conversation so a follow-up turn can
         // address the SAME child session instead of starting a new consultation.
-        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1 })
+        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode })
         return result.answer
 
       } catch (error) {
@@ -338,7 +360,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       evidence: { type: 'array', items: { type: 'string' } }, failed_attempts: { type: 'array', items: { type: 'string' } }, attempts: { type: 'string' }, context: { type: 'string' },
       // Continue an EXISTING consultation as a new turn of the SAME Advisor
       // conversation: earlier context, persona and tool policy stay intact.
-      consultation_id: { type: 'string', description: 'Continue an earlier Advisor conversation instead of starting a new one: pass the consultation_id that earlier result returned. Reuse it when this question builds on that review — supplying the evidence it asked for, challenging its verdict, or refining the same decision — because the advisor keeps its earlier context, persona and tool policy. Omit it for an unrelated problem, and also when you want a deliberately independent reassessment of a related one: a fresh consultation does not inherit the earlier framing. An unknown or foreign id is refused rather than silently restarted as a new consultation.' },
+      consultation_id: { type: 'string', description: 'Continue an earlier Advisor conversation instead of starting a new one: pass the consultation_id that earlier result returned. Reuse it when this question builds on that review — supplying the evidence it asked for, challenging its verdict, or refining the same decision — because the advisor keeps its earlier context, persona and tool policy. Omit it for an unrelated problem, and also when you want a deliberately independent reassessment of a related one: a fresh consultation does not inherit the earlier framing. An unknown or foreign id is refused rather than silently restarted as a new consultation. The literal value "last" means the most recent DELIVERED manual consultation YOU opened on this task — not simply whatever was discussed most recently, and automatic consultations and failed or still-running calls do not count. The reply reports the concrete consultation_id it resolved to, so you always learn which conversation you actually continued.' },
 
     },
     output: {
@@ -374,11 +396,22 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       const refundReservation = (): void => { manualReserved.set(key, Math.max(0, (manualReserved.get(key) ?? 1) - 1)) }
       let continuation: { consultationId: string; publicId: string; childSessionId: string; turns: number } | undefined
       if (typeof args.consultation_id === 'string' && args.consultation_id.trim()) {
-        const requested = handleBase(args.consultation_id.trim())
-        const found = consultations.get(requested)
-        if (!found) { refundReservation(); return unavailable('Unknown consultation id: this agent has no open consultation with that id. Start a new consultation by omitting consultation_id.') }
-        if (found.requesterId !== key || found.rootId !== String(taskRootAgent(ctx, agent).id)) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
-        continuation = { consultationId: found.consultationId, publicId: args.consultation_id.trim(), childSessionId: found.childSessionId, turns: found.turns }
+        const requested = args.consultation_id.trim()
+        const rootId = String(taskRootAgent(ctx, agent).id)
+        // The alias is resolved HERE, once, into a concrete record, and the resolved
+        // binding is what the whole call carries — a retry cannot retarget it. When it
+        // resolves to nothing the call is refused outright: silently starting a fresh
+        // consultation would let a caller believe it continued one when it did not.
+        if (requested.toLowerCase() === LATEST_ALIAS) {
+          const latest = latestManualConsultation(key, rootId)
+          if (!latest) { refundReservation(); return unavailable('There is no earlier manual consultation to continue: "last" means the most recent DELIVERED manual consultation by this agent on this task, and there is none. A failed or still-running consultation does not count. Start a new consultation by omitting consultation_id.') }
+          continuation = { consultationId: latest.consultationId, publicId: handleOf(latest.consultationId, 0), childSessionId: latest.childSessionId, turns: latest.turns }
+        } else {
+          const found = consultations.get(handleBase(requested))
+          if (!found) { refundReservation(); return unavailable('Unknown consultation id: this agent has no open consultation with that id. Start a new consultation by omitting consultation_id.') }
+          if (found.requesterId !== key || found.rootId !== rootId) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
+          continuation = { consultationId: found.consultationId, publicId: requested, childSessionId: found.childSessionId, turns: found.turns }
+        }
       }
       try {
         const ending = agent.session.snapshotEvents().findLast(event => event.type === 'step/start')

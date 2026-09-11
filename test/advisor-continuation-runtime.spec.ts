@@ -305,6 +305,18 @@ const twoTurnAdvisor = (): ScriptEntry[] => [
   textResponse('TURN-TWO-CLOSE'),
 ]
 
+/** The alias a caller uses when it no longer holds the uuid it was handed. */
+const ALIAS = 'last'
+/** One consultation's worth of Advisor responses: a verdict submission, then the close. */
+const consultationScript = (count: number): ScriptEntry[] =>
+  Array.from({ length: count }, () => advisorVerdictResponse()).flatMap(entry => [entry, textResponse('CONSULTATION-CLOSE')])
+/** Ask once and return the tool's own structured answer. */
+async function ask(harness: DeployedRuntimeHarness, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const outcome = await harness.runTool(CONSULT, args, harness.root)
+  expect(outcome.isError, outcome.text).toBe(false)
+  return asAnswer(outcome.value)
+}
+
 describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distinct turn that publishes one fresh verdict', () => {
   it('publishes a complete verdict for a first consultation', async () => {
     const { harness } = await openHarness({
@@ -622,5 +634,67 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
       `closed turns       : ${JSON.stringify(closedTurns(persisted.events))}`,
       `verdict marker in the durable child log: ${persistedText.includes('UNPUBLISHED-VERDICT-SUMMARY')}`,
       `verdict marker in the requester's tool result: ${outcome.text.includes('UNPUBLISHED-VERDICT-SUMMARY')}`)
+  }, TEST_TIMEOUT)
+
+  it('resolves the "last" alias to a concrete conversation and continues THAT child', async () => {
+    const { harness } = await openHarness({ weak: [textResponse('requester idle')], advisor: consultationScript(2) })
+
+    const one = await ask(harness, { question: T1.question, current_hypothesis: T1.hypothesis })
+    expect(one.status).toBe('ok')
+    const issued = String(one.consultation_id), childId = String(one.child_session_id)
+    expect(childId.length).toBeGreaterThan(0)
+    // Released before the follow-up, so the continuation below is a real cold resume.
+    await until(() => childReleased(harness, childId), `child ${childId} to be released`)
+
+    const two = await ask(harness, { question: T2.question, current_hypothesis: T2.hypothesis, consultation_id: ALIAS })
+
+    evidence('--- alias "last" resolves to a concrete conversation ---',
+      `issued consultation_id  : ${issued}`,
+      `resolved consultation_id: ${String(two.consultation_id)}`,
+      `child_session_id        : ${String(two.child_session_id)}`,
+      `expected child          : ${childId}`,
+      `status                  : ${String(two.status)}`)
+
+    expect(two.status).toBe('ok')
+    // The alias must hand back a real id, never the word "last", so the caller
+    // learns which conversation it actually continued.
+    expect(two.consultation_id).toBe(issued)
+    expect(two.consultation_id).not.toBe(ALIAS)
+    expect(two.child_session_id).toBe(childId)
+  }, TEST_TIMEOUT)
+
+  it('tracks DELIVERY, so a follow-up into an older conversation becomes the alias target', async () => {
+    const { harness } = await openHarness({ weak: [textResponse('requester idle')], advisor: consultationScript(4) })
+
+    const one = await ask(harness, { question: T1.question })
+    expect(one.status).toBe('ok')
+    const firstIssued = String(one.consultation_id), firstChild = String(one.child_session_id)
+    await until(() => childReleased(harness, firstChild), `child ${firstChild} to be released`)
+
+    // A second, unrelated conversation. It is the most recently OPENED one.
+    const other = await ask(harness, { question: 'A-DIFFERENT-TOPIC-QUESTION' })
+    expect(other.status).toBe('ok')
+    const otherChild = String(other.child_session_id)
+    expect(otherChild).not.toBe(firstChild)
+
+    // Now re-enter the OLDER conversation explicitly. That delivery is the most
+    // recent one, so the alias has to follow it rather than the newer conversation.
+    const back = await ask(harness, { question: T2.question, consultation_id: firstIssued })
+    expect(back.status).toBe('ok')
+    expect(back.child_session_id).toBe(firstChild)
+
+    const viaAlias = await ask(harness, { question: 'CONTINUE-WHERE-WE-LEFT-OFF', consultation_id: ALIAS })
+
+    evidence('--- alias follows delivery, not the most recently opened conversation ---',
+      `first child (older)     : ${firstChild}`,
+      `second child (newer)    : ${otherChild}`,
+      `alias resolved to child : ${String(viaAlias.child_session_id)}`,
+      `alias resolved to id    : ${String(viaAlias.consultation_id)}`,
+      `first issued id         : ${firstIssued}`)
+
+    expect(viaAlias.status).toBe('ok')
+    expect(viaAlias.child_session_id).toBe(firstChild)
+    expect(viaAlias.child_session_id).not.toBe(otherChild)
+    expect(viaAlias.consultation_id).toBe(firstIssued)
   }, TEST_TIMEOUT)
 })
