@@ -94,6 +94,165 @@ function flattenArgumentStrings(value: unknown, out: string[] = [], depth = 0): 
 }
 function argumentText(args: unknown): string { return flattenArgumentStrings(args).join(' ') }
 const VALIDATION_FAMILY = /\b(?:pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+test|gradle\w*\s+test|(?:pnpm|npm|yarn)\s+(?:run\s+)?(?:typecheck|test|lint|build)|tsc)\b/
+/** The same family, scanned for EVERY match so a mention can be rejected and the
+ * scan continued to the invocation behind it. */
+const VALIDATION_FAMILY_SCAN = new RegExp(VALIDATION_FAMILY.source, 'g')
+
+/** A half-open span of the original command text. */
+interface CommandSpan { readonly start: number; readonly end: number }
+
+/**
+ * Launchers whose OPERAND is the check: `npx vitest run` invokes a check while
+ * naming none itself. The set is deliberately small and explicit, because a
+ * missing launcher loses a genuine invocation - a silent false negative, which
+ * is the worse error here.
+ */
+const LAUNCHERS = new Set(['npx', 'npx.cmd', 'env'])
+
+/** Split a command at UNQUOTED separators, keeping every token's exact span. */
+function shellSegments(command: string): CommandSpan[][] {
+  const segments: CommandSpan[][] = []
+  let tokens: CommandSpan[] = []
+  let start = -1
+  let quote = ''
+  for (let index = 0; index < command.length; index++) {
+    const character = command.charAt(index)
+    if (quote !== '') {
+      if (character === quote) quote = ''
+      // Inside double quotes a backslash escapes only a quote or another
+      // backslash. Escaping the next character unconditionally would make the
+      // closing quote of a PowerShell path such as "C:\proj\" part of the
+      // string, and every token after it would read as argument text.
+      else if (character === '\\' && quote === '"' && (command.charAt(index + 1) === '"' || command.charAt(index + 1) === '\\')) index++
+      continue
+    }
+    if (character === '"' || character === "'") {
+      if (start < 0) start = index
+      quote = character
+      continue
+    }
+    // A backslash is NOT an escape outside quotes: this runs for PowerShell too,
+    // where it is the path separator, and treating `C:\dir\ x` as an escaped
+    // space silently merges two tokens.
+    if (character === ' ' || character === '\t') {
+      if (start >= 0) { tokens.push({ start, end: index }); start = -1 }
+      continue
+    }
+    // UNQUOTED separators end a statement. Redirection operators deliberately do
+    // NOT: their operand is a file name, so `echo ok > vitest` would otherwise
+    // make the file `vitest` look like an invocation of a check.
+    if (';|&\n\r'.includes(character)) {
+      if (start >= 0) { tokens.push({ start, end: index }); start = -1 }
+      if (tokens.length > 0) { segments.push(tokens); tokens = [] }
+      continue
+    }
+    if (start < 0) start = index
+  }
+  if (start >= 0) tokens.push({ start, end: command.length })
+  if (tokens.length > 0) segments.push(tokens)
+  return segments
+}
+
+/**
+ * Shells whose `-c` / `-Command` operand is ITSELF a command line. The operand is
+ * quoted, so without this the genuine check inside `pwsh -Command "npm test"`
+ * would be read as argument text and lost - the false-negative direction, which is
+ * the more expensive one here.
+ */
+const SHELL_WRAPPERS = new Set(['bash', 'sh', 'zsh', 'pwsh', 'powershell', 'cmd'])
+/** The flags that make a shell wrapper treat its next operand as a command line. */
+const COMMAND_FLAGS = new Set(['-c', '-command', '/c'])
+/** Nesting deeper than this is not worth resolving; treat it as not a check. */
+const MAX_WRAPPER_DEPTH = 3
+
+/** The spans of one segment that occupy an executable position. */
+function executableSpans(segment: CommandSpan[], command: string, depth = 0): CommandSpan[] {
+  const textAt = (span: CommandSpan): string => command.slice(span.start, span.end)
+  let cursor = 0
+  while (cursor < segment.length) {
+    const span = segment[cursor]
+    if (span === undefined) break
+    const text = textAt(span)
+    // `FOO=1 npm test` configures the run; the check is what remains.
+    if (/^[A-Za-z_][\w-]*=/.test(text)) { cursor++; continue }
+    // PowerShell `$env:NAME = "value"` is a binding, not an invocation.
+    if (/^\$[\w:]+$/i.test(text)) {
+      const next = segment[cursor + 1]
+      cursor += next !== undefined && textAt(next) === '=' ? 3 : 1
+      continue
+    }
+    break
+  }
+  const executable = segment[cursor]
+  if (executable === undefined) return []
+  const spans: CommandSpan[] = [executable]
+  const base = (textAt(executable).replace(/^["']|["']$/g, '').split(/[\\/]/).pop() ?? '').toLowerCase()
+  const operands = segment.slice(cursor + 1)
+  if (SHELL_WRAPPERS.has(base)) {
+    for (let index = 0; index < operands.length; index++) {
+      const operand = operands[index]
+      if (operand === undefined) break
+      const text = textAt(operand).toLowerCase()
+      if (!COMMAND_FLAGS.has(text)) {
+        // A shell invoked with a script file, not with a command string.
+        if (!text.startsWith('-') && !text.startsWith('/')) break
+        continue
+      }
+      const inner = operands[index + 1]
+      return inner === undefined ? spans : spans.concat(nestedSpans(inner, command, depth))
+    }
+    return spans
+  }
+  if (!LAUNCHERS.has(base)) return spans
+  for (const operand of operands) {
+    const text = textAt(operand)
+    if (text.startsWith('-') || /^[A-Za-z_][\w-]*=/.test(text)) continue
+    spans.push(operand)
+    break
+  }
+  return spans
+}
+
+/**
+ * The invocations inside the quoted command string of a shell wrapper, mapped back
+ * into the ORIGINAL command's coordinates so the caller can slice its own text.
+ */
+function nestedSpans(operand: CommandSpan, command: string, depth: number): CommandSpan[] {
+  if (depth >= MAX_WRAPPER_DEPTH) return []
+  const raw = command.slice(operand.start, operand.end)
+  const quote = raw.charAt(0)
+  const quoted = quote === '"' || quote === "'"
+  const closed = quoted && raw.length > 1 && raw.charAt(raw.length - 1) === quote ? 1 : 0
+  const open = quoted ? 1 : 0
+  const content = raw.slice(open, raw.length - closed)
+  const offset = operand.start + open
+  return invocationSpans(content, depth + 1).map(span => ({ start: span.start + offset, end: span.end + offset }))
+}
+
+/** Every span of a command in which a family match is an invocation. */
+function invocationSpans(command: string, depth = 0): CommandSpan[] {
+  return shellSegments(command).flatMap(segment => executableSpans(segment, command, depth))
+}
+
+/**
+ * The index of the first family match that INVOKES a check rather than merely
+ * appearing in argument text.
+ *
+ * The distinction is positional, not textual: `git commit -m "notes; npm test"`
+ * puts the phrase inside a quoted argument of an unrelated executable, while
+ * `echo "npm test"; npm test` both mentions it and really runs it - the mention
+ * is rejected and the scan continues to the invocation behind the separator.
+ */
+function validationMatchIndex(command: string): number | undefined {
+  const spans = invocationSpans(command)
+  if (spans.length === 0) return undefined
+  VALIDATION_FAMILY_SCAN.lastIndex = 0
+  for (let match = VALIDATION_FAMILY_SCAN.exec(command); match !== null; match = VALIDATION_FAMILY_SCAN.exec(command)) {
+    const index = match.index
+    if (spans.some(span => index >= span.start && index < span.end)) return index
+  }
+  return undefined
+}
 
 /**
  * The validation statement a shell call performs: the segment that names the
@@ -111,11 +270,18 @@ const VALIDATION_FAMILY = /\b(?:pytest|jest|vitest|go\s+test|cargo\s+test|mvn\s+
  * at the family word, so `npm run test -- x` and `npx vitest run a.spec.ts`
  * remain distinct targets, and a command that only mentions a family inside a
  * longer word (`npm testx`) is not a validation at all.
+ *
+ * The match must also OCCUPY an executable position. A phrase quoted into the
+ * argument of some other command - `git commit -m "notes; npm test"` - only
+ * mentions a check, and giving it an identity opened an obligation for a run
+ * that never happened. The test is positional rather than a denylist of
+ * innocent executables, so a real invocation later in the same command is still
+ * found.
  */
 function validationStatement(command: string): string | undefined {
-  const match = VALIDATION_FAMILY.exec(command)
-  if (!match) return undefined
-  const rest = command.slice(match.index)
+  const index = validationMatchIndex(command)
+  if (index === undefined) return undefined
+  const rest = command.slice(index)
   const boundary = rest.search(/[|;\r\n]|\d?>>?\s*&?\S|<\s*&?\S/)
   let statement = boundary >= 0 ? rest.slice(0, boundary) : rest
   // A recording prefix such as `$env:DSH_RUNTIME_PACKAGE_JSON = "...";` or
@@ -131,7 +297,9 @@ function validationStatement(command: string): string | undefined {
 function validationKey(name: string, args: unknown, scope?: string): string | undefined {
   if (!VALIDATION_TOOL.test(name)) return undefined
   const command = argumentText(args).toLowerCase()
-  if (/^\s*(?:echo|printf|write-output|cat)\b/.test(command)) return undefined
+  // An `echo "npm test"` or a `cat vitest.log` is rejected below by POSITION
+  // rather than by an executable-name denylist: the denylist read the START of
+  // the command, so `echo "npm test"; npm test` also lost the real check.
   const statement = validationStatement(command)
   if (!statement) return undefined
   let kind: string | undefined

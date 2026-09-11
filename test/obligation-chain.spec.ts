@@ -324,13 +324,17 @@ describe('verification obligations through the real plugin chain', () => {
   }, 10000)
 
   it('does not open an obligation for an expected-negative exit', async () => {
-    // `grep -c "npm test" notes.txt` is the sharpest available exclusion case: the
-    // plugin still derives a `test` validation identity for it (the family regex is
-    // not anchored), and only the expected-negative class keeps it out of the record.
+    // `grep -c "npm test" notes.txt` searches for the TEXT of a check; it does not
+    // run one, so it now mints no validation identity at all. The expected-negative
+    // class still applies, but it is no longer the ONLY thing standing between this
+    // command and a bogus obligation - the identity is absent too. Stated plainly
+    // because it changes what this test proves: it once demonstrated the exclusion
+    // working against a PRESENT identity, and that combination is no longer
+    // constructible now that a mention is rejected by position.
     const command = 'grep -c "npm test" notes.txt'
     const outcome = classified(command, 1)
     expect(outcome).toMatchObject({ class: 'expected-negative', exitCode: 1 })
-    expect(outcome.validationKey).toBeDefined()
+    expect(outcome.validationKey).toBeUndefined()
     const h = await harness({ weak: [
       toolCallResponse('expected-negative', 'bash', { command }),
       toolCallResponse('expected-negative-list', 'advisor_obligation', { action: 'list' }),
@@ -352,4 +356,34 @@ describe('verification obligations through the real plugin chain', () => {
     expect(requests.some(entry => requestText(entry.request).includes('[Advisor obligations'))).toBe(false)
     expect(toolResultText(h.root, 'expected-negative-list')).toContain('No current-run obligation record.')
   })
+  it('does not let a command that merely MENTIONS a check clear the obligation', async () => {
+    // The sharpest form of the defect: the mentioning command FAILS. If it carried
+    // an identity it would open a bogus obligation of its own, and a succeeding
+    // mention would close the genuine one - the mechanism could accuse an innocent
+    // command and then absolve a check that never ran.
+    const check = 'npm test'
+    const mention = 'git commit -m "notes; npm test"'
+    const h = await harness({ weak: [
+      toolCallResponse('mention-fail', 'bash', { command: check }),
+      toolCallResponse('mention-prose', 'bash', { command: mention }),
+      textResponse('Committed the notes.'),
+      textResponse('Nothing else to verify.'),
+    ] })
+    const executed = registerShellFixture(h, new Map([
+      [check, [{ exitCode: 1, output: FAILURE_OUTPUT }]],
+      [mention, [{ exitCode: 1, output: 'nothing to commit' }]],
+    ]))
+
+    await h.runRoot('Make the suite pass.')
+
+    expect(executed).toEqual([check, mention])
+    // No identity, so the failing commit cannot open a second obligation...
+    const mentionOutcome = classified(mention, 1)
+    expect(mentionOutcome.validationKey).toBeUndefined()
+    expect(mentionOutcome.class).toBe('unknown-failure')
+    // ...and the check it merely named is still open, exactly once.
+    const snapshot = obligationSnapshot(h)
+    expect(snapshot.openCount).toBe(1)
+    expect(snapshot.items[0]).toMatchObject({ state: 'open' })
+  }, 10000)
 })
