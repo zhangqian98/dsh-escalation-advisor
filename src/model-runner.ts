@@ -90,9 +90,8 @@ export interface AdvisorRunResult {
 
 export function advisorToolSurface(ctx: Context, parent: Agent, policy: EffectiveAdvisorPolicy, amplifierTools: readonly string[] = []) {
   const visible = new Set(ctx.tools.schemas(parent).map(tool => tool.name))
-  const global = new Set(ctx.tools.schemas().map(tool => tool.name))
   const requested = policy.allowedTools.filter(name => !isCapabilityAmplifier(ctx, name, amplifierTools))
-  return { allowedTools: requested.filter(name => visible.has(name) && global.has(name)), unavailableTools: requested.filter(name => !visible.has(name) || !global.has(name)) }
+  return { allowedTools: requested.filter(name => visible.has(name)), unavailableTools: requested.filter(name => !visible.has(name)) }
 }
 
 export function advisorPolicyNote(allowedTools: string[], unavailableTools: string[]): string {

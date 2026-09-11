@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Context, Service } from '@deepseek-ai/cordis'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import { bindScopeParent, createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
@@ -342,6 +344,56 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const advisor = advisorChildren(h)[0]!.agent
     expect(JSON.stringify(advisor.session.snapshotEvents())).toContain('Advisor delegation tools are permanently disabled')
     await run.dispose()
+  })
+
+  it('inherits a read tool registered only in the requester preset scope', async () => {
+    let reads = 0
+    const h = await harness({
+      weak: [
+        toolCallResponse('scoped-read-review', 'consult_advisor', { question: 'Inspect through my scoped reader.' }),
+        textResponse('Root completed after review.'),
+      ],
+      advisor: [
+        toolCallResponse('scoped-read', 'scoped_read', {}),
+        advisorVerdictResponse(),
+        textResponse('Verdict submitted.'),
+      ],
+    }, { defaultEnabledTools: ['scoped_read'], readOnlyTools: ['scoped_read'] })
+    const presetKey = {}
+    await h.ctx.plugin({
+      name: 'fixture-agent-preset', inject: ['tools'], apply(context: Context) {
+        const preset = createScope(context, presetKey)
+        context.effect(() => preset.rawDispose, 'fixture preset scope')
+        preset.ctx.tools.register(defineContentToolFixture({
+          name: 'scoped_read', description: 'Read data visible only in the requester preset.', parameters: {},
+          execute: async () => { reads += 1; return [{ type: 'text', text: 'scoped evidence' }] },
+        }))
+        bindScopeParent(h.root, presetKey)
+        class FixtureAgentPresets extends Service {
+          constructor(serviceContext: Context) { super(serviceContext, 'agentPresets') }
+          composedPreset(): string { return 'fixture-preset' }
+          composeFrom(childContext: Context): string {
+            const childKey = scopeOf(childContext)
+            if (!childKey) throw new Error('Fixture child has no agent scope')
+            bindScopeParent(childKey, presetKey)
+            return 'fixture-preset'
+          }
+        }
+        new FixtureAgentPresets(context)
+      },
+    })
+
+    expect(h.ctx.tools.schemas().map(tool => tool.name)).not.toContain('scoped_read')
+    expect(h.ctx.tools.schemas(h.root).map(tool => tool.name)).toContain('scoped_read')
+    await h.runRoot('Review using my scoped read capability.')
+
+    const advisorRequests = h.adapter.forModel('advisor')
+    expect(advisorRequests.length, JSON.stringify(advisorRunHistory(h.root), null, 2)).toBeGreaterThan(0)
+    expect((advisorRequests[0]!.request.tools ?? []).map(tool => tool.name)).toContain('scoped_read')
+    expect(reads).toBe(1)
+    expect(advisorChildren(h)[0]!.agent.session.snapshotEvents()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'advisor/identity', data: expect.objectContaining({ allowedTools: expect.arrayContaining(['scoped_read']) }) }),
+    ]))
   })
 
   it('treats an ordinary worker with an Advisor-looking label as a worker', async () => {

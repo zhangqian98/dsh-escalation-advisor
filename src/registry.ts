@@ -101,8 +101,7 @@ export class AdvisorRegistry {
   }
 
   private restrict(agent: Agent, identity: AdvisorIdentity): void {
-    const global = new Set(this.ctx.tools.schemas().map(tool => tool.name))
-    this.ctx.effect(() => agent.ctx.tools.restrict({ allow: identity.allowedTools.filter(name => global.has(name) && name !== 'run_code') }), 'advisor: descendant tool ceiling')
+    this.ctx.effect(() => agent.ctx.tools.restrict({ allow: identity.allowedTools.filter(name => name !== 'run_code') }), 'advisor: descendant tool ceiling')
   }
 
   identity(agent: Agent): AdvisorIdentity | undefined { return this.identities.get(String(agent.id)) }
