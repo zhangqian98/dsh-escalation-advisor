@@ -323,6 +323,46 @@ describe('verification obligations through the real plugin chain', () => {
     expect(obligationNotices(h.root)).toHaveLength(4 + MAX_AUTO_REMINDERS_PER_TASK)
   }, 10000)
 
+  it('states an unchanged item in one line and ends the budget with a handoff checklist', async () => {
+    const scriptedRounds = 5
+    const script = Array.from({ length: scriptedRounds }, (_, index) => [
+      toolCallResponse('shape-' + index, 'bash', { command: index === 0 ? 'npm test' : 'npx vitest run' }),
+      textResponse('Round ' + index + ' only explains the failure again.'),
+    ]).flat()
+    const h = await harness({ weak: script })
+    registerShellFixture(h, new Map([
+      ['npm test', Array.from({ length: scriptedRounds }, () => ({ exitCode: 1, output: FAILURE_OUTPUT }))],
+      ['npx vitest run', Array.from({ length: scriptedRounds }, () => ({ exitCode: 1, output: FAILURE_OUTPUT }))],
+    ]))
+
+    await h.runRoot('Keep working without a passing re-run.')
+
+    const notices = obligationNotices(h.root)
+    const ids = obligationSnapshot(h).items.map(item => item.id)
+    expect(ids).toHaveLength(2)
+    expect(obligationSnapshot(h).openCount).toBe(2)
+
+    // An item unchanged since the last reminder is stated in ONE LINE instead of
+    // having its whole block read out again. Before this, every notice repeated the
+    // full text of every open item, which is what made a dispositioned item cost
+    // attention on every single turn.
+    const reminders = notices.filter(text => text.includes('still open'))
+    expect(reminders.length).toBeGreaterThan(0)
+
+    // The last reminder the fixed budget allows is the handoff checklist, and it
+    // names EVERY open item - including the one that went compact - so suppressing
+    // the repetition can never become silence.
+    const final = notices.filter(text => text.includes('STILL UNRESOLVED'))
+    expect(final).toHaveLength(1)
+    for (const id of ids) expect(final[0]).toContain(id)
+    // A pre-step INJECTION can still follow the last reminder - the budget stops
+    // reminders, not the turn - so the claim is about the last REMINDER.
+    expect(reminders[reminders.length - 1]).toContain('STILL UNRESOLVED')
+    // The per-task budget is untouched: the checklist IS the last reminder, not an
+    // extra one on top of it.
+    expect(obligationSnapshot(h).remindersUsed).toBe(MAX_AUTO_REMINDERS_PER_TASK)
+  }, 10000)
+
   it('does not open an obligation for an expected-negative exit', async () => {
     // `grep -c "npm test" notes.txt` searches for the TEXT of a check; it does not
     // run one, so it now mints no validation identity at all. The expected-negative

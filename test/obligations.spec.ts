@@ -206,6 +206,41 @@ describe('ObligationStore', () => {
     expect(store.remindersUsed('s1', 100)).toBe(0)
   })
 
+  it('does not re-arm attention for a disposition, but does for later evidence', () => {
+    const store = new ObligationStore()
+    const item = failure(store, 10, 'k-auth')
+    store.markReminded(item)
+    expect(store.pendingReminder('s1', 100)).toHaveLength(0)
+
+    // Recording a disposition is a RECORD, not new evidence. If it re-armed
+    // attention, the same full text would be read out again every time one is
+    // written - which is exactly the repetition this is meant to stop.
+    store.recordDisposition('s1', 100, item.id, { kind: 'not-applicable', basis: 'measured against the artifact', at: 11_000, seq: 11 })
+    expect(store.pendingReminder('s1', 100)).toHaveLength(0)
+    // Suppressing the repetition is NOT closing anything: the item stays open and
+    // counted, so a later reader still sees it.
+    expect(store.open('s1', 100)).toHaveLength(1)
+    expect(store.open('s1', 100)[0]?.state).toBe('open')
+
+    // Later evidence moves the revision PAST the disposition, which re-arms
+    // attention on its own - the anti-burial direction is untouched.
+    failure(store, 40, 'k-auth')
+    const due = store.pendingReminder('s1', 100)
+    expect(due).toHaveLength(1)
+    expect(due[0]?.dispositionRevision).toBeLessThan(due[0]?.revision ?? 0)
+    expect(store.remindersUsed('s1', 100)).toBe(0)
+  })
+
+  it('keeps a dispositioned item visible and counted after suppression', () => {
+    const store = new ObligationStore()
+    const item = failure(store, 10, 'k-auth')
+    store.recordDisposition('s1', 100, item.id, { kind: 'accept-risk', basis: 'operator accepted the residual risk', at: 11_000, seq: 11 })
+    expect(store.open('s1', 100).map(entry => entry.id)).toEqual([item.id])
+    expect(store.list('s1', 100)[0]).toMatchObject({ state: 'open', disposition: { kind: 'accept-risk' } })
+    // Only a witness closes; a disposition never does.
+    expect(store.open('s1', 100)).toHaveLength(1)
+  })
+
   it('reports nothing for a task it never observed', () => {
     const store = new ObligationStore()
     failure(store, 10, 'k-auth')

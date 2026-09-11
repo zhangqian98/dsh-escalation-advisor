@@ -93,6 +93,12 @@ export interface Obligation {
   injectedRevision: number
   remindedRevision: number
   disposition?: Disposition
+  /**
+   * The revision the current disposition covers. A disposition is a RECORD, not
+   * evidence, so it covers only what was true when it was written; evidence that
+   * moves the revision later leaves it behind instead of silently still covering.
+   */
+  dispositionRevision?: number
   correction?: Correction
   resolution?: Resolution
 }
@@ -201,9 +207,18 @@ export class ObligationStore {
     return due
   }
 
-  /** At most one reminder per obligation revision; the task budget is separate. */
+  /**
+   * At most one reminder per obligation revision; the task budget is separate.
+   *
+   * A disposition that still covers the current revision is NOT a reason to speak
+   * again: recording one is a record, not a new failure. Repeating its full text
+   * every turn is noise. New evidence moves the revision, which re-arms attention
+   * by itself - so this suppresses repetition, never the unresolved status.
+   */
   pendingReminder(sessionId: string, taskStartSeq: number): Obligation[] {
-    return this.open(sessionId, taskStartSeq).filter(item => item.revision > item.remindedRevision)
+    return this.open(sessionId, taskStartSeq).filter(item =>
+      item.revision > item.remindedRevision
+      && !(item.disposition !== undefined && item.dispositionRevision === item.revision))
   }
 
   markReminded(obligation: Obligation): void {
@@ -301,6 +316,7 @@ export class ObligationStore {
     if (!item) return undefined
     item.disposition = { ...disposition }
     item.revision += 1
+    item.dispositionRevision = item.revision
     return item
   }
 

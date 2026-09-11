@@ -79,20 +79,40 @@ function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child:
 }
 
 /** Open obligations, stated as a reminder rather than as a block. */
-function obligationMessage(items: readonly Obligation[]): UserMessage {
-  const lines = items.map(item => {
+function obligationMessage(detail: readonly Obligation[], unchanged: readonly Obligation[], final: boolean): UserMessage {
+  const lines = detail.map(item => {
     const closure = item.validationKey
       ? 'a later pass of the same command in this scope with no related change since'
       : 'this failure carries no validation identity, so it cannot be closed automatically'
     const options = item.kind === 'claim-contradicted'
       ? 'A) ask the Advisor with the claim and the counterexample; B) back it with a verification witness; C) record a correction naming document, claim and change.'
       : 'A) ask the Advisor with the evidence; B) fix it and re-run the same command; C) record not-applicable or accept-risk with a checkable basis.'
-    return '- ' + item.id + ' [' + item.kind + ', seen ' + item.repeatCount + 'x' + (item.disposition ? ', disposition=' + item.disposition.kind : '') + '] ' + item.summary + '\n  Closes only through: ' + closure + '.\n  ' + options
+    return '- ' + item.id + ' [' + item.kind + ', seen ' + item.repeatCount + 'x' + dispositionNote(item) + '] ' + item.summary + '\n  Closes only through: ' + closure + '.\n  ' + options
   })
+  // Everything already stated in full collapses to one line: repeating the block
+  // would add nothing the earlier statement did not already carry.
+  const brief = unchanged.map(item =>
+    '- ' + item.id + ' [' + item.kind + ', still open' + dispositionNote(item) + '] ' + item.summary)
+  const tail = final
+    ? '\n\nThis is the LAST automatic reminder for this task. Report every item above as STILL UNRESOLVED in your final answer: none has been verified, and a recorded disposition is a record, not verification.'
+    : '\n\nThis is a reminder, not a block. An explanation of why a failure happened is not a verification witness and does not close an item.'
   return createUserMessage({
-    content: [{ type: 'text', text: '[Advisor obligations - open verification items. No score reset, cooldown or consultation budget clears these.]\n' + lines.join('\n') + '\n\nThis is a reminder, not a block. An explanation of why a failure happened is not a verification witness and does not close an item.' }],
-    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + items.length + ' open obligation(s)' },
+    content: [{ type: 'text', text: '[Advisor obligations - open verification items. No score reset, cooldown or consultation budget clears these.]\n' + lines.concat(brief).join('\n') + tail }],
+    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + (detail.length + unchanged.length) + ' open obligation(s)' },
   })
+}
+
+/**
+ * A disposition is a record of a DECISION, never verification. It also stops
+ * covering the item the moment later evidence moves the revision past it, and
+ * saying so is the whole point of tracking which revision it was written against.
+ */
+function dispositionNote(item: Obligation): string {
+  if (item.disposition === undefined) return ''
+  const recorded = ', disposition=' + item.disposition.kind
+  return item.dispositionRevision === item.revision
+    ? recorded + ', not verified'
+    : recorded + ' (outrun by later evidence), not verified'
 }
 function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor unavailable', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', consultation_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
 function toolAnswer(answer: AdvisorRunResult, consultationId: string) {
@@ -601,7 +621,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     const advice = await automatic(request.agent, request.turn, request.step, request.signal, true)
     const taskStartSeq = taskStarts.get(key) ?? 0
     const due = roleOf(request.agent) === 'root' ? obligations.pendingInjection(key, taskStartSeq) : []
-    const obligationNote = due.length ? obligationMessage(due) : undefined
+    const obligationNote = due.length ? obligationMessage(due, [], false) : undefined
     return advice || notes.length || obligationNote ? { ...nextStep, messages: [...nextStep.messages, ...notes, ...(obligationNote ? [obligationNote] : []), ...(advice ? [advice] : [])] } : nextStep
   })
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
@@ -615,7 +635,10 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     const due = obligations.pendingReminder(key, taskStartSeq)
     if (!due.length || !obligations.consumeReminder(key, taskStartSeq)) return
     for (const item of due) obligations.markReminded(item)
-    agent.steer(obligationMessage(open))
+    // The last reminder the fixed budget allows is the handoff checklist, so an
+    // unresolved item is disclosed once at the end rather than re-read every turn.
+    const final = obligations.remindersUsed(key, taskStartSeq) >= MAX_AUTO_REMINDERS_PER_TASK
+    agent.steer(obligationMessage(due, open.filter(item => !due.includes(item)), final))
   })
   ctx.on('agent/disposed', ({ agent }) => {
     const key = String(agent.id)
