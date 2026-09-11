@@ -12,7 +12,7 @@ import { coverageEnabled, type AdvisorAgentRole } from './coverage.js'
 import { buildCasePacket, textContent } from './context.js'
 import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, requesterSeq, START_REJECTED, type AdvisorRunResult, type AdvisorContinuation } from './model-runner.js'
 import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
-import { toolGuidance } from './prompts.js'
+import { GOAL_ROUND_ADVISOR_ROUTE, toolGuidance } from './prompts.js'
 import { EscalationTracker, classifyToolOutcome, mutationKey, type EscalationDecision } from './state.js'
 import { MAX_AUTO_REMINDERS_PER_TASK, ObligationStore, opensObligation, type Obligation } from './obligations.js'
 import { AdvisorTaskLimiter, AdvisorTaskLimitError } from './task-limiter.js'
@@ -146,6 +146,8 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const manualReserved = new Map<string, number>()
   const revisions = new Map<string, number>()
   const hiddenTools = new Map<Agent, () => void>()
+  /** True while the current root turn originated from an admitted goal round. */
+  const goalRoundActive = new Set<string>()
   const inFlight = new Set<string>()
   const suppressed = new Set<string>()
   const retryableStarts = new Map<string, { failures: number; after: number }>()
@@ -229,7 +231,18 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     if (!context.agent || !manualEnabled(context.agent) || ctx.tools.get(ADVISOR_TOOL_NAME, context.agent) === undefined) {
       return { ...assembly, tools: assembly.tools.filter(tool => tool.name !== ADVISOR_TOOL_NAME), sections: assembly.sections.filter(section => section.name !== 'escalation-advisor-guidance'), contexts: assembly.contexts.filter(context => context.name !== 'advisor:guidance') }
     }
-    return assembly
+    if (!goalRoundActive.has(String(context.agent.id))) return assembly
+    return {
+      ...assembly,
+      contexts: assembly.contexts.map(context => context.name === 'advisor:guidance' ? { ...context, text: context.text + '\n\n' + GOAL_ROUND_ADVISOR_ROUTE } : context),
+    }
+  })
+
+  ctx.on('agent/inbox/claimed', ({ agent, message }) => {
+    if (registry.identity(agent)) return
+    const key = String(agent.id)
+    if (message.source.kind === 'goal') goalRoundActive.add(key)
+    else if (message.source.kind === 'user') goalRoundActive.delete(key)
   })
 
   /**
@@ -635,6 +648,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     return advice || notes.length || obligationNote ? { ...nextStep, messages: [...nextStep.messages, ...notes, ...(obligationNote ? [obligationNote] : []), ...(advice ? [advice] : [])] } : nextStep
   })
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
+    goalRoundActive.delete(String(agent.id))
     await automatic(agent, turn, undefined, signal, false)
     if (roleOf(agent) !== 'root') return
     const key = String(agent.id), taskStartSeq = taskStarts.get(key) ?? 0
@@ -652,7 +666,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   })
   ctx.on('agent/disposed', ({ agent }) => {
     const key = String(agent.id)
-    tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key); obligations.clear(key)
+    tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key); obligations.clear(key); goalRoundActive.delete(key)
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
     hiddenTools.get(agent)?.(); hiddenTools.delete(agent)
     for (const controller of controllers.get(key) ?? []) controller.abort()

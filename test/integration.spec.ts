@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { advisorRunHistory } from '../src/telemetry.js'
 import {
@@ -11,6 +12,7 @@ import {
   deferred,
   descriptorOf,
   requestText,
+  runtimeContextOf,
   systemPromptOf,
   textResponse,
   toolCallResponse,
@@ -130,6 +132,55 @@ describe('real DSH AgentLoop and spawn integration', () => {
     await worker.dispose()
     expect(requestText(h.adapter.forModel('worker')[0]!.request)).not.toContain('Advisor is available through consult_advisor.')
     expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).guidance).toMatchObject({ available: true, reason: '使用指导已启用' })
+  })
+
+  it('adds PTC routing instructions only to goal rounds', async () => {
+    const h = await harness({ weak: [textResponse('ordinary response'), textResponse('goal response'), textResponse('ordinary after goal')] })
+
+    await h.runRoot('Check an ordinary turn')
+    const ordinary = runtimeContextOf(h.adapter.forModel('weak')[0]!.request)
+    expect(ordinary).not.toContain('Goal-round tool routing:')
+
+    await h.runRoot('Continue the autonomous goal', {
+      kind: 'goal',
+      goalId: brandString<Branded<'GoalId'>>('goal-routing-1'),
+      revision: 1,
+      round: 1,
+    })
+    const goal = runtimeContextOf(h.adapter.forModel('weak')[1]!.request)
+    expect(goal).toContain('Goal-round tool routing:')
+    expect(goal).toContain('If the direct tool surface contains only `run_code` (PTC)')
+    expect(goal).toContain('tools.consult_advisor')
+
+    await h.runRoot('Start a new ordinary task')
+    const afterGoal = runtimeContextOf(h.adapter.forModel('weak')[2]!.request)
+    expect(afterGoal).not.toContain('Goal-round tool routing:')
+  })
+
+  it('keeps goal routing through tool steps without leaking into the next task', async () => {
+    const h = await harness({
+      weak: [toolCallResponse('goal-route-tool-call', 'goal_route_probe', {}), textResponse('goal tool step done'), textResponse('ordinary done')],
+    })
+    h.ctx.tools.register(defineContentToolFixture({
+      name: 'goal_route_probe',
+      description: 'A harmless goal-route test tool.',
+      parameters: {},
+      execute: async () => [{ type: 'text', text: 'probe result' }],
+    }))
+
+    await h.runRoot('Run the goal with a tool step', {
+      kind: 'goal',
+      goalId: brandString<Branded<'GoalId'>>('goal-routing-2'),
+      revision: 1,
+      round: 1,
+    })
+    const goalRequests = h.adapter.forModel('weak')
+    expect(goalRequests).toHaveLength(2)
+    expect(runtimeContextOf(goalRequests[0]!.request)).toContain('Goal-round tool routing:')
+    expect(runtimeContextOf(goalRequests[1]!.request)).toContain('Goal-round tool routing:')
+
+    await h.runRoot('Start another ordinary task')
+    expect(runtimeContextOf(h.adapter.forModel('weak')[2]!.request)).not.toContain('Goal-round tool routing:')
   })
 
   it.each([65536, undefined])('uses the Advisor model limits (%s), ignoring legacy caps and the parent output limit', async nativeOutput => {

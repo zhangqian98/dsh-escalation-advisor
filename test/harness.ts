@@ -514,6 +514,13 @@ export function systemPromptOf(request: GenerateOptions): string {
   return carried + leading
 }
 
+export function runtimeContextOf(request: GenerateOptions): string {
+  const snapshots = request.messages
+    .filter(message => message.source.kind === 'plugin' && message.source.plugin === '@deepseek-ai/dsh-system-prompt')
+    .map(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n'))
+  return snapshots[snapshots.length - 1] ?? ''
+}
+
 export function deferred<T = void>(): {
   promise: Promise<T>
   resolve(value: T | PromiseLike<T>): void

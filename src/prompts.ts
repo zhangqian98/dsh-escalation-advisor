@@ -20,3 +20,10 @@ export function toolGuidance(mode: AdvisorMode): string {
     : mode === 'escalate' ? 'Repeated failures may also trigger it automatically.' : ''
   return `## Strong advisor\nActively use consult_advisor as an engineering collaborator. ${automatic} Automatic escalation is a fallback; do not wait for it.\n\nConsult before implementing a consequential design or diagnosis when evidence is incomplete or multiple plausible approaches remain. Consult after the first substantive failed validation before trying a different speculative fix. Consult when findings contradict your hypothesis, when an edit has wider effects than expected, or before claiming completion while a material correctness question remains unresolved. Architecture, concurrency, state transitions, compatibility and test validity are all appropriate questions; tool errors are not required.\n\nFor these checkpoints, call consult_advisor yourself before continuing. Ask a focused question with your hypothesis, concrete evidence, competing options and the decision needed. A single useful consultation can cover several related questions; do not repeat a resolved question or consult for mechanical edits and routine lookups. Verify the independent advice against evidence before acting.`
 }
+
+export const GOAL_ROUND_ADVISOR_ROUTE = [
+  'Goal-round tool routing:',
+  'This is an autonomous goal continuation round. If `consult_advisor` appears as a direct tool schema, call it directly.',
+  'If the direct tool surface contains only `run_code` (PTC), call the declared SDK binding inside it: in TypeScript, `await tools.consult_advisor({...})`; follow the current run_code SDK declaration for the language and exact arguments.',
+  'Do not issue a top-level `consult_advisor` call in PTC mode, and do not invent a binding that is not declared.',
+].join('\n')
