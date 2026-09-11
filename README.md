@@ -1,5 +1,13 @@
 # dsh-escalation-advisor
 
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4D6BFE)](https://github.com/deepseek-ai/deepseek-harness)
+[![Release](https://img.shields.io/github/v/release/zhangqian98/dsh-escalation-advisor?include_prereleases&color=4D6BFE)](https://github.com/zhangqian98/dsh-escalation-advisor/releases)
+[![CI](https://github.com/zhangqian98/dsh-escalation-advisor/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangqian98/dsh-escalation-advisor/actions/workflows/ci.yml)
+[![Node.js](https://img.shields.io/badge/Node.js-22.19%2B-4D6BFE)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-4D6BFE)](LICENSE)
+
+**English** · [简体中文](README.zh-CN.md)
+
 A DSH-only advisor plugin for running cheaper models most of the time and borrowing a stronger DSH model only when a second opinion is useful.
 
 Advisor work runs as a **visible DSH child session**, not a hidden LLM request. Users can open the relevant agent tree and inspect the Advisor transcript, tool calls, token use, and final result.
@@ -24,7 +32,7 @@ Continuous review stays root-only by default so a task with many workers does no
 
 Advisor children themselves are always excluded from manual consultation, escalation scoring, and continuous review, so consultation cannot recurse.
 
-## Install from Git
+## Install
 
 This release supports **DSH `0.1.2-rc.1`, `0.1.5-alpha.2`, and `0.1.5-rc.1`**. All three pass the integration suite; `0.1.2-rc.1` has also been checked in an installed DSH Web profile with real Codex models. Development and CI lock the complete runtime dependency tree to `0.1.5-alpha.2`; other prereleases are not claimed as compatible. CI checks Node 22.19 and 24. DSH `0.1.5-rc.1` migrates supported older session files to V3 while retaining their original files; back up histories before upgrading.
 
@@ -36,8 +44,26 @@ node scripts/patch-dsh-history.mjs /absolute/path/to/@deepseek-ai/dsh/package.js
 
 This local compatibility patch checks the exact DSH version and original file checksums, backs up two core files, and adds schemas for only `advisor/policy`, `advisor/model`, `advisor/identity`, and `advisor/run`. Their payloads are retained through V0 → V3 migration; other unknown historical types still fail. It also updates the persistence worker's event vocabulary for these four types. Keep Advisor enabled when opening these histories. Reinstalling DSH replaces the local core patch; rerun it for this exact release, and revalidate compatibility before using a different DSH release. The plugin supports both the earlier `tool/code-dispatch*` records and V3's `tool/ptc-dispatch*` records for continuous-review evidence.
 
+Install the immutable GitHub release tag into the Web profile, then restart DSH:
+
 ```bash
-dsh plugin --profile web add git+https://github.com/zhangqian98/dsh-escalation-advisor.git
+dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.26
+dsh web
+```
+
+After the package is published on npm, the equivalent registry install is:
+
+```bash
+dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.26
+```
+
+For a local checkout, build and install the generated tarball rather than linking the source directory:
+
+```bash
+npm ci
+npm run check
+npm pack
+dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.26.tgz
 ```
 
 Configure the strong model in **Settings → Plugins → DSH Escalation Advisor**. The plugin stores only provider/model route IDs and reuses authentication already configured in DSH Models.
@@ -52,7 +78,7 @@ Both global settings and the conversation-header **Advisor** panel reuse the com
 
 ## Visible Advisor sessions
 
-Each consultation currently creates a fresh one-shot child beneath the **exact requesting agent**:
+A new consultation creates a fresh continuable child beneath the **exact requesting agent**:
 
 ```text
 Root
@@ -63,7 +89,7 @@ Root
 
 That hierarchy makes it clear who asked the Advisor. Advice is returned only to the agent that triggered the consultation; it never jumps directly from a worker's Advisor to the root agent.
 
-Fresh children are currently preferred over a reused continuable Advisor because ordinary continuable settlement notices can wake a parent even when a background review finds `severity=none`. See [DESIGN.md](./DESIGN.md).
+The returned `consultation_id` can be supplied to a later manual `consult_advisor` call to continue the same child conversation with its earlier context. Omitting it starts an independent conversation. The `last` alias resolves only to that requesting agent's most recently delivered manual consultation on the same root task. Automatic escalation and continuous review start fresh consultations rather than silently inheriting an earlier frame. See [DESIGN.md](./DESIGN.md).
 
 ## Tool permissions: root ceiling plus requester visibility
 
@@ -185,7 +211,7 @@ Every run captures the root/requester task revision. Results from an older user 
 
 Usage instructions are contributed to the system prompt under **Strong advisor**. A short **advisor:guidance** runtime-context section also makes availability visible in the conversation's context snapshot. Both follow role, coverage, and actual tool visibility. Advisor children receive their own context rather than copies of the requester's runtime guidance.
 
-Continuous review includes native PTC `tool/code-dispatch-start` and `tool/code-dispatch` records. It pairs subtools with their observed parent calls, so an internal file write or validation counts as new work even when the outer `run_code` description contains no such keyword. Unrelated dispatch records and nested Advisor consultation transport are excluded.
+Continuous review includes both older PTC `tool/code-dispatch*` records and V3 `tool/ptc-dispatch*` records. It pairs subtools with their observed parent calls, so an internal file write or validation counts as new work even when the outer `run_code` description contains no such keyword. Unrelated dispatch records and nested Advisor consultation transport are excluded.
 
 Advisor injections render directly in the main transcript as full message bubbles labeled **Advisor**, including historical injections and compact transcript mode. This uses DSH's presentation registries: the durable message remains plugin-owned, so rendering it like a chat message does not grant human authority or create another model request. Other plugins retain their native context rendering. The header panel's **咨询记录与回注** section remains a secondary inspection entry and distinguishes model-initiated consultations from automatic failure triggers. New runs also retain their complete reports. Reads do not add session events or invoke the model.
 
@@ -242,6 +268,7 @@ An active durable DSH goal is resolved from the full goal-event history until ex
 npm install
 npm run check
 npm run build
+npm run pack:check
 ```
 
 Tests include real DSH AgentLoop, tool runtime, session invariants, spawn children, and strict Remote Gateway dispatch. Only the model adapter is scripted. These verify lifecycle behavior without requiring provider credentials; live model quality/authentication and a complete production Web deployment remain separate deployment checks.
@@ -254,6 +281,8 @@ npx vitest run --config vitest.runtime.config.ts
 ```
 
 The installed-runtime configuration resolves all DSH imports from that installation. Persistence regressions use each version's actual cold-read validation and check that restored policy, identity, and verdict records survive, while unrelated unknown events still fail.
+
+Release tags use `v<package-version>`. The release workflow checks the tag, runs the suite, builds an npm tarball, and attaches it to the GitHub release. If the repository secret `NPM_TOKEN` is configured, the same workflow also publishes the prerelease under npm's `alpha` dist-tag.
 
 ## License
 

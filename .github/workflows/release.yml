@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org/'
+      - run: npm install --global npm@11.7.0
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify tag matches package version
+        run: node -e "const p=require('./package.json'); if (process.env.GITHUB_REF_NAME !== 'v'+p.version) throw new Error('tag/package version mismatch')"
+      - run: npm run check
+      - name: Pack release tarball
+        id: pack
+        shell: bash
+        run: echo "filename=$(npm pack --silent)" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.filename }}" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+      - name: Publish npm alpha when NPM_TOKEN is configured
+        if: env.NODE_AUTH_TOKEN != ''
+        run: npm publish --tag alpha --provenance

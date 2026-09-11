@@ -1,6 +1,6 @@
 {
   "name": "dsh-escalation-advisor",
-  "version": "0.1.0-alpha.25",
+  "version": "0.1.0-alpha.26",
   "description": "Three-mode visible-session advisor plugin for DeepSeek Harness with configurable tool permissions, local-subagent coverage, and task-tree budgets.",
   "type": "module",
   "main": "./lib/index.js",
@@ -13,14 +13,20 @@
     "./client": "./client/index.js",
     "./package.json": "./package.json"
   },
-  "files": ["lib", "client", "scripts/patch-dsh-history.mjs", "cordis.patch.yml", "README.md", "LICENSE", "DESIGN.md"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "alpha"
+  },
+  "files": ["lib", "client", "scripts/patch-dsh-history.mjs", "cordis.patch.yml", "README.md", "README.zh-CN.md", "LICENSE", "DESIGN.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "check": "npm run typecheck && npm test && node --check client/index.js",
-    "prepare": "npm run build",
-    "prepack": "npm run build"
+    "pack:check": "node scripts/check-package.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check && npm run pack:check"
   },
   "dsh": {
     "bundle": {
@@ -88,7 +94,9 @@
     "react-dom": "18.3.1"
   },
   "engines": {"node":"^22.19.0 || >=24.2.0"},
-  "keywords": ["dsh-plugin", "deepseek-harness", "advisor", "escalation", "second-opinion", "shadow-reviewer", "subagent"],
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "cordis", "coding-agent", "ai-agent", "advisor", "escalation", "second-opinion", "shadow-reviewer", "subagent"],
   "license": "MIT",
-  "repository": {"type":"git", "url":"git+https://github.com/zhangqian98/dsh-escalation-advisor.git"}
+  "repository": {"type":"git", "url":"git+https://github.com/zhangqian98/dsh-escalation-advisor.git"},
+  "homepage": "https://github.com/zhangqian98/dsh-escalation-advisor#readme",
+  "bugs": {"url":"https://github.com/zhangqian98/dsh-escalation-advisor/issues"}
 }

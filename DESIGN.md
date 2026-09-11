@@ -4,7 +4,7 @@
 
 Advisor work is not a hidden auxiliary LLM request. Each consultation starts a session-backed DSH child beneath the **exact requesting agent**, so the user can inspect who asked, the Advisor transcript, tool calls, token use, and outcome.
 
-The implementation deliberately uses a **fresh one-shot child per consultation**. This gives every review a clean evidence boundary and avoids ordinary continuable-child settlement notices waking a parent when a background review finds `severity=none`. Session reuse should only be added behind an explicit strategy whose notification behavior remains correct.
+The implementation creates a **fresh continuable child for every new consultation**. A later manual call may explicitly reuse that child by returning the issued `consultation_id`; omitting the id always starts an independent conversation. Automatic escalation and continuous review never choose an earlier conversation implicitly. Continuation authorization is scoped to the exact live requester and root task, and each new turn receives a fresh verdict collector identity.
 
 ### Verdict channel
 
