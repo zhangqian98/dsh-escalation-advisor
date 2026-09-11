@@ -14,6 +14,7 @@ jobs:
     strategy:
       matrix:
         node: ['22.19.0', '24']
+        dsh: ['0.1.2-rc.1', '0.1.5-alpha.2', '0.1.5-rc.1']
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -27,6 +28,9 @@ jobs:
       # bundled by some Node 24 images. Match the working community-plugin CI.
       - run: npm install --global npm@11.7.0
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Pin DSH matrix version
+        if: matrix.dsh != '0.1.5-alpha.2'
+        run: npm install --no-save --ignore-scripts --no-audit --no-fund @deepseek-ai/dsh-agent@${{ matrix.dsh }} @deepseek-ai/dsh-commands@${{ matrix.dsh }} @deepseek-ai/dsh-llm@${{ matrix.dsh }} @deepseek-ai/dsh-session@${{ matrix.dsh }} @deepseek-ai/dsh-settings@${{ matrix.dsh }} @deepseek-ai/dsh-subagent@${{ matrix.dsh }} @deepseek-ai/dsh-system-prompt@${{ matrix.dsh }} @deepseek-ai/dsh-tools@${{ matrix.dsh }} @deepseek-ai/dsh-typert-protocol@${{ matrix.dsh }}
       - run: npm run check
       - run: npm run build
       - run: npm run pack:check

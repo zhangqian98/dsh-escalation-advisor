@@ -25,6 +25,11 @@ interface SessionState {
   activeSignals: EscalationSignal[]
   recentSignals: EscalationSignal[]
   evidence: TrackerEvidence[]
+  /** Monotonic observation revision. Unlike `evidence` (capped at 24 with
+   * shift), this never saturates, so watermark cursors built on it always
+   * advance past delivered reviews when new tool evidence arrives. Reset with
+   * the rest of the task state by `clear`. */
+  observationCount: number
   lastFailureFingerprint?: string
   lastFailureValidationKey?: string
   repeatedFailureCount: number
@@ -57,6 +62,10 @@ export interface ToolOutcome {
   class: OutcomeClass
   exitCode?: number
   validationKey?: string
+  /** The shell text around the check can mask its exit (extra statements,
+   * pipes, conditional chains, substitutions). Identity still names the target,
+   * but a compound success proves nothing about the check itself. */
+  compound?: boolean
 }
 export interface TrackerEvidence {
   callId?: string
@@ -188,7 +197,13 @@ function shellSegments(command: string): CommandSpan[][] {
     }
     // UNQUOTED separators end a statement. Redirection operators deliberately do
     // NOT: their operand is a file name, so `echo ok > vitest` would otherwise
-    // make the file `vitest` look like an invocation of a check.
+    // make the file `vitest` look like an invocation of a check. Duplication
+    // redirections (`2>&1`, `&>`, `&>>`) are likewise glued: splitting `2>&1`
+    // at the `&` would leave a bare separator behind that reads as backgrounding.
+    if (character === '&' && (command.charAt(index + 1) === '>' || command.charAt(index - 1) === '>')) {
+      if (start < 0) start = index
+      continue
+    }
     if (';|&\n\r'.includes(character)) {
       if (start >= 0) { tokens.push({ start, end: index }); start = -1 }
       if (tokens.length > 0) { segments.push(tokens); tokens = [] }
@@ -349,6 +364,109 @@ function validationStatement(command: string): string | undefined {
   return statement.trim() || undefined
 }
 
+/** Whether surrounding shell text can mask the check's own exit code.
+ *
+ * Separators BEFORE the check never mask it (`grep needle file; npm test` still
+ * validates: the call exit is the check's). Past the check, only reporting-only
+ * tails keep attribution: a quoted literal (`; "TSC_EXIT=$LASTEXITCODE"`), an
+ * echo-family call, a lone reporting pipe (`| Select-Object`, `| tee`) or a
+ * bare redirect. Anything else past the check — a real invocation (`; true`,
+ * `&& deploy`), extra `;`/`&`/newline statements, additional pipes, `||`
+ * chains (the check may never have run), command substitution, conditionals —
+ * means exit 0 may come from elsewhere. A trailing `&&` chain ending exactly at
+ * the check still reports it. Identity still names the target in all cases;
+ * only the success proof is gated.
+ */
+function tokenText(command: string, span: CommandSpan): string {
+  return command.slice(span.start, span.end)
+}
+/** PowerShell alone treats a bare quoted string as a reporting expression; in
+ * POSIX shells the same text in command position EXECUTES. */
+function isPwshLike(name: string): boolean {
+  return /^(pwsh|powershell)(\.exe)?$/i.test(name)
+}
+/** A post-check segment that only reports: a quoted literal (PowerShell only —
+ * POSIX executes it). A standalone redirection (`; > file`) is a truncating
+ * command of its own, never reporting, in every shell. Anything that can run —
+ * including `echo`/`true` tails whose constant successful exit would mask the
+ * check — breaks attribution. */
+function reportingOnlySegment(command: string, tokens: CommandSpan[], toolName: string): boolean {
+  if (tokens.length === 0) return true
+  const raw = tokenText(command, tokens[0]!)
+  if (/^[\"']/.test(raw)) return isPwshLike(toolName)
+  return false
+}
+/** Pass-through pipeline consumers: formatters and pagers, not filters or mutators
+ * (`true`, `grep`, scripts all decide the pipeline exit themselves). A quoted
+ * consumer is an inert value only in PowerShell; in POSIX shells it executes. */
+const REPORTING_PIPE_TARGETS = new Set([
+  'select-object', 'out-string', 'format-table', 'format-list', 'format-wide',
+  'tee', 'tee-object', 'head', 'tail', 'less', 'more', 'cat',
+])
+function pipeConsumerAllowed(command: string, tokens: CommandSpan[], toolName: string): boolean {
+  if (tokens.length === 0) return true
+  const raw = tokenText(command, tokens[0]!)
+  const quoted = /^[\"']/.test(raw)
+  if (quoted && isPwshLike(toolName)) return true
+  const base = raw.replace(/^[\"']|[\"']$/g, '').split(/[\\/]/).pop()?.toLowerCase().replace(/\.(?:exe|cmd|bat|ps1)$/, '') ?? ''
+  return REPORTING_PIPE_TARGETS.has(base)
+}
+function compoundExecution(command: string, checkIndex: number | undefined, toolName = ''): boolean {
+  if (/\$\(|`[^`]*`/.test(command)) return true
+  if (/(^|[\s;|&(){}])\s*(if|then|elif|else|fi|for|while|until|case|esac|function)\b/i.test(command)) return true
+  const segments = shellSegments(command).filter(tokens => tokens.length > 0)
+  if (segments.length <= 1) return false
+  const bounds = segments.map(tokens => ({ start: tokens[0]!.start, end: tokens[tokens.length - 1]!.end }))
+  const checkSeg = checkIndex === undefined ? -1 : bounds.findIndex(bound => checkIndex >= bound.start && checkIndex < bound.end)
+  const gaps: string[] = []
+  let cursor = 0
+  for (const bound of bounds) { gaps.push(command.slice(cursor, bound.start)); cursor = bound.end }
+  gaps.push(command.slice(cursor))
+  const cleanRedirects = (gap: string): string => gap.replace(/\d*>&\d*-?/g, ' ').replace(/&>>?/g, ' ')
+  // A lone pipe continues the current statement into a reporting stage; the
+  // single-pipe rule below governs it, so the reporting-only rule must not
+  // re-examine its target as a fresh statement.
+  const pipeOnlyGap = (gap: string): boolean => /^\s*\|\s*$/.test(cleanRedirects(gap))
+  let pipes = 0
+  let pipeConsumer = -1
+  for (let i = 0; i < gaps.length; i++) {
+    const gap = cleanRedirects(gaps[i]!)
+    if (/[;\n\r]/.test(gap) && i > checkSeg) {
+      // A separator past the check: every later statement must merely report.
+      // Pipe continuations are skipped here; the single-pipe rule below owns them.
+      for (let j = Math.max(checkSeg + 1, 1); j < segments.length; j++) {
+        if (pipeOnlyGap(gaps[j]!)) continue
+        if (!reportingOnlySegment(command, segments[j]!, toolName)) return true
+      }
+      continue
+    }
+    // `|&` is a pipe, not backgrounding; normalize before the `&` test.
+    const piped = gap.replace(/\|&/g, '|')
+    if (/(^|[^&])&(?!&)/.test(piped)) return true
+    if (/\|\|/.test(gap)) return true
+    // `a && check` ending at the check still reports it; a chain that continues
+    // past it is already covered by the reporting-only rule above.
+    if (/&&/.test(gap) && (checkSeg < 0 || i > checkSeg)) {
+      for (let j = Math.max(checkSeg + 1, 1); j < segments.length; j++) {
+        if (pipeOnlyGap(gaps[j]!)) continue
+        if (!reportingOnlySegment(command, segments[j]!, toolName)) return true
+      }
+      continue
+    }
+    const found = (piped.match(/\|/g) ?? []).length
+    if (found > 0) pipeConsumer = i
+    pipes += found
+  }
+  if (pipes > 1) return true
+  if (pipes === 1) {
+    // Exactly one reporting stage is tolerated, and only for a pass-through
+    // consumer: anything else decides the pipeline exit itself.
+    if (pipeConsumer < 0 || pipeConsumer >= segments.length) return true
+    if (!pipeConsumerAllowed(command, segments[pipeConsumer]!, toolName)) return true
+  }
+  return false
+}
+
 function validationKey(name: string, args: unknown, scope?: string): string | undefined {
   if (!VALIDATION_TOOL.test(name)) return undefined
   const command = argumentText(args).toLowerCase()
@@ -406,11 +524,15 @@ function structuredOutcome(observed: ObservedToolResult): OutcomeClass | undefin
 }
 export function classifyToolOutcome(observed: ObservedToolResult): ToolOutcome {
   const exitCode = findExitCode(observed.value), validation = validationKey(observed.name, observed.arguments, observed.scope)
+  // The exit code belongs to the whole shell invocation, not necessarily to the
+  // extracted check: compound text around it can mask the check's own failure.
+  const command = argumentText(observed.arguments).toLowerCase()
+  const compound = validation !== undefined && compoundExecution(command, validationMatchIndex(command), observed.name)
   const exclusion = structuredOutcome(observed)
   if (exclusion) return { class: exclusion, exitCode, validationKey: validation }
   if (!observed.isError && isExpectedNegativeExit(observed.name, observed.arguments, exitCode)) return { class: 'expected-negative', exitCode, validationKey: validation }
-  if (observed.isError || (exitCode !== undefined && exitCode !== 0)) return { class: validation ? 'validation-failure' : 'unknown-failure', exitCode, validationKey: validation }
-  return { class: 'success', exitCode, validationKey: validation }
+  if (observed.isError || (exitCode !== undefined && exitCode !== 0)) return { class: validation ? 'validation-failure' : 'unknown-failure', exitCode, validationKey: validation, ...(compound ? { compound: true } : {}) }
+  return { class: 'success', exitCode, validationKey: validation, ...(compound ? { compound: true } : {}) }
 }
 function mutationPaths(args: unknown): string[] {
   const record = recordOf(args), candidates: string[] = []
@@ -423,18 +545,30 @@ export function mutationKey(name: string, args: unknown): string | undefined {
   const body = candidates.length ? candidates.sort().join('|') : JSON.stringify(args).slice(0, 1500)
   return hash(body)
 }
-function createState(): SessionState { return { score: 0, activeSignals: [], recentSignals: [], evidence: [], repeatedFailureCount: 0, mutationCounts: new Map(), mutationTargets: new Map(), mutationPenaltyIssued: new Set(), consultCountByProblem: new Map(), autoConsultCountByTurn: new Map() } }
+function createState(): SessionState { return { score: 0, activeSignals: [], recentSignals: [], evidence: [], observationCount: 0, repeatedFailureCount: 0, mutationCounts: new Map(), mutationTargets: new Map(), mutationPenaltyIssued: new Set(), consultCountByProblem: new Map(), autoConsultCountByTurn: new Map() } }
 
 export class EscalationTracker {
   private readonly states = new Map<string, SessionState>()
   private state(sessionId: string): SessionState { let current = this.states.get(sessionId); if (!current) { current = createState(); this.states.set(sessionId, current) } return current }
   evidence(sessionId: string): readonly TrackerEvidence[] { return [...this.state(sessionId).evidence] }
+  /** Fingerprints of the currently live problems: the latest failure plus recent
+   * signal identities. A manual review covers exactly these, so a later automatic
+   * trigger on the same problems stays suppressed while new ones still re-arm. */
+  currentFingerprints(sessionId: string): Set<string> {
+    const state = this.state(sessionId)
+    const out = new Set<string>()
+    if (state.lastFailureFingerprint !== undefined) out.add(state.lastFailureFingerprint)
+    for (const signal of state.recentSignals) out.add(signal.fingerprint)
+    return out
+  }
+  observationCount(sessionId: string): number { return this.state(sessionId).observationCount }
   private addSignal(state: SessionState, signal: EscalationSignal): void { state.score += signal.weight; state.activeSignals.push(signal); state.recentSignals.push(signal); if (state.recentSignals.length > 12) state.recentSignals.splice(0, state.recentSignals.length - 12) }
   observe(sessionId: string, observed: ObservedToolResult, config: Config): void {
     if (observed.name === ADVISOR_TOOL) return
     const state = this.state(sessionId), outcome = classifyToolOutcome(observed)
     const failureText = observed.errorMessage || observed.contentText || JSON.stringify(observed.value ?? '')
     const fingerprint = failureFingerprint(observed.name, failureText)
+    state.observationCount += 1
     state.evidence.push({ ...(observed.callId ? { callId: observed.callId } : {}), tool: observed.name, fingerprint, argumentsSummary: JSON.stringify(observed.arguments ?? {}).slice(0, 2400), outcome: outcome.class, errorSummary: failureText.slice(0, 2400), repeatCount: state.lastFailureFingerprint === fingerprint ? state.repeatedFailureCount + 1 : 1, ...(outcome.validationKey ? { validationKey: outcome.validationKey } : {}) })
     if (state.evidence.length > 24) state.evidence.shift()
     if (outcome.class === 'permission-denial' || outcome.class === 'cancelled' || outcome.class === 'timeout' || outcome.class === 'tool-infrastructure-error' || outcome.class === 'expected-negative') return
@@ -447,7 +581,9 @@ export class EscalationTracker {
       } else { state.lastFailureFingerprint = fingerprint; state.lastFailureValidationKey = outcome.validationKey; state.repeatedFailureCount = 1 }
       return
     }
-    if (outcome.class === 'success' && outcome.validationKey && outcome.exitCode === 0) {
+    // A compound success (piped/masked exit, chained commands) names its target but
+    // proves nothing about it: it neither resets failure state nor validates mutations.
+    if (outcome.class === 'success' && outcome.validationKey && outcome.exitCode === 0 && !outcome.compound) {
       const tokens = argumentText(observed.arguments).replace(/\\/g, '/').split(/[\s"']+/)
       const validated = new Set<string>()
       for (const [key, paths] of state.mutationTargets) if (paths.length && paths.every(path => {

@@ -143,7 +143,7 @@ function rootTask(events: readonly EventRecord[]): { root_objective: string; suc
   const rootObjective = goalObjective || (firstUser ? boundedText(messageText(firstUser)) : '')
   const criteriaValue = goal?.successCriteria ?? goal?.success_criteria
   const criteria = Array.isArray(criteriaValue)
-    ? unique(criteriaValue.filter((item): item is string => typeof item === 'string'))
+    ? unique(criteriaValue.filter((item): item is string => typeof item === 'string')).slice(0, MAX_SUCCESS_CRITERIA)
     : []
   return { root_objective: rootObjective, success_criteria: criteria }
 }
@@ -186,11 +186,31 @@ function validationLabel(name: string, args: unknown): string | undefined {
   return VALIDATION_TEXT.test(candidate) ? boundedText(candidate, 1200) : undefined
 }
 
-function materialAssistantConclusion(text: string): boolean {
+export function materialAssistantConclusion(text: string): boolean {
   const value = text.trim()
   if (!value) return false
   if (value.length >= 80) return true
   return /\b(root cause|conclusion|fixed|implemented|changed|validated|passes?|fails?|blocked|recommend|should|must|because|therefore)\b/i.test(value)
+}
+
+/** Whether any assistant message newer than `afterSeq` states a material conclusion.
+ * Shapes are defensive: session event payloads vary across runtime versions. */
+export function hasNewMaterialConclusion(events: readonly unknown[], afterSeq: number): boolean {
+  const tail = events.slice(-24)
+  for (const event of tail) {
+    const recordEvent = record(event)
+    const seq = recordEvent?.seq
+    if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq <= afterSeq) continue
+    if (recordEvent?.type !== 'assistant/message') continue
+    const data = record(recordEvent?.data)
+    const message = record(data?.message) ?? data
+    const content = message?.content
+    if (!Array.isArray(content)) continue
+    let text = ''
+    try { text = textContent(content as readonly unknown[]) } catch { continue }
+    if (materialAssistantConclusion(text)) return true
+  }
+  return false
 }
 
 function redactValue(value: unknown): unknown {
@@ -207,6 +227,11 @@ function redactValue(value: unknown): unknown {
 // packet from one long task carried 204 validation rows (182 KB), of which 203
 // had succeeded and none matched the trigger, while tool_activity already
 // summarizes the most recent calls with their outcomes.
+export const MAX_CASE_PACKET_BYTES = 48 * 1024
+export const MAX_REQUESTER_EVIDENCE = 8
+export const MAX_REQUESTER_FAILED_ATTEMPTS = 8
+export const MAX_SUCCESS_CRITERIA = 12
+export const MAX_RECENT_TAIL = 12
 const MAX_VALIDATION_ENTRIES = 10
 const MAX_UNRELATED_VALIDATION_FAILURES = 3
 const VALIDATION_SUCCESS_CONTEXT = 1
@@ -383,7 +408,13 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     other: validationEvidence.length - succeededChecks - failedChecks,
     relevant: validationEvidence.filter(entry => entry.relevant_to_problem).length,
   }
-  const attempts = unique(input.failedAttempts ?? []).map(action => ({
+  const requesterEvidenceAll = unique(input.evidence ?? [])
+  const requesterFailedAll = unique(input.failedAttempts ?? [])
+  const truncation = {
+    requester_evidence_omitted: Math.max(0, requesterEvidenceAll.length - MAX_REQUESTER_EVIDENCE),
+    failed_attempts_omitted: Math.max(0, requesterFailedAll.length - MAX_REQUESTER_FAILED_ATTEMPTS),
+  }
+  const attempts = requesterFailedAll.slice(0, MAX_REQUESTER_FAILED_ATTEMPTS).map(action => ({
     action,
     outcome: 'failed',
     evidence_refs: [] as string[],
@@ -412,7 +443,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
       return [{ role: 'tool', summary: '', seq }]
     }
     return []
-  }).slice(-16).filter(entry => entry.role !== 'tool')
+  }).slice(-MAX_RECENT_TAIL).filter(entry => entry.role !== 'tool')
   const referencedActivity = new Set([...failures, ...validation].map(entry => entry.call_id))
   const recentActivity = new Set(allActivity.slice(-BASE_ACTIVITY_ENTRIES).map(entry => entry.call_id))
   const activityCandidates = activity.filter(item => recentActivity.has(item.call_id) || referencedActivity.has(item.call_id))
@@ -465,8 +496,8 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     },
     ...(trigger === undefined ? {} : { trigger }),
     requester_supplied: {
-      evidence: unique(input.evidence ?? []),
-      failed_attempts: unique(input.failedAttempts ?? []),
+      evidence: unique(input.evidence ?? []).slice(0, MAX_REQUESTER_EVIDENCE),
+      failed_attempts: unique(input.failedAttempts ?? []).slice(0, MAX_REQUESTER_FAILED_ATTEMPTS),
       authority: 'claims-for-review',
     },
     attempts,
@@ -489,15 +520,29 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     },
     tool_activity: toolActivity,
     recent_tail: recentTail,
+    ...(truncation.requester_evidence_omitted + truncation.failed_attempts_omitted > 0 ? { truncation } : {}),
   }
   const meaningfulDelta = changedPaths.length > 0
     || failures.length > 0
     || validation.length > 0
     || delta.some(event => event.type === 'assistant/message' && materialAssistantConclusion(messageText(event)))
+  let prompt = JSON.stringify(redactValue(packet))
+  if (Buffer.byteLength(prompt) > MAX_CASE_PACKET_BYTES) {
+    // Shrink the lowest-priority sections first: recent tail, then tool activity
+    // summaries are already bounded; fall back to a hard truncate with marker.
+    const budget = MAX_CASE_PACKET_BYTES - Buffer.byteLength('\n…[packet-truncated]')
+    let low = 0, high = prompt.length
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2)
+      if (Buffer.byteLength(prompt.slice(0, mid)) <= budget) low = mid
+      else high = mid - 1
+    }
+    prompt = prompt.slice(0, low) + '\n…[packet-truncated]'
+  }
   return {
     // DSH owns token accounting for the complete model request, including its
     // system prompt and tool schemas. Bytes are not a model token limit.
-    prompt: JSON.stringify(redactValue(packet)),
+    prompt,
     lastSeq,
     meaningful: input.mode === 'continuous' ? meaningfulDelta : true,
   }

@@ -28,13 +28,16 @@ export function opensObligation(outcomeClass: string): boolean {
   return outcomeClass === 'validation-failure'
 }
 
-/** A failed or cancelled mutation may still have written; only success is trusted. */
+/** A failed or cancelled mutation may still have written; only success is trusted.
+ * `callId` exempts a validation execution from its own writes: the command's own
+ * output is the check itself, not interference with it. */
 export interface MutationEvent {
   sessionId: string
   taskStartSeq: number
   scope: string
   seq: number
   applied: boolean
+  callId?: string
 }
 
 export interface ValidationRun {
@@ -43,6 +46,9 @@ export interface ValidationRun {
   scope: string
   validationKey: string
   callId: string
+  /** Masked exit (extra statements/pipes/chains around the check): names the
+   * target but proves nothing, so it can never witness closure. */
+  compound?: boolean
   /** Dispatch seq, or undefined when dispatch metadata was lost: then nothing may close. */
   startedSeq?: number
   completedSeq: number
@@ -149,6 +155,7 @@ function witnessFor(obligation: Obligation, run: ValidationRun, mutations: reado
   if (obligation.state !== 'open') return false
   if (!obligation.validationKey) return false
   if (!run.succeeded) return false
+  if (run.compound) return false
   // Without a trustworthy start boundary the execution window is unknown, so a
   // change during the run cannot be excluded.
   if (run.startedSeq === undefined) return false
@@ -161,9 +168,10 @@ function witnessFor(obligation: Obligation, run: ValidationRun, mutations: reado
   if (run.startedSeq <= obligation.latestFailureSeq) return false
   if (run.completedSeq <= obligation.latestFailureSeq) return false
   // A related change during execution, or after the pass but before closure,
-  // makes the witness stale.
-  if (mutations.some(m => m.scope === obligation.scope && m.seq >= startedSeq && m.seq <= run.completedSeq)) return false
-  if (mutations.some(m => m.scope === obligation.scope && m.seq > run.completedSeq)) return false
+  // makes the witness stale. The validation's own execution is exempt.
+  const foreign = mutations.filter(m => m.callId === undefined || m.callId !== run.callId)
+  if (foreign.some(m => m.scope === obligation.scope && m.seq >= startedSeq && m.seq <= run.completedSeq)) return false
+  if (foreign.some(m => m.scope === obligation.scope && m.seq > run.completedSeq)) return false
   return true
 }
 
@@ -250,6 +258,18 @@ export class ObligationStore {
     })
   }
 
+  /** Bind a verified validation identity to a keyless claim entry. */
+  bindClaimValidationKey(sessionId: string, taskStartSeq: number, claimId: string, validationKey: string): Obligation | undefined {
+    const keyless = taskKey(sessionId, taskStartSeq) + '|claim|' + claimId;
+    // Identity keys are claim|<id> for keyless and claim|<id> regardless of key,
+    // so a keyless entry is found directly; migrate it to the keyed identity.
+    const existing = this.items.get(keyless) ?? [...this.items.values()].find(item => item.sessionId === sessionId && item.taskStartSeq === taskStartSeq && item.kind === 'claim-contradicted' && item.claimId === claimId);
+    if (!existing || existing.validationKey !== undefined) return existing;
+    existing.validationKey = validationKey;
+    existing.revision += 1;
+    return existing;
+  }
+
   /** A published claim contradicted by a counterexample needs an explicit entry point. */
   recordClaimContradiction(input: ClaimInput): Obligation {
     return this.upsert({
@@ -266,12 +286,19 @@ export class ObligationStore {
     const existing = this.items.get(key)
     if (existing) {
       // A recurrence reopens the same obligation rather than forking a new one.
+      // A new contradiction needs its own correction: the previous record
+      // covered the earlier event, not this one.
       existing.state = 'open'
       existing.resolution = undefined
+      existing.correction = undefined
       existing.latestFailureSeq = Math.max(existing.latestFailureSeq, input.seq)
       existing.repeatCount += 1
       existing.revision += 1
       existing.summary = input.summary
+      // A keyless claim-contradicted entry may gain its verified identity once
+      // the caller supplies one; an existing key is never silently replaced.
+      if (existing.validationKey === undefined && input.validationKey !== undefined) existing.validationKey = input.validationKey
+      if (existing.claimId === undefined && input.claimId !== undefined) existing.claimId = input.claimId
       return existing
     }
     const created: Obligation = {
@@ -300,11 +327,16 @@ export class ObligationStore {
   recordMutation(event: MutationEvent): void {
     const list = this.mutationsFor(event.sessionId, event.taskStartSeq)
     list.push({ ...event })
-    // A related change after a resolution makes that evidence stale.
+    // A related change after a resolution makes that evidence stale. Equality
+    // also reopens unless the mutation IS the resolving execution itself: session
+    // cursors can stand still while off-session work lands (mirrored worker
+    // edits) or in direct-pipeline flows, and strict `<` would silently keep a
+    // stale proof resolved.
     for (const item of this.list(event.sessionId, event.taskStartSeq)) {
       if (item.state !== 'resolved') continue
       if (item.scope !== event.scope) continue
-      if ((item.resolution?.seq ?? -1) < event.seq) { item.state = 'open'; item.resolution = undefined; item.revision += 1 }
+      const at = item.resolution?.seq ?? -1
+      if (at < event.seq || (at === event.seq && event.callId !== item.resolution?.witnessCallId)) { item.state = 'open'; item.resolution = undefined; item.revision += 1 }
     }
   }
 

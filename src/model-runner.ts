@@ -237,7 +237,7 @@ export interface TurnObserver {
  * message id returned from dispatch, and the closure is only reported when the
  * declaring `turn/end` belongs to the session that claimed the message.
  */
-export function installTurnObserver(ctx: Context, signal: DeadlineSignal, childSessionId?: string): TurnObserver {
+export function installTurnObserver(ctx: Context, signal: DeadlineSignal, childSessionId?: string, onClaim?: (messageId: string, turn: number, isOwn: boolean, sessionId: string) => void): TurnObserver {
   const claimed = new Map<string, { sessionId: string; turn: number; own: boolean }>()
   let target = childSessionId
   let messageId: string | undefined
@@ -245,16 +245,25 @@ export function installTurnObserver(ctx: Context, signal: DeadlineSignal, childS
   let resolve!: (value: TurnClosure) => void
   const closed = new Promise<TurnClosure>((done) => { resolve = done })
   /** Whether this claim is known to belong to the delivery being measured. */
-  const own = (id: string, sessionId: string): boolean => id === messageId || (target !== undefined && sessionId === target)
+  const own = (id: string, sessionId: string): boolean => messageId !== undefined ? id === messageId : (target !== undefined && sessionId === target)
   /** The turn that claimed the delivered message, once any claim proves it. */
   let claimedTurn: number | undefined
   // A claim accepted before dispatch resolved is re-evaluated once the child
   // session or the delivered message id is known.
   const rebind = (): void => {
+    claimedTurn = undefined
     for (const [id, claim] of claimed) {
       claim.own = own(id, claim.sessionId)
-      // A claim that arrived before dispatch resolved becomes ours only now.
-      if (claim.own) claimedTurn = claim.turn
+      // A claim that arrived before dispatch resolved becomes ours only now;
+      // a session-only candidate that does not name the delivered message is
+      // discarded once the message id is known — and, when it belongs to the
+      // target child, its turn is reported as foreign so the gate never admits it.
+      if (claim.own) {
+        claimedTurn = claim.turn
+        try { onClaim?.(id, claim.turn, true, claim.sessionId) } catch {}
+      } else if (target !== undefined && claim.sessionId === target) {
+        try { onClaim?.(id, claim.turn, false, claim.sessionId) } catch {}
+      }
     }
   }
   const stopClaim = ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
@@ -266,7 +275,12 @@ export function installTurnObserver(ctx: Context, signal: DeadlineSignal, childS
     // boundary. Nothing else in this call can claim an inbox message.
     const isOwn = own(id, sessionId)
     claimed.set(id, { sessionId, turn: Number(turn), own: isOwn })
-    if (isOwn) claimedTurn = Number(turn)
+    if (isOwn) {
+      claimedTurn = Number(turn)
+      try { onClaim?.(id, Number(turn), true, sessionId) } catch {}
+    } else if (target !== undefined && sessionId === target) {
+      try { onClaim?.(id, Number(turn), false, sessionId) } catch {}
+    }
   })
 
   const stopTurn = ctx.on('session/event', (session, event) => {
@@ -396,6 +410,13 @@ export async function callAdvisor(
   const consultationId = lifecycle.publicId
   let conversationId = continuation.kind === 'continue' ? continuation.childSessionId : ''
   let observed: TurnObserver | undefined
+  // True once THIS attempt's dispatch resolved: only then does an interrupt
+  // target execution this attempt owns. Refusing an overlap (or failing before
+  // dispatch) must never stop the already-running legitimate turn.
+  let ownDelivery = false
+  // Hoisted so the outer finally removes the abort hook on EVERY exit path,
+  // including dispatch/binding failures that never reach the inner finally.
+  let onAbort: (() => void) | undefined
   // This turn's binding: written only by `bind` below, removed only by this
   // turn's own cleanup, and never by a later, failed or unrelated turn.
   let boundChild = false
@@ -416,8 +437,27 @@ export async function callAdvisor(
     yield* next()
   })
   try {
+    // Authorize this turn BEFORE dispatch, inside the guarded region so the
+    // finally below always cleans up. For a follow-up the child is known; for
+    // a fresh start the reservation is pending by invocation until bind.
+    // Authorization failure is fatal to the turn: dispatching without it would
+    // admit model work no gate can attribute, so it throws instead of proceeding.
+    // A live activation of a concurrent turn on the same child is likewise refused
+    // rather than interleaved (sequential retries/follow-ups never trip this:
+    // every turn revokes its own activation in its finally).
+    if (conversationId !== '') {
+      const live = lifecycle.registry.activationFor(conversationId)
+      if (live !== undefined && live.invocationId !== identity.invocationId && live.expiresAt > Date.now()) {
+        throw new AdvisorUnavailableError('Another Advisor turn is already active on this child session; the overlapping turn was refused rather than interleaved.', 'retryable_start', true)
+      }
+    }
+    try {
+      lifecycle.registry.authorizeTurn({ invocationId: identity.invocationId, collectorId: lifecycle.collectorId, ...(conversationId === '' ? {} : { childSessionId: conversationId }), ttlMs: config.timeoutMs })
+    } catch (error) {
+      throw new AdvisorUnavailableError('Unable to authorize the Advisor turn: ' + (error instanceof Error ? error.message : String(error)), 'retryable_start', true)
+    }
     let messageId: string
-    const onAbort = (): void => { closureCancelled = !deadline.timedOut(); interrupt(subagents, conversationId, parent) }
+    onAbort = (): void => { closureCancelled = !deadline.timedOut(); interrupt(subagents, conversationId, parent) }
     try {
       // A retry of a FRESH consultation starts a new conversation: continuing the
       // failed one would either resend into a child this deployment cannot reach or
@@ -427,13 +467,30 @@ export async function callAdvisor(
       // Armed BEFORE dispatch: the runtime may claim the delivered message before
       // `startContinuable` resolves, and that claim is the only evidence that the
       // delivery was accepted into a turn at all.
-      observed = installTurnObserver(ctx, deadline, conversationId === '' ? undefined : conversationId)
+      observed = installTurnObserver(ctx, deadline, conversationId === '' ? undefined : conversationId, (claimedId, claimedTurnValue, isOwn, claimSession) => {
+        try {
+          const child = (typeof conversationId === 'string' && conversationId !== '') ? conversationId : undefined;
+          if (child === undefined || claimSession !== child) return;
+          if (isOwn) {
+            if (claimedId === (typeof messageId === 'string' ? messageId : claimedId)) lifecycle.registry.noteClaimedTurn(child, claimedId, claimedTurnValue);
+          } else {
+            // A competing delivery claimed a turn of this child during the window:
+            // that turn is never this consultation, whenever it steps.
+            lifecycle.registry.noteForeignTurn(child, claimedTurnValue);
+          }
+        } catch {}
+      })
       callSignal.addEventListener('abort', onAbort)
       if (callSignal.aborted) onAbort()
       if (address) {
         // Authorization is the EXACT live requesting Agent: the runtime rejects a
         // sender that is not the live direct parent of the addressed child.
         messageId = String(await subagents.sendMessage(parent, SessionId(conversationId), [{ type: 'text', text: prefix + continuation.prompt }], { signal: callSignal }))
+        ownDelivery = true
+        // Bind BEFORE replaying buffered claims: an early claim replays through
+        // onClaim during observed.bind and must find the message binding, or its
+        // turn is lost for the whole execution.
+        if (!lifecycle.registry.bindTurn({ invocationId: identity.invocationId, childSessionId: conversationId, messageId })) throw new AdvisorUnavailableError('Unable to bind the Advisor delivery to its authorization.', 'retryable_start', true)
         observed.bind(conversationId, messageId)
       } else {
         const request: AdvisorStartRequest = {
@@ -450,9 +507,19 @@ export async function callAdvisor(
         })
         conversationId = String(child.childId)
         messageId = String(child.messageId)
+        ownDelivery = true
+        // Bind BEFORE replaying buffered claims: see above.
+        if (!lifecycle.registry.bindTurn({ invocationId: identity.invocationId, childSessionId: conversationId, messageId })) throw new AdvisorUnavailableError('Unable to bind the Advisor delivery to its authorization.', 'retryable_start', true)
         observed.bind(conversationId, messageId)
       }
     } catch (error) {
+      // A half-established delivery leaves a child with an open turn but no
+      // authorization: stop it before classifying, so no orphan execution
+      // survives the failure. An absent or closing target is a no-op.
+      // Scoped to this attempt's own delivery: a pre-dispatch refusal (notably
+      // the overlap path, where conversationId names the OTHER turn's child)
+      // must not stop that legitimate turn.
+      if (ownDelivery && conversationId !== '') interrupt(subagents, conversationId, parent)
       // An AdvisorUnavailableError raised by dispatch carries its own branch and
       // was already classified; anything else here is a transport refusal.
       if (error instanceof AdvisorUnavailableError) throw error
@@ -494,7 +561,10 @@ export async function callAdvisor(
       // The verdict channel is the only authoritative source. Publishing is
       // reconciled against THIS turn's closing boundary, so a verdict submitted
       // in a turn that did not close `completed` is never published.
-      const reconciled = lifecycle.collector.reconcile(collectorId, { stopReason: kind, turnEnd: { seq: closure.seq, kind } })
+      try {
+        if (closed.messageId !== undefined && closed.claimedTurn !== undefined) lifecycle.registry.noteClaimedTurn(conversationId, closed.messageId, closed.claimedTurn);
+      } catch {}
+      const reconciled = lifecycle.collector.reconcile(collectorId, { stopReason: kind, turnEnd: { seq: closure.seq, kind }, turn: closure.turn, ...(closed.messageId === undefined ? {} : { messageId: closed.messageId }), ...(messageId === undefined ? {} : { authorizedMessageId: messageId }) })
       if (!reconciled.published) {
         if (kind !== 'completed') {
           const facts = reasonFacts(turnEnd)
@@ -508,6 +578,12 @@ export async function callAdvisor(
       callSignal.removeEventListener('abort', onAbort)
     }
   } catch (error) {
+    // The child may hold an open turn from a failure after accepted delivery
+    // (bind/onPublished/collector wiring): stop it so nothing runs on after the
+    // authorization is revoked below. A closed or absent target is a no-op, and
+    // interrupting twice (dispatch catch already did) is idempotent. Pre-dispatch
+    // refusals own no delivery and interrupt nothing (see ownDelivery above).
+    if (ownDelivery && conversationId !== '') interrupt(subagents, conversationId, parent)
     if (error instanceof AdvisorUnavailableError) throw error
     if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor request cancelled.', 'cancelled')
     if (callSignal.aborted) throw new AdvisorUnavailableError(timeoutMessage, 'timeout', true)
@@ -520,8 +596,13 @@ export async function callAdvisor(
     // delivery — this module never disposes it.
     stopObserve()
     observed?.dispose()
+    if (onAbort !== undefined) { try { callSignal.removeEventListener('abort', onAbort) } catch {} }
     deadline.dispose()
     identity.release()
+    try {
+      if (conversationId !== '') lifecycle.registry.revokeTurn(conversationId, identity.invocationId);
+      else lifecycle.registry.revokeTurn('', identity.invocationId);
+    } catch {}
     // A turn that did not publish leaves a record a late verdict submission
     // resolves to 'closed' against instead of reviving it. The record is keyed by
     // THIS turn's own collector identity, so releasing it can only drop this

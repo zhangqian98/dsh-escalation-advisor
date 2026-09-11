@@ -23,6 +23,10 @@ export interface AdvisorRunRecord {
   error?: string
   usage?: { inputTokens: number; outputTokens: number }
   verdictTool?: string
+  /** This attempt's verdict-channel identity (unique per consultation turn). */
+  collectorId?: string
+  /** Consultation turn index this attempt belongs to (1-based); lets a restore continue counting. */
+  turns?: number
 }
 
 declare module '@deepseek-ai/dsh-session/types' {
@@ -35,7 +39,20 @@ export function recordRun(requester: Agent, root: Agent, record: AdvisorRunRecor
 }
 
 export function advisorRunHistory(root: Agent): AdvisorRunRecord[] {
+  // Attempts restart at 1 for every consultation turn on the same id, so a
+  // later failed attempt must never erase an earlier delivery of the same
+  // consultation (consultation restore and the UI both key off delivered runs).
   const runs = new Map<string, AdvisorRunRecord>()
-  for (const event of root.session.snapshotEvents()) if (event.type === 'advisor/run' && event.data?.version === 1) runs.set(event.data.id + ':' + event.data.attempt, event.data)
+  for (const event of root.session.snapshotEvents()) {
+    if (event.type !== 'advisor/run' || event.data?.version !== 1) continue
+    // Keyed by consultation turn (attempt numbers restart on every follow-up call),
+    // so successive turns never collapse into one row. Within a turn, status
+    // progression still replaces, but a delivery is never erased by a later miss.
+    const key = event.data.id + ':' + (event.data.collectorId ?? event.data.attempt)
+    const current = runs.get(key)
+    // Status progression replaces (reserved -> started -> terminal), but a later
+    // failed attempt on the same consultation must never erase its delivery.
+    if (current === undefined || current.status !== 'delivered') runs.set(key, event.data)
+  }
   return [...runs.values()].slice(-100)
 }

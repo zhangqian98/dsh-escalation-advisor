@@ -176,7 +176,7 @@ describe('buildCasePacket', () => {
     expect(output.lastSeq).toBe(5)
   })
 
-  it('preserves scoped evidence beyond the former byte cap together with the latest failure and capability policy', () => {
+  it('bounds requester evidence with truncation counts while keeping the latest failure and capability policy', () => {
     const events: FakeEvent[] = [user(0, 'Fix the failing build')]
     for (let index = 1; index <= 5; index++) {
       events.push(call(index * 2 - 1, 'c' + index, 'exec_command', { cmd: 'npm test ' + 'old '.repeat(500) }))
@@ -191,8 +191,11 @@ describe('buildCasePacket', () => {
       trigger: { turn: 4, step: 3, score: 7, shouldConsult: true, problemFingerprint: 'RETAIN_TRIGGER_FP', signals: [{ kind: 'repeated-failure', weight: 3, fingerprint: 'RETAIN_TRIGGER_FP', detail: 'Same auth failure repeated' }] },
     })
     const packet = JSON.parse(output.prompt)
-    expect(Buffer.byteLength(output.prompt)).toBeGreaterThan(24576)
-    expect(packet.requester_supplied.evidence).toHaveLength(60)
+    // Requester evidence is bounded (first 8 kept, remainder reported) while
+    // trigger failures, validation, and capability policy are never evicted.
+    expect(Buffer.byteLength(output.prompt)).toBeLessThanOrEqual(48 * 1024 + 64)
+    expect(packet.requester_supplied.evidence).toHaveLength(8)
+    expect(packet.truncation).toMatchObject({ requester_evidence_omitted: 52 })
     expect(output.prompt).toContain('LATEST_FAILURE_MARKER')
     expect(packet.trigger).toMatchObject({ fingerprint: 'RETAIN_TRIGGER_FP', score: 7, signals: [expect.objectContaining({ kind: 'repeated-failure' })] })
     expect(packet.capabilities).toEqual({

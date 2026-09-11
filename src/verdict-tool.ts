@@ -90,6 +90,12 @@ export interface TerminalEvidence {
   readonly stopReason: string
   /** The child's closing turn boundary, if the session recorded one. */
   readonly turnEnd?: { readonly seq: number; readonly kind: string }
+  /** The turn the delivered message was claimed in; must match the candidate turn. */
+  readonly turn?: number
+  /** The claimed inbox message id for this delivery. */
+  readonly messageId?: string
+  /** The authorized delivery message id; when both are known they must match. */
+  readonly authorizedMessageId?: string
 }
 
 export type ReconcileOutcome =
@@ -187,6 +193,8 @@ export class AdvisorVerdictCollector {
     if (!ending) return { published: false, reason: 'The Advisor session recorded no closing turn boundary.' }
     if (ending.seq < candidate.seq) return { published: false, reason: 'The closing turn boundary predates the submitted verdict.' }
     if (ending.kind !== 'completed') return { published: false, reason: 'The Advisor turn closed with ' + ending.kind + '.' }
+    if (evidence.turn !== undefined && evidence.turn !== candidate.turn) return { published: false, reason: 'The closing turn does not match the turn that submitted the verdict.' }
+    if (evidence.messageId !== undefined && evidence.authorizedMessageId !== undefined && evidence.messageId !== evidence.authorizedMessageId) return { published: false, reason: 'The closed turn did not claim the authorized delivery.' }
     consultation.state = 'published'
     return { published: true, verdict: candidate.verdict, candidate }
   }

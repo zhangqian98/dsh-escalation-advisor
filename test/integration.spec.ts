@@ -205,7 +205,12 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const request = h.adapter.forModel('advisor')[0]!.request
     expect(request.maxTokens).toBe(nativeOutput)
     expect(h.adapter.forModel('weak')[0]!.request.maxTokens).toBe(128)
-    expect(Buffer.byteLength(requestText(request))).toBeGreaterThan(24576)
+    // The case packet is bounded (requester evidence capped, 48KB total budget)
+    // but still ignores the legacy 4KB input cap: bounded, never legacy-truncated.
+    expect(Buffer.byteLength(requestText(request))).toBeGreaterThan(4096)
+    expect(requestText(request)).toContain('Evidence 0')
+    expect(requestText(request)).not.toContain('Evidence 59')
+    expect(requestText(request)).toContain('requester_evidence_omitted')
     expect(advisorChildren(h)[0]!.agent.session.snapshotEvents()).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'request/context', data: expect.objectContaining({ contextWindow: 1000000 }) }),
     ]))

@@ -3,13 +3,14 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { Config as ConfigSchema, routeConfigured, severityRank, type Config as AdvisorConfig } from './config.js'
 import { coverageEnabled, type AdvisorAgentRole } from './coverage.js'
-import { buildCasePacket, textContent } from './context.js'
+import { buildCasePacket, hasNewMaterialConclusion, textContent } from './context.js'
 import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, requesterSeq, START_REJECTED, type AdvisorRunResult, type AdvisorContinuation } from './model-runner.js'
 import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
 import { GOAL_ROUND_ADVISOR_ROUTE, toolGuidance } from './prompts.js'
@@ -19,7 +20,7 @@ import { AdvisorTaskLimiter, AdvisorTaskLimitError } from './task-limiter.js'
 import { AdvisorWorkspaceLock } from './workspace-lock.js'
 import { AdvisorRegistry } from './registry.js'
 import { isCapabilityAmplifier, toolEffect } from './capabilities.js'
-import { recordRun, type AdvisorRunRecord, type ConsultationMode } from './telemetry.js'
+import { advisorRunHistory, recordRun, type AdvisorRunRecord, type ConsultationMode } from './telemetry.js'
 import { redactSecrets, truncateUtf8 } from './redact.js'
 import type { AdvisorVerdict } from './verdict.js'
 import { ADVISOR_VERDICT_TOOL, AdvisorVerdictCollector, registerAdvisorVerdictTool } from './verdict-tool.js'
@@ -138,7 +139,10 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const tracker = new EscalationTracker()
   const obligations = new ObligationStore()
   /** Dispatch seq per tool call: the only trustworthy bound on a validation window. */
-  const dispatchSeq = new Map<string, { seq: number; taskStartSeq: number }>()
+  const dispatchSeq = new Map<string, { seq: number; taskStartSeq: number; tick: number; agentKey: string }>()
+  /** Global dispatch counter. Session seqs are not comparable across agents, so
+   * eviction uses this shared tick instead of any one session's numbering. */
+  let dispatchTick = 0
   const limiter = new AdvisorTaskLimiter()
   const workspace = new AdvisorWorkspaceLock()
   const registry = new AdvisorRegistry(ctx)
@@ -153,6 +157,29 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const retryableStarts = new Map<string, { failures: number; after: number }>()
   const taskStarts = new Map<string, number>()
   const reviewed = new Map<string, { turn: number; seq: number }>()
+  /** Workspace mutation epoch per task tree: bumped on any potential mutation tool result. */
+  const workspaceEpoch = new Map<string, number>()
+  /** Structural mutation epoch per task tree: bumped only on path-carrying
+   * edit/write-family tools (including worker mirrors below). Unlike the
+   * conservative epoch above, a repeat shell failure does not move it, so the
+   * review watermark can tell 'same problem again' from 'workspace changed'. */
+  const structuralEpoch = new Map<string, number>()
+  const bumpStructural = (agent: Agent): number => {
+    try {
+      const rootId = String(taskRootAgent(ctx, agent).id)
+      const next = (structuralEpoch.get(rootId) ?? 0) + 1
+      structuralEpoch.set(rootId, next)
+      return next
+    } catch { return 0 }
+  }
+  const structuralOf = (agent: Agent): number => {
+    try { return structuralEpoch.get(String(taskRootAgent(ctx, agent).id)) ?? 0 } catch { return 0 }
+  }
+  /** Evidence watermark: problems a delivered consultation already covered, plus the
+   * evidence revision, structural epoch and requester seq it covered them at.
+   * Escalation re-arms on an uncovered fingerprint or a structural workspace change;
+   * continuous review (fingerprint-less) re-arms on new evidence or conclusions. */
+  const reviewWatermark = new Map<string, { evidenceVersion: number; fingerprints: Set<string>; seq: number; epoch: number }>()
   const futureNotes = new Map<string, UserMessage[]>()
   const controllers = new Map<string, Set<AbortController>>()
   const disposed = new AbortController()
@@ -262,11 +289,68 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     // Keyed by the BARE uuid: the handle a caller holds is `<uuid>#<turn>.<attempt>`,
     // but one conversation is ONE record whatever handle form addresses it — the id
     // the FIRST turn minted, or that same uuid on its own.
-    consultations.set(handleBase(value.consultationId), { ...value, deliveredSeq: ++delivered })
+    // Map.set on an existing key does NOT move it to the end, so delete first:
+    // otherwise a just-continued consultation stays eviction-oldest by creation order.
+    const mapKey = handleBase(value.consultationId)
+    if (consultations.has(mapKey)) consultations.delete(mapKey)
+    consultations.set(mapKey, { ...value, deliveredSeq: ++delivered })
     while (consultations.size > 64) {
-      const oldest = consultations.keys().next().value
+      let oldest: string | undefined
+      let oldestSeq = Number.POSITIVE_INFINITY
+      for (const [key, record] of consultations) {
+        if (record.deliveredSeq < oldestSeq) { oldestSeq = record.deliveredSeq; oldest = key }
+      }
       if (oldest === undefined) break
+      const evicted = consultations.get(oldest)
       consultations.delete(oldest)
+      // Revoking a leaked activation for an evicted conversation is safe: only
+      // an exact invocation match is revoked, so a live turn is never affected.
+      try {
+        if (evicted !== undefined) registry.revokeTurn(evicted.childSessionId)
+      } catch {}
+    }
+  }
+
+  // P0-durable: rebuild delivered MANUAL continuations from the persisted
+  // advisor/run log so a restart / plugin-reload can continue the same child.
+  // Only manual consultations are restored (automatic ones are re-triggered by
+  // fresh evidence); only delivered runs with a live continuable child.
+  const restoreConsultations = (root: Agent): void => {
+    try {
+      const rootId = String(root.id)
+      for (const run of advisorRunHistory(root)) {
+        if (run.mode !== 'manual' || run.status !== 'delivered' || !run.childSessionId) continue
+        if (run.requesterId === undefined) continue
+        const mapKey = handleBase(run.id)
+        // Keep the LATEST delivered turn: an older row would resume counting from
+        // a stale turn index and collide with the newer turn's channel identity.
+        const kept = consultations.get(mapKey)
+        if (kept !== undefined && (kept.turns ?? 0) >= (run.turns ?? 1)) continue
+        // The child must still exist and be a continuable descendant of this root.
+        let child: Agent | undefined
+        try { child = ctx.agents.get(SessionId(run.childSessionId)) } catch { child = undefined }
+        if (!child) continue
+        consultations.set(mapKey, {
+          consultationId: run.id,
+          childSessionId: run.childSessionId,
+          requesterId: run.requesterId,
+          rootId,
+          turns: run.turns ?? 1,
+          mode: 'manual',
+          deliveredSeq: ++delivered,
+        })
+      }
+      while (consultations.size > 64) {
+        let oldest: string | undefined
+        let oldestSeq = Number.POSITIVE_INFINITY
+        for (const [key, record] of consultations) {
+          if (record.deliveredSeq < oldestSeq) { oldestSeq = record.deliveredSeq; oldest = key }
+        }
+        if (oldest === undefined) break
+        consultations.delete(oldest)
+      }
+    } catch (error) {
+      logger.warn('Advisor consultation restore failed: ' + redactSecrets(error instanceof Error ? error.message : String(error)))
     }
   }
   // The `last` alias resolves only inside the calling agent's own scope: its own
@@ -288,7 +372,11 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   })
   ctx.effect(() => () => consultations.clear(), 'advisor: drop continuation records')
 
+  const epochOf = (agent: Agent): number => workspaceEpoch.get(String(taskRootAgent(ctx, agent).id)) ?? 0
   const consult = async (agent: Agent, mode: ConsultationMode, trigger: ReviewTrigger, args: AskAdvisorArgs, signal: AbortSignal, revision: string, options: { onStarted?: () => void; continuation?: { consultationId: string; publicId: string; childSessionId: string; turns: number } } = {}) => {
+    // Unique per consult() call: attempts restart at 1 on every follow-up call,
+    // so the turn identity must not recycle across calls sharing one consultation.
+    const attemptNonce = randomUUID()
     const root = taskRootAgent(ctx, agent), id = options.continuation?.consultationId ?? randomUUID()
     // The handle the FIRST turn minted, reused verbatim by every later turn: a caller
     // that continues with the id it was handed gets that same id back.
@@ -296,6 +384,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     const config = configFor(agent)
     const sinceSeq = mode === 'continuous' ? reviewed.get(String(agent.id))?.seq : undefined
     const turns = options.continuation?.turns ?? 0
+    const epochAtDispatch = epochOf(agent)
     let continuation: AdvisorContinuation = options.continuation === undefined
       ? { kind: 'start', prompt: '' }
       : { kind: 'continue', childSessionId: options.continuation.childSessionId, prompt: '' }
@@ -306,10 +395,10 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       // The collector record is single-use per turn: one record with one candidate
       // slot cannot hold turn 2 without refusing a legitimate second verdict as
       // 'duplicate' or 'conflicting'.
-      const collectorId = id + '#' + turns + '.' + attempt
+      const collectorId = id + '#' + turns + '.' + attempt + '.' + attemptNonce
       const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
       const runRecord: AdvisorRunRecord = {
-        version: 1, id, requesterId: String(agent.id), mode, turn: trigger.turn, ...(trigger.step === undefined ? {} : { step: trigger.step }),
+        version: 1, id, requesterId: String(agent.id), mode, turn: trigger.turn, ...(trigger.step === undefined ? {} : { step: trigger.step }), collectorId, turns: turns + 1,
         taskRevision: revision, ...(trigger.decision ? { fingerprint: trigger.decision.problemFingerprint, score: trigger.decision.score } : {}),
         attempt, status: 'reserved', timestamp: new Date().toISOString(), question: redactSecrets(args.question),
       }
@@ -349,7 +438,11 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
             else continuation = { kind: 'continue', childSessionId: continuation.childSessionId, prompt: packet.prompt }
             const answer = await callAdvisor(ctx, config, agent, continuation, attemptSignal, policy, 'Advisor · ' + mode + ' · turn ' + trigger.turn, {
               registry, root, collector: verdicts, publicId, collectorId, ...(options.continuation === undefined ? {} : { followUp: true }), onStarted: () => { markStarted(); options.onStarted?.(); record({ status: 'started' }) },
-              onPublished: childSessionId => { continuation = { kind: 'continue', childSessionId, prompt: '' }; record({ childSessionId }) },
+              // A retry of a FRESH consultation must start a new conversation, so only
+              // a follow-up keeps addressing its child: without this guard the failed
+              // first attempt's child would leak into the retry's authorization and
+              // stream observation while the retry actually starts a new child.
+              onPublished: childSessionId => { if (continuation.kind === 'continue') continuation = { kind: 'continue', childSessionId, prompt: '' }; record({ childSessionId }) },
             })
 
             return { answer, lastSeq: packet.lastSeq }
@@ -357,9 +450,39 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         })
         if (!result) { record({ status: 'skipped' }); return undefined }
         if (!fresh(agent, revision)) { record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity }); return undefined }
-        record({ status: 'delivered', childSessionId: result.answer.childSessionId, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, usage: result.answer.usage, verdictTool: ADVISOR_VERDICT_TOOL,
-          responseText: mode === 'manual' ? JSON.stringify(toolAnswer(result.answer, publicId), null, 2) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId, publicId).content) })
-        if (mode === 'continuous') reviewed.set(String(agent.id), { turn: trigger.turn, seq: result.lastSeq })
+        // Workspace-epoch staleness is enforced by the caller comparing the
+        // epoch captured at dispatch against the current epoch (see below).
+        if (epochOf(agent) !== epochAtDispatch) {
+          record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, error: 'Workspace changed during the Advisor run; the review is kept for audit but not steered.' })
+          rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode })
+          return undefined
+        }
+        // Bound telemetry: the full verdict lives in the Advisor child transcript;
+        // the requester/root log keeps a bounded digest, never an unbounded copy.
+        {
+          const full = mode === 'manual' ? JSON.stringify(toolAnswer(result.answer, publicId)) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId, publicId).content)
+          const bounded = truncateUtf8(full, 4096)
+          record({ status: 'delivered', childSessionId: result.answer.childSessionId, summary: truncateUtf8(result.answer.verdict.summary, 1024), severity: result.answer.verdict.severity, usage: result.answer.usage, verdictTool: ADVISOR_VERDICT_TOOL,
+            responseText: bounded })
+        }
+        // Any delivered consultation — manual or automatic — advances the review
+        // watermark so a subsequent automatic trigger on the SAME evidence does
+        // not immediately spend a second strong-model call. New failures,
+        // validations, mutations or conclusions move the evidence version past it.
+        {
+          const key = String(agent.id)
+          const fp = trigger.decision?.problemFingerprint
+          const entry = reviewWatermark.get(key) ?? { evidenceVersion: 0, fingerprints: new Set<string>(), seq: 0, epoch: 0 }
+          if (fp) entry.fingerprints.add(fp)
+          // A manual review carries no trigger decision, so it covers the live
+          // problems instead: without this it would suppress nothing at all.
+          for (const live of tracker.currentFingerprints(key)) entry.fingerprints.add(live)
+          entry.evidenceVersion = tracker.observationCount(key)
+          entry.seq = result.lastSeq
+          entry.epoch = structuralOf(agent)
+          reviewWatermark.set(key, entry)
+          reviewed.set(key, { turn: trigger.turn, seq: result.lastSeq })
+        }
         // The id stays stable for the whole conversation so a follow-up turn can
         // address the SAME child session instead of starting a new consultation.
         rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode })
@@ -468,6 +591,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     parameters: {
       action: { type: 'string', required: true },
       id: { type: 'string' }, claim_id: { type: 'string' }, summary: { type: 'string' },
+      validation_call_id: { type: 'string' },
       disposition: { type: 'string' }, basis: { type: 'string' },
       document: { type: 'string' }, change: { type: 'string' }, evidence: { type: 'string' },
     },
@@ -492,10 +616,19 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       const id = text('id'), seq = exec.agent.session.seq
       if (action === 'list') return { action, message: listed().length ? 'Current-run obligations (runtime only: a restart keeps no record).' : 'No current-run obligation record.', obligations: listed() }
       if (action === 'register') {
-        const claimId = text('claim_id'), summary = text('summary')
+        const claimId = text('claim_id'), summary = text('summary'), validationCallId = text('validation_call_id')
         if (!claimId || !summary) return { action, message: 'register requires claim_id and summary.', obligations: listed() }
-        const item = obligations.recordClaimContradiction({ sessionId: key, taskStartSeq, scope, seq, at: Date.now(), claimId, summary: redactSecrets(summary).slice(0, 300) })
-        return { action, message: 'Registered ' + item.id + '. It stays open until a verification witness and a correction record both exist.', obligations: listed() }
+        if (!validationCallId) return { action, message: 'register requires validation_call_id: the tool call id of an observed validation command in this task whose pass/fail identity this claim can be re-verified against. Run the check first, then register with its call id.', obligations: listed() }
+        const evidence = tracker.evidence(key).find(item => item.callId === validationCallId)
+        if (!evidence) return { action, message: 'Unknown validation_call_id for this task: no observed tool evidence carries that call id. Run the verification command first, then register with its call id.', obligations: listed() }
+        if (!evidence.validationKey) return { action, message: 'That call carries no validation identity (it is not a recognized test/typecheck/lint/build invocation), so it cannot be closed automatically. Re-run a recognized validation command and register with its call id.', obligations: listed() }
+        // A claim keeps the FIRST verified identity it was bound to: silently
+        // swapping it would let a later pass of validation A close a contradiction
+        // the caller just attributed to validation B.
+        const clash = obligations.list(key, taskStartSeq).find(item => item.kind === 'claim-contradicted' && item.claimId === claimId && item.validationKey !== undefined && item.validationKey !== evidence.validationKey)
+        if (clash?.validationKey) return { action, message: 'Claim ' + claimId + ' is already bound to validation ' + clash.validationKey.slice(0, 12) + ' on ' + clash.id + '; it cannot be re-registered against ' + evidence.validationKey.slice(0, 12) + '. Use a new claim_id for a different check, or disposition the existing item.', obligations: listed() }
+        const item = obligations.recordClaimContradiction({ sessionId: key, taskStartSeq, scope, seq, at: Date.now(), claimId, summary: redactSecrets(summary).slice(0, 300), validationKey: evidence.validationKey })
+        return { action, message: 'Registered ' + item.id + ' against validation ' + (item.validationKey ?? evidence.validationKey).slice(0, 12) + '. It stays open until a correction record AND a later pass of the same validation (no related change since) both exist.', obligations: listed() }
       }
       if (action === 'disposition') {
         const kind = text('disposition'), basis = text('basis')
@@ -507,15 +640,30 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       if (action === 'correct') {
         const claimId = text('claim_id'), document = text('document'), change = text('change'), evidence = text('evidence')
         if (!claimId || !document || !change || !evidence) return { action, message: 'correct requires claim_id, document, change and evidence.', obligations: listed() }
-        const item = obligations.recordCorrection(key, taskStartSeq, id, { claimId, document: redactSecrets(document).slice(0, 200), change: redactSecrets(change).slice(0, 300), evidence: redactSecrets(evidence).slice(0, 300), at: Date.now(), seq })
+        const correction = { claimId, document: redactSecrets(document).slice(0, 200), change: redactSecrets(change).slice(0, 300), evidence: redactSecrets(evidence).slice(0, 300), at: Date.now(), seq }
+        let item = id ? obligations.recordCorrection(key, taskStartSeq, id, correction) : undefined
+        // Models fumble ids the way callers fumble consultation handles: when no
+        // id is given but the claim id names exactly one open item, use it rather
+        // than refusing. An explicit id keeps the strict behavior above.
+        if (!item && !id) {
+          const candidates = obligations.list(key, taskStartSeq).filter(candidate => candidate.kind === 'claim-contradicted' && candidate.state === 'open' && candidate.claimId === claimId)
+          if (candidates.length > 1) return { action, message: 'Several open obligations share claim_id ' + claimId + '; pass the id shown by list.', obligations: listed() }
+          if (candidates.length === 1) item = obligations.recordCorrection(key, taskStartSeq, candidates[0]!.id, correction)
+        }
         return { action, message: item ? 'Recorded the correction on ' + item.id + '. A correction alone does not close it; a verification witness must still follow the failure.' : 'No such obligation, or the claim id does not match.', obligations: listed() }
       }
       return { action, message: 'Unknown action. Use list, register, disposition or correct.', obligations: listed() }
     },
   }))
 
-  for (const agent of ctx.agents.list()) refreshTool(agent)
-  ctx.on('agent/created', ({ agent }) => refreshTool(agent))
+  for (const agent of ctx.agents.list()) {
+    refreshTool(agent)
+    if (agent.session.header.parentSession === undefined) restoreConsultations(agent)
+  }
+  ctx.on('agent/created', ({ agent }) => {
+    refreshTool(agent)
+    if (agent.session.header.parentSession === undefined) restoreConsultations(agent)
+  })
   ctx.on('settings/updated', namespace => { if (namespace === SETTINGS_NAMESPACE) { suppressed.clear(); retryableStarts.clear(); for (const agent of ctx.agents.list()) refreshTool(agent) } })
   ctx.on('agent/inbox/inserted', ({ agent, message }) => {
     if (registry.identity(agent)) return
@@ -532,30 +680,53 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     if (message.source.kind !== 'user') return
     revisions.set(key, (revisions.get(key) ?? 0) + 1)
     tracker.clear(key)
+    reviewWatermark.delete(key)
     taskStarts.set(key, agent.session.seq)
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
   })
   ctx.on('tools/execute', async (exec, next) => {
     if (exec.agent) {
       const agentKey = String(exec.agent.id)
-      dispatchSeq.set(String(exec.callId), { seq: exec.agent.session.seq, taskStartSeq: taskStarts.get(agentKey) ?? 0 })
-      // Expire by sequence distance so in-flight calls keep their start boundary.
-      const oldest = exec.agent.session.seq - 512
-      for (const [id, entry] of dispatchSeq) if (entry.seq < oldest) dispatchSeq.delete(id)
+      dispatchTick += 1
+      dispatchSeq.set(String(exec.callId), { seq: exec.agent.session.seq, taskStartSeq: taskStarts.get(agentKey) ?? 0, tick: dispatchTick, agentKey })
+      // Expire by shared tick distance so in-flight calls keep their start
+      // boundary no matter which session dispatched around them.
+      for (const [id, entry] of dispatchSeq) if (dispatchTick - entry.tick > 512) dispatchSeq.delete(id)
     }
     return await next()
   })
 
   ctx.on('tools/result', (exec, result: Readonly<ToolExecutionResult>) => {
-    if (!exec.agent || exec.name === ADVISOR_TOOL_NAME || roleOf(exec.agent) === 'advisor') return
+    if (!exec.agent || exec.name === ADVISOR_TOOL_NAME) return
     const config = configFor(exec.agent)
     if (!routeConfigured(config)) return
+    // Advisor edits still change the shared workspace (epoch + obligation
+    // freshness), but an Advisor's own tool calls never feed its escalation
+    // tracker: they are review work, not requester evidence.
+    const advisorResult = roleOf(exec.agent) === 'advisor'
+    if (advisorResult && toolEffect(exec.name, config.readOnlyTools, config.mutatingTools) === 'read-only') return
     const agentKey = String(exec.agent.id), callId = String(exec.callId)
     // Task identity is captured at dispatch so a task change mid-call cannot
-    // re-attribute the run.
+    // re-attribute the run. When the dispatch entry is gone (evicted as a lost
+    // orphan long ago), the result is quarantined: attributing it to the CURRENT
+    // task would score stale evidence and open obligations in the wrong task.
+    // The tool result itself still reaches the model; only plugin bookkeeping
+    // abstains. A missing entry is never backfilled from current state.
     const dispatched = dispatchSeq.get(callId)
-    dispatchSeq.delete(callId)
-    const taskStartSeq = dispatched?.taskStartSeq ?? taskStarts.get(agentKey) ?? 0
+    // A result whose dispatch identity was lost keeps its observable workspace
+    // effects (epoch, structural and obligation mutations below use live session
+    // state, not the lost window) but contributes nothing task-specific: scoring
+    // it, opening failures, or closing proofs against the CURRENT task would
+    // misattribute ancient evidence. startedSeq stays undefined, so witnesses
+    // still close nothing on its behalf either.
+    const attributionLost = dispatched === undefined
+    if (dispatched !== undefined) dispatchSeq.delete(callId)
+    const currentTaskStart = taskStarts.get(agentKey) ?? 0
+    // A result recorded under a task the agent has since left must not score,
+    // open, or close anything in the new task: its evidence belongs to a dead
+    // scope. Workspace freshness below still observes that something ran.
+    const staleTask = dispatched !== undefined && dispatched.taskStartSeq !== currentTaskStart
+    const taskStartSeq = dispatched?.taskStartSeq ?? currentTaskStart
     const scope = 'task:' + agentKey + ':' + taskStartSeq
     const observed = {
       callId, name: exec.name, arguments: exec.arguments, isError: result.isError, scope,
@@ -563,17 +734,55 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     }
     const startedSeq = dispatched?.seq
     const completedSeq = exec.agent.session.seq
-    tracker.observe(agentKey, observed, config)
-    if (mutationKey(exec.name, exec.arguments)) obligations.recordMutation({ sessionId: agentKey, taskStartSeq, scope, seq: completedSeq, applied: !result.isError })
-    if (roleOf(exec.agent) !== 'root') return
+    if (!advisorResult && !attributionLost && !staleTask) tracker.observe(agentKey, observed, config)
     const outcome = classifyToolOutcome(observed)
+    // Freshness distinguishes execution from mutation. Review traffic (the verdict
+    // channel, inspection reads, the obligation tool itself) stays fully invisible.
+    // A validation execution is evidence, not interference: it moves neither the
+    // structural clock (its own writes are the check) nor — by call id in the
+    // witness — its own proof. Everything genuinely mutating (shells, configured
+    // or path-carrying custom tools, worker and Advisor edits) counts, mirrored
+    // into the root scope when it originates off-root. The epoch only ever marks
+    // reviews stale, never proofs.
+    const effect = toolEffect(exec.name, config.readOnlyTools, config.mutatingTools)
+    const structural = mutationKey(exec.name, exec.arguments) !== undefined
+    const reviewTraffic = advisorResult && effect !== 'mutating' && !structural
+    const countsAsMutation = !reviewTraffic && (effect === 'mutating' || structural)
+    if (countsAsMutation) {
+      // An editing Advisor's own effects must not stale its own review (the verdict
+      // reports them), and no concurrent read-only review can exist beside it:
+      // the exclusive workspace lease serializes editors against every reader.
+      // Its edits still invalidate older proofs via the mirror below.
+      if (!advisorResult) {
+        try {
+          const rootId = String(taskRootAgent(ctx, exec.agent).id)
+          workspaceEpoch.set(rootId, (workspaceEpoch.get(rootId) ?? 0) + 1)
+        } catch {}
+      }
+      if (outcome.validationKey === undefined) bumpStructural(exec.agent)
+      const mutation = { sessionId: agentKey, taskStartSeq, scope, seq: completedSeq, applied: !result.isError, callId }
+      obligations.recordMutation(mutation)
+      // A worker or Advisor shares the root's workspace: mirror the mutation into
+      // the root scope with the root's current seq (session seqs are not
+      // comparable across agents), so it invalidates a root witness that it
+      // genuinely outdates.
+      if (roleOf(exec.agent) !== 'root') {
+        try {
+          const rootAgent = taskRootAgent(ctx, exec.agent), rootKey = String(rootAgent.id)
+          const rootStart = taskStarts.get(rootKey) ?? 0
+          obligations.recordMutation({ sessionId: rootKey, taskStartSeq: rootStart, scope: 'task:' + rootKey + ':' + rootStart, seq: rootAgent.session.seq, applied: !result.isError, callId })
+        } catch {}
+      }
+    }
+    if (attributionLost || staleTask) return
+    if (roleOf(exec.agent) !== 'root') return
     if (opensObligation(outcome.class)) {
       obligations.recordFailure({
         sessionId: agentKey, taskStartSeq, scope, seq: completedSeq, at: Date.now(), callId,
         ...(outcome.validationKey ? { validationKey: outcome.validationKey } : {}),
         summary: redactSecrets((result.isError ? result.error.message : observed.contentText) || exec.name).slice(0, 300),
       })
-    } else if (outcome.class === 'success' && outcome.validationKey && outcome.exitCode === 0) {
+    } else if (outcome.class === 'success' && outcome.validationKey && outcome.exitCode === 0 && !outcome.compound && !staleTask) {
       obligations.recordValidation({ sessionId: agentKey, taskStartSeq, scope, validationKey: outcome.validationKey, callId, ...(startedSeq === undefined ? {} : { startedSeq }), completedSeq, succeeded: true })
     }
   })
@@ -586,6 +795,28 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     if (mode === 'continuous' && reviewed.get(key)?.turn === turn) return
     const decision = mode === 'escalation' ? tracker.decision(key, turn, config) : undefined
     if (decision && !decision.shouldConsult) return
+    // A delivered consultation (manual OR automatic) suppresses a repeat
+    // automatic consultation on the same evidence: only NEW failures,
+    // validations, mutations or conclusions re-arm it.
+    {
+      const mark = reviewWatermark.get(key)
+      if (mark !== undefined) {
+        const fp = decision?.problemFingerprint
+        if (fp !== undefined) {
+          // Escalation re-arms on a new (uncovered) problem or a structural
+          // workspace change since the review — never on a bare repeat of a
+          // covered problem, no matter how many times the bounded evidence
+          // array shifted under it. (The conservative shell-inclusive epoch is
+          // deliberately NOT consulted here: a repeat failure through bash would
+          // otherwise re-arm every time.)
+          if (mark.fingerprints.has(fp) && structuralOf(agent) === mark.epoch) return
+        } else if (tracker.observationCount(key) <= mark.evidenceVersion) {
+          // Continuous review has no fingerprint: new tool evidence or a material
+          // assistant conclusion re-arms it.
+          if (!hasNewMaterialConclusion(agent.session.snapshotEvents(), mark.seq)) return
+        }
+      }
+    }
     const revision = revisionOf(agent)
     const suppressionKey = [key, revision, mode, decision?.problemFingerprint ?? turn].join('|')
     if (suppressed.has(suppressionKey)) return
@@ -629,8 +860,26 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   ctx.on('agent/pre-step', async (request, next) => {
     const identity = registry.identity(request.agent)
     if (identity && identity.advisorId !== String(request.agent.id)) return { kind: 'reject' }
+    if (identity && identity.advisorId === String(request.agent.id)) {
+      // The Advisor child is a visible audit session, not an open model endpoint:
+      // every turn must correspond to a plugin-authorized activation created by
+      // startContinuable/sendMessage for THIS invocation (bound, or pending in
+      // the pre-bind window of a fresh start). Direct user prompts,
+      // generic send_message, or stale turns without a live activation are refused
+      // before they can reach budgets, locks, or the strong model.
+      const turn = typeof request.turn === 'number' ? request.turn : undefined
+      // Message ids are stable across representations, so the entering batch is
+      // checked against the authorized delivery once it is bound: a step carrying
+      // any other message — including a foreign message batched into our own turn —
+      // is refused before the model sees it.
+      const enteringIds = request.messages.map(message => String(message.id))
+      if (!registry.isTurnAuthorized(String(request.agent.id), identity.invocationId, turn, enteringIds)) {
+        return { kind: 'reject' }
+      }
+    }
     if (!identity && request.messages.some(message => message.source.kind === 'user')) {
       tracker.clear(String(request.agent.id))
+      reviewWatermark.delete(String(request.agent.id))
       taskStarts.set(String(request.agent.id), request.agent.session.seq)
     }
     const nextStep = await next()
@@ -666,11 +915,14 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   })
   ctx.on('agent/disposed', ({ agent }) => {
     const key = String(agent.id)
-    tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key); obligations.clear(key); goalRoundActive.delete(key)
+    try { registry.revokeTurn(key) } catch {}
+    try { registry.pruneConsumed() } catch {}
+    tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key); obligations.clear(key); goalRoundActive.delete(key); reviewWatermark.delete(key)
+    for (const [id, entry] of dispatchSeq) if (entry.agentKey === key) dispatchSeq.delete(id)
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
     hiddenTools.get(agent)?.(); hiddenTools.delete(agent)
     for (const controller of controllers.get(key) ?? []) controller.abort()
     controllers.delete(key)
-    if (agent.session.header.parentSession === undefined) { limiter.clear(key); registry.clearRoot(key) }
+    if (agent.session.header.parentSession === undefined) { limiter.clear(key); registry.clearRoot(key); workspaceEpoch.delete(key); structuralEpoch.delete(key) }
   })
 }
