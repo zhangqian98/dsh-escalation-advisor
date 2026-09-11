@@ -76,6 +76,27 @@ describe('Advisor lifecycle accounting and delivery', () => {
     expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).budget.used).toBe(1)
   })
 
+  it('treats a negative budget as no limit for BOTH the manual and the task budget, and zero as a refusal', async () => {
+    // Fourteen explicit calls cross both old ceilings: the manual cap was 8 and the task cap was 12,
+    // so under the previous defaults calls 9 onward would have been refused.
+    const calls = Array.from({ length: 14 }, (_, index) => toolCallResponse('c' + index, 'consult_advisor', { question: 'Review step ' + index }))
+    const unlimited = await harness({ weak: [...calls, textResponse('done')], advisor: advisorScript(...Array.from({ length: 14 }, () => advisorVerdictResponse())) }, { maxManualConsultsPerSession: -1, maxAdvisorConsultsPerTask: -1 })
+    await unlimited.runRoot('Review every step')
+    expect(advisorRunHistory(unlimited.root).filter(run => run.status === 'delivered')).toHaveLength(14)
+    expect(JSON.parse(unlimited.ctx.advisor.snapshot(String(unlimited.root.id))).budget.used).toBe(14)
+
+    // Zero still refuses outright: the tool answers unavailable and no Advisor model request is made.
+    const disabled = await harness({ weak: [toolCallResponse('first', 'consult_advisor', { question: 'Review once' }), textResponse('done')], advisor: advisorScript(advisorVerdictResponse()) }, { maxManualConsultsPerSession: 0 })
+    await disabled.runRoot('Review once')
+    expect(advisorRunHistory(disabled.root)).toHaveLength(0)
+    expect(disabled.adapter.forModel('advisor')).toHaveLength(0)
+
+    // A positive cap is still enforced: the same fourteen calls stop at exactly eight.
+    const capped = await harness({ weak: [...calls, textResponse('done')], advisor: advisorScript(...Array.from({ length: 14 }, () => advisorVerdictResponse())) }, { maxManualConsultsPerSession: 8, maxAdvisorConsultsPerTask: -1 })
+    await capped.runRoot('Review every step')
+    expect(advisorRunHistory(capped.root).filter(run => run.status === 'delivered')).toHaveLength(8)
+  })
+
   it('retries a transient automatic failure once and only deduplicates after delivery', async () => {
     let retryableFailures = 0
     const h = await harness({ weak: [toolCallResponse('f1', 'fails', {}), toolCallResponse('f2', 'fails', {}), textResponse('done'), textResponse('Settled after the Advisor result.')], advisor: [() => { retryableFailures += 1; throw new Error('provider timeout') }, ...advisorScript(advisorVerdictResponse())] }, { mode: 'escalate', retryDelayMs: 0 })
