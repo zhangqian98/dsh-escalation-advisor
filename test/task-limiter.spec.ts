@@ -19,6 +19,15 @@ describe('AdvisorTaskLimiter', () => {
     await limiter.run('root', limits, signal, async started => { started() })
     await expect(limiter.run('root', limits, signal, async () => undefined)).rejects.toMatchObject({ code: 'task_budget_exhausted' })
   })
+  it('treats a negative budget as no limit at all, while zero still refuses every consultation', async () => {
+    const limiter = new AdvisorTaskLimiter(), signal = new AbortController().signal
+    const unlimited = { maxTotal: -1, maxConcurrent: 1, trackStart: true }
+    for (let index = 0; index < 40; index++) await limiter.run('root', unlimited, signal, async started => { started() })
+    expect(limiter.snapshot('root').used).toBe(40)
+    const fresh = new AdvisorTaskLimiter()
+    await expect(fresh.run('root', { maxTotal: 0, maxConcurrent: 1 }, signal, async () => undefined)).rejects.toMatchObject({ code: 'task_budget_exhausted' })
+    await expect(fresh.run('root', { maxTotal: -1, maxConcurrent: 1 }, signal, async () => undefined)).resolves.toBeUndefined()
+  })
   it('refunds a published child that fails before model dispatch, but counts a dispatched timeout', async () => {
     const limiter = new AdvisorTaskLimiter(), signal = new AbortController().signal
     const limits = { maxTotal: 1, maxConcurrent: 1, trackStart: true }

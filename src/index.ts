@@ -361,7 +361,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     async execute(raw: unknown, exec: ToolRunContext) {
       if (!exec.agent || !manualEnabled(exec.agent)) return unavailable('Advisor is not configured or enabled for this agent.')
       const agent = exec.agent, key = String(agent.id), config = currentConfig()
-      if ((manualCalls.get(key) ?? 0) + (manualReserved.get(key) ?? 0) >= config.maxManualConsultsPerSession) return unavailable('Manual Advisor consultation budget reached.')
+      if (config.maxManualConsultsPerSession >= 0 && (manualCalls.get(key) ?? 0) + (manualReserved.get(key) ?? 0) >= config.maxManualConsultsPerSession) return unavailable('Manual Advisor consultation budget reached.')
       manualReserved.set(key, (manualReserved.get(key) ?? 0) + 1)
       let started = false
       const args = raw as AskAdvisorArgs

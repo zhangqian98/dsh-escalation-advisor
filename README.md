@@ -116,8 +116,10 @@ Separately, a definite validation failure opens a runtime-only verification obli
 
 Strong-model usage is bounded at two levels:
 
-- `maxManualConsultsPerSession` — explicit consultation cap per agent/session; default `8`.
-- `maxAdvisorConsultsPerTask` — shared consultation cap across the live root task tree; default `12`.
+- `maxManualConsultsPerSession` — explicit consultation cap per agent/session; default `-1` (no limit).
+- `maxAdvisorConsultsPerTask` — shared consultation cap across the live root task tree; default `-1` (no limit).
+
+Both budgets treat a negative value as no limit at all, while `0` means consultations are disabled outright. Set a positive number to bound Advisor spend.
 - `maxConcurrentAdvisorRuns` — simultaneous Advisor runs in one root task tree; default `2`.
 
 If multiple workers ask at once, excess consultations queue behind the task-tree concurrency limit. Reservations are refunded if no model request starts, including queued cancellation and authentication configuration failures. A dispatched request consumes budget even when it fails. Automatic transient failures receive at most one delayed retry; only a delivered verdict consumes the problem deduplication allowance.

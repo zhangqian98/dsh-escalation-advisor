@@ -88,9 +88,12 @@ export class AdvisorTaskLimiter {
     task: (markStarted: () => void) => Promise<T>,
   ): Promise<T> {
     const state = this.state(taskId)
-    if (limits.maxTotal <= 0 || state.used >= limits.maxTotal) {
-      if (limits.maxTotal > 0 && state.used - state.pendingStarts < limits.maxTotal) throw new AdvisorTaskLimitError('Advisor task budget is temporarily reserved by consultations that have not dispatched.', 'task_budget_reserved')
-      throw new AdvisorTaskLimitError(`Advisor task budget reached (${limits.maxTotal} consultations for this task tree).`, 'task_budget_exhausted')
+    // A negative budget means NO limit at all; zero still means "none permitted",
+    // which is how a deployment disables consultations outright.
+    const cap = limits.maxTotal
+    if (cap >= 0 && state.used >= cap) {
+      if (cap > 0 && state.used - state.pendingStarts < cap) throw new AdvisorTaskLimitError('Advisor task budget is temporarily reserved by consultations that have not dispatched.', 'task_budget_reserved')
+      throw new AdvisorTaskLimitError(`Advisor task budget reached (${cap} consultations for this task tree).`, 'task_budget_exhausted')
     }
     state.used += 1
     state.pendingStarts += 1

@@ -46,9 +46,9 @@ export interface Config {
   escalationWait: AdvisorWaitMode
   continuousWait: AdvisorWaitMode
   timeoutMs: number
-  /** Per-agent explicit consultation budget. */
+  /** Per-agent explicit consultation budget. A negative value means no limit. */
   maxManualConsultsPerSession: number
-  /** Shared strong-model consultation budget for the whole live root task tree. */
+  /** Shared strong-model consultation budget for the whole live root task tree. A negative value means no limit. */
   maxAdvisorConsultsPerTask: number
   /** Maximum simultaneous Advisor runs within one live root task tree. */
   maxConcurrentAdvisorRuns: number
@@ -86,8 +86,8 @@ export const Config = z.object({
   escalationWait: z.union([...WAIT_MODES]).default('block'),
   continuousWait: z.union([...WAIT_MODES]).default('background'),
   timeoutMs: z.number().step(1).min(MIN_TIMEOUT_MS).max(MAX_TIMEOUT_MS).default(DEFAULT_TIMEOUT_MS),
-  maxManualConsultsPerSession: z.number().step(1).min(0).max(100).default(8),
-  maxAdvisorConsultsPerTask: z.number().step(1).min(0).max(1000).default(12),
+  maxManualConsultsPerSession: z.number().step(1).min(-1).max(100).default(-1),
+  maxAdvisorConsultsPerTask: z.number().step(1).min(-1).max(1000).default(-1),
   maxConcurrentAdvisorRuns: z.number().step(1).min(1).max(32).default(2),
   scoreThreshold: z.number().step(1).min(1).max(100).default(4),
   toolErrorWeight: z.number().step(1).min(0).max(20).default(2),

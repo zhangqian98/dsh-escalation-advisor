@@ -64,7 +64,7 @@ All Advisor calls under one live root task share a process-local limiter:
 
 ```text
 Root task
-  maxAdvisorConsultsPerTask = 12
+  maxAdvisorConsultsPerTask = -1  (no limit)
   maxConcurrentAdvisorRuns = 2
         |
         +-- Root Advisor
@@ -74,7 +74,7 @@ Root task
 
 The task root is found by walking live `parentSession` links through the DSH Agent registry. Calls above the concurrency cap queue FIFO. A queued call aborted before start returns its reserved budget; a call that actually starts consumes budget even if the model later fails.
 
-Manual consultation also retains a per-agent cap (`maxManualConsultsPerSession`, default 8), preventing one worker from spending the whole task budget through explicit calls.
+Manual consultation also retains a per-agent cap (`maxManualConsultsPerSession`). Both budgets default to `-1`, which means no limit at all: a negative value is never exhausted, while `0` still means consultations are disabled outright. Set either to a positive number to bound cost; the cap only ever limits how many consultations may start, never what one of them may report.
 
 ## Permission model: defaults plus deltas
 
