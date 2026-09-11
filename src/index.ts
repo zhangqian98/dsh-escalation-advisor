@@ -505,8 +505,18 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   ctx.on('agent/created', ({ agent }) => refreshTool(agent))
   ctx.on('settings/updated', namespace => { if (namespace === SETTINGS_NAMESPACE) { suppressed.clear(); retryableStarts.clear(); for (const agent of ctx.agents.list()) refreshTool(agent) } })
   ctx.on('agent/inbox/inserted', ({ agent, message }) => {
-    if (message.source.kind !== 'user' || registry.identity(agent)) return
+    if (registry.identity(agent)) return
     const key = String(agent.id)
+    // An autonomous goal round is NOT a new task. It must not clear the failure
+    // score or move the task boundary: open obligations, their closure scope and
+    // the per-task reminder budget all stay with the task. It also has no human
+    // turn to restate the open items, so injection alone is re-armed, once per
+    // round, for the task the goal is running inside.
+    if (message.source.kind === 'goal') {
+      obligations.rearmInjection(key, taskStarts.get(key) ?? 0)
+      return
+    }
+    if (message.source.kind !== 'user') return
     revisions.set(key, (revisions.get(key) ?? 0) + 1)
     tracker.clear(key)
     taskStarts.set(key, agent.session.seq)

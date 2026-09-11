@@ -208,6 +208,23 @@ export class ObligationStore {
   }
 
   /**
+   * Re-arms injection for every open item in a task, touching nothing else.
+   *
+   * An autonomous goal round is neither a new task nor new evidence: nothing
+   * bumps a revision, so without this the items would be stated once and never
+   * again for the rest of the run. Re-arming is what makes a goal round restate
+   * the open items. The reminder marker is deliberately left alone, so the
+   * per-task reminder budget and its handoff checklist keep their meaning.
+   *
+   * @returns how many open items were re-armed.
+   */
+  rearmInjection(sessionId: string, taskStartSeq: number): number {
+    const items = this.open(sessionId, taskStartSeq)
+    for (const item of items) item.injectedRevision = 0
+    return items.length
+  }
+
+  /**
    * At most one reminder per obligation revision; the task budget is separate.
    *
    * A disposition that still covers the current revision is NOT a reason to speak

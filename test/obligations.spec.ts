@@ -206,6 +206,29 @@ describe('ObligationStore', () => {
     expect(store.remindersUsed('s1', 100)).toBe(0)
   })
 
+  it('re-arms injection for a goal round without spending a reminder or closing anything', () => {
+    const store = new ObligationStore()
+    const item = failure(store, 10, 'k-auth')
+    expect(store.pendingInjection('s1', 100)).toHaveLength(1)
+    expect(store.pendingInjection('s1', 100)).toHaveLength(0)
+    store.markReminded(item)
+
+    // An autonomous goal round is not new evidence, so it re-arms INJECTION only:
+    // the open item is restated for that round...
+    expect(store.rearmInjection('s1', 100)).toBe(1)
+    expect(store.pendingInjection('s1', 100).map(entry => entry.id)).toEqual([item.id])
+    // ...while the reminder path, the budget and the record itself stay untouched.
+    expect(store.pendingReminder('s1', 100)).toHaveLength(0)
+    expect(store.remindersUsed('s1', 100)).toBe(0)
+    expect(store.open('s1', 100).map(entry => entry.id)).toEqual([item.id])
+
+    // Re-arming follows OPEN items only: once a witness closes the item, a further
+    // goal round has nothing left to restate.
+    store.recordValidation(run({ startedSeq: 11, completedSeq: 12 }))
+    expect(store.rearmInjection('s1', 100)).toBe(0)
+    expect(store.pendingInjection('s1', 100)).toHaveLength(0)
+  })
+
   it('does not re-arm attention for a disposition, but does for later evidence', () => {
     const store = new ObligationStore()
     const item = failure(store, 10, 'k-auth')

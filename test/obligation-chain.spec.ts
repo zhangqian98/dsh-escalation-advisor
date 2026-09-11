@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
 import { MAX_AUTO_REMINDERS_PER_TASK, type Obligation } from '../src/obligations.js'
 import { classifyToolOutcome } from '../src/state.js'
 import {
@@ -321,6 +322,46 @@ describe('verification obligations through the real plugin chain', () => {
     // One injection per obligation revision (4 recurrences) plus one reminder per
     // granted continuation (MAX): no fourth reminder was ever delivered.
     expect(obligationNotices(h.root)).toHaveLength(4 + MAX_AUTO_REMINDERS_PER_TASK)
+  }, 10000)
+
+  it('restates the open item for an autonomous goal round while the reminder budget stays per task', async () => {
+    const scriptedRounds = 6
+    const script = [
+      ...Array.from({ length: scriptedRounds }, (_, index) => [
+        toolCallResponse('goal-cap-' + index, 'bash', { command: 'npm test' }),
+        textResponse('Round ' + index + ' only explains the failure again.'),
+      ]).flat(),
+      textResponse('The goal round continues the work.'),
+    ]
+    const h = await harness({ weak: script })
+    registerShellFixture(h, new Map([['npm test', Array.from({ length: scriptedRounds }, () => ({ exitCode: 1, output: FAILURE_OUTPUT }))]]))
+
+    await h.runRoot('Keep working without a passing re-run.')
+    const before = obligationSnapshot(h)
+    expect(before.remindersUsed).toBe(MAX_AUTO_REMINDERS_PER_TASK)
+    expect(before.exhausted).toBe(true)
+    const id = before.items[0]!.id
+    const requestsBefore = h.adapter.forModel('weak').length
+
+    // An admitted goal round arrives as a fresh user turn whose source kind is
+    // `goal`, which the driver uses precisely because it is NOT a new task.
+    await h.runRoot('Take the next goal round.', { kind: 'goal', goalId: brandString<Branded<'GoalId'>>('goal-chain-1'), revision: 1, round: 1 })
+
+    const goalRequests = h.adapter.forModel('weak').slice(requestsBefore)
+    expect(goalRequests.length).toBeGreaterThan(0)
+    const goalText = requestText(goalRequests[0]!.request)
+    // The item is restated for the round, under the SAME id: a new task would have
+    // scoped it away instead, since injection is filtered by task boundary.
+    expect(goalText).toContain('[Advisor obligations')
+    expect(goalText).toContain(id)
+
+    // Nothing else moved. The record is still the one open item of the same task,
+    // and the per-task reminder budget stays spent rather than being re-armed.
+    const after = obligationSnapshot(h)
+    expect(after.items.map(item => item.id)).toEqual([id])
+    expect(after.openCount).toBe(1)
+    expect(after.remindersUsed).toBe(MAX_AUTO_REMINDERS_PER_TASK)
+    expect(after.exhausted).toBe(true)
   }, 10000)
 
   it('states an unchanged item in one line and ends the budget with a handoff checklist', async () => {

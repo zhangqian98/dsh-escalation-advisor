@@ -303,7 +303,8 @@ export interface IntegrationHarness {
   readonly root: Agent
   readonly adapter: ScriptedAdapter
   readonly created: CreatedAgentRecord[]
-  runRoot(prompt: string): Promise<void>
+  /** `source` defaults to an ordinary human turn; a goal round passes its own attribution. */
+  runRoot(prompt: string, source?: Parameters<typeof createUserMessage>[0]['source']): Promise<void>
   spawnWorker(options?: {
     model?: string
     label?: string
@@ -381,10 +382,10 @@ export async function createIntegrationHarness(
     root,
     adapter,
     created,
-    async runRoot(prompt: string): Promise<void> {
+    async runRoot(prompt: string, source: Parameters<typeof createUserMessage>[0]['source'] = { kind: 'user' }): Promise<void> {
       root.followup(createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source: { kind: 'user' },
+        source,
       }))
       await root.whenIdle()
     },
