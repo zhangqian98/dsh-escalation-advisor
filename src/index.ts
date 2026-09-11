@@ -332,13 +332,13 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   registerAdvisorVerdictTool(ctx, { registry, collector: verdicts })
   ctx.tools.register(defineTool({
     name: ADVISOR_TOOL_NAME,
-    description: 'Ask a stronger model for an independent engineering review in a visible child session. Supply the question, hypothesis, evidence and failed attempts; the harness supplies the task.',
+    description: 'Ask a stronger model for an independent engineering review in a visible child session. Supply the question, hypothesis, evidence and failed attempts; the harness supplies the task. By default this starts a NEW Advisor conversation; pass consultation_id to continue an earlier one.',
     parameters: {
       question: { type: 'string', required: true }, goal: { type: 'string' }, current_hypothesis: { type: 'string' }, decision_needed: { type: 'string' },
       evidence: { type: 'array', items: { type: 'string' } }, failed_attempts: { type: 'array', items: { type: 'string' } }, attempts: { type: 'string' }, context: { type: 'string' },
       // Continue an EXISTING consultation as a new turn of the SAME Advisor
       // conversation: earlier context, persona and tool policy stay intact.
-      consultation_id: { type: 'string' },
+      consultation_id: { type: 'string', description: 'Continue an earlier Advisor conversation instead of starting a new one: pass the consultation_id that earlier result returned. Reuse it when this question builds on that review — supplying the evidence it asked for, challenging its verdict, or refining the same decision — because the advisor keeps its earlier context, persona and tool policy. Omit it for an unrelated problem, and also when you want a deliberately independent reassessment of a related one: a fresh consultation does not inherit the earlier framing. An unknown or foreign id is refused rather than silently restarted as a new consultation.' },
 
     },
     output: {
