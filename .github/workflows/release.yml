@@ -13,8 +13,6 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -32,10 +30,15 @@ jobs:
         id: pack
         shell: bash
         run: echo "filename=$(npm pack --silent)" >> "$GITHUB_OUTPUT"
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.filename }}" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
-      - name: Publish npm alpha when NPM_TOKEN is configured
-        if: env.NODE_AUTH_TOKEN != ''
-        run: npm publish --tag alpha --provenance
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${{ steps.pack.outputs.filename }}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.filename }}" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi
+      - name: Publish npm alpha through trusted publishing
+        run: npm publish --tag alpha
