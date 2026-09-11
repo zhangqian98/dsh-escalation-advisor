@@ -44,17 +44,17 @@ node scripts/patch-dsh-history.mjs /absolute/path/to/@deepseek-ai/dsh/package.js
 
 This local compatibility patch checks the exact DSH version and original file checksums, backs up two core files, and adds schemas for only `advisor/policy`, `advisor/model`, `advisor/identity`, and `advisor/run`. Their payloads are retained through V0 → V3 migration; other unknown historical types still fail. It also updates the persistence worker's event vocabulary for these four types. Keep Advisor enabled when opening these histories. Reinstalling DSH replaces the local core patch; rerun it for this exact release, and revalidate compatibility before using a different DSH release. The plugin supports both the earlier `tool/code-dispatch*` records and V3's `tool/ptc-dispatch*` records for continuous-review evidence.
 
-Install the immutable GitHub release tag into the Web profile, then restart DSH:
-
-```bash
-dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.26
-dsh web
-```
-
-After the package is published on npm, the equivalent registry install is:
+Install the exact npm release into the Web profile, then restart DSH:
 
 ```bash
 dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.26
+dsh web
+```
+
+The immutable GitHub release tag remains available as a source install:
+
+```bash
+dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.26
 ```
 
 For a local checkout, build and install the generated tarball rather than linking the source directory:
@@ -282,7 +282,7 @@ npx vitest run --config vitest.runtime.config.ts
 
 The installed-runtime configuration resolves all DSH imports from that installation. Persistence regressions use each version's actual cold-read validation and check that restored policy, identity, and verdict records survive, while unrelated unknown events still fail.
 
-Release tags use `v<package-version>`. The release workflow checks the tag, runs the suite, builds an npm tarball, and attaches it to the GitHub release. If the repository secret `NPM_TOKEN` is configured, the same workflow also publishes the prerelease under npm's `alpha` dist-tag.
+Release tags use `v<package-version>`. The release workflow checks the tag, runs the suite, builds an npm tarball, attaches it to the GitHub release, and publishes the prerelease under npm's `alpha` dist-tag through npm Trusted Publishing (OIDC). The workflow stores no long-lived npm publishing token.
 
 ## License
 
