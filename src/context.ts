@@ -200,6 +200,13 @@ function redactValue(value: unknown): unknown {
 const MAX_VALIDATION_ENTRIES = 10
 const VALIDATION_SUCCESS_CONTEXT = 2
 const MAX_FAILURES = 8
+const BASE_ACTIVITY_ENTRIES = 16
+const MAX_ACTIVITY_ENTRIES = 20
+const ACTIVITY_SUMMARY_BYTES = 1200
+
+function newest(indices: readonly number[], limit: number): number[] {
+  return limit <= 0 ? [] : indices.slice(-limit)
+}
 
 /**
  * Keeps every failed or trigger-related check plus the most recent successful
@@ -218,10 +225,10 @@ function boundedValidation<T extends { outcome: string; relevant_to_problem: boo
   // A trigger-related check is the reason the consultation exists, so the cap
   // never evicts one. The remaining budget goes to the newest failures and then
   // to a short tail of successful checks.
-  const keptRelated = related.slice(-MAX_VALIDATION_ENTRIES)
-  const keptFailed = failed.slice(-Math.max(0, MAX_VALIDATION_ENTRIES - keptRelated.length))
+  const keptRelated = newest(related, MAX_VALIDATION_ENTRIES)
+  const keptFailed = newest(failed, MAX_VALIDATION_ENTRIES - keptRelated.length)
   const room = Math.max(0, MAX_VALIDATION_ENTRIES - keptRelated.length - keptFailed.length)
-  const keptSuccessful = successful.slice(-Math.min(VALIDATION_SUCCESS_CONTEXT, room))
+  const keptSuccessful = newest(successful, Math.min(VALIDATION_SUCCESS_CONTEXT, room))
   return [...keptRelated, ...keptFailed, ...keptSuccessful].sort((left, right) => left - right).map(index => entries[index]!)
 }
 
@@ -230,8 +237,8 @@ function boundedEvidence<T>(entries: readonly T[], pin: (entry: T) => boolean, l
   const pinned: number[] = []
   const rest: number[] = []
   entries.forEach((entry, index) => (pin(entry) ? pinned : rest).push(index))
-  const keptPinned = pinned.slice(-limit)
-  const keptRest = rest.slice(-Math.max(0, limit - keptPinned.length))
+  const keptPinned = newest(pinned, limit)
+  const keptRest = newest(rest, limit - keptPinned.length)
   return [...keptPinned, ...keptRest].sort((left, right) => left - right).map(index => entries[index]!)
 }
 
@@ -296,7 +303,17 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     const key = observed.get(callId)?.validationKey
     return key !== undefined && triggerKeys.has(key)
   }
-  const activity = [...callById.entries()]
+  // A successful run_code wrapper only reports that its PTC program settled.
+  // Its concrete sub-dispatches carry the actual tools, arguments and outcomes,
+  // so retaining both doubles the same activity without adding evidence. Keep a
+  // failed or unfinished wrapper because it may be the only record of a bridge
+  // failure that happened outside every sub-dispatch.
+  const ptcParents = new Set([...callById.values()].flatMap(call => {
+    if (call.event.type === 'tool/call') return []
+    const parentCallId = record(call.event.data)?.parentCallId
+    return typeof parentCallId === 'string' ? [parentCallId] : []
+  }))
+  const allActivity = [...callById.entries()]
     .filter(([callId, call]) => deltaSeqs.has(eventSeq(call.event))
       || (resultById.get(callId) !== undefined && deltaSeqs.has(eventSeq(resultById.get(callId)!.event))))
     .map(([callId, call]) => {
@@ -305,32 +322,32 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
       return {
         call_id: callId,
         tool: call.name,
-        arguments_summary: summary(call.args),
+        arguments_summary: summary(call.args, ACTIVITY_SUMMARY_BYTES),
         call_seq: eventSeq(call.event),
         ...(result === undefined ? { outcome: 'result-not-observed' } : {
           outcome: canonical ? (canonical.outcome === 'validation-failure' || canonical.outcome === 'unknown-failure' ? 'failed' : canonical.outcome === 'success' ? 'succeeded' : canonical.outcome) : result.failed ? 'failed' : 'succeeded',
           result_seq: eventSeq(result.event),
-          result_summary: summary(inspectionOutput(callId, canonical?.errorSummary || result.text)),
+          result_summary: summary(inspectionOutput(callId, canonical?.errorSummary || result.text), ACTIVITY_SUMMARY_BYTES),
         }),
       }
     })
+  const activity = allActivity
+    .filter(item => !(item.tool === 'run_code' && item.outcome === 'succeeded' && ptcParents.has(item.call_id)))
   const failures = boundedEvidence(activity.filter(item => item.outcome === 'failed'), item => triggerRelated(item.call_id), MAX_FAILURES)
     .map(item => ({
-      tool: item.tool,
-      arguments_summary: item.arguments_summary,
-      error_summary: ('result_summary' in item && item.result_summary) || 'Tool reported an error without text.',
-       repeat_count: observed.get(item.call_id)?.repeatCount ?? 1,
       call_id: item.call_id,
+      tool: item.tool,
+      repeat_count: observed.get(item.call_id)?.repeatCount ?? 1,
     }))
   const validationEvidence = activity.flatMap(item => {
     const call = callById.get(item.call_id)
     const label = call && validationLabel(call.name, call.args)
     if (!label || item.outcome === 'result-not-observed') return []
     return [{
-      command_or_tool: label,
+      call_id: item.call_id,
+      tool: call.name,
       outcome: item.outcome,
       relevant_to_problem: triggerRelated(item.call_id),
-      call_id: item.call_id,
     }]
   })
   const validation = boundedValidation(validationEvidence)
@@ -374,10 +391,17 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     if (event.type === 'tool/result') {
       const result = toolResult(event)
       if (!result.callId || resultById.get(result.callId)?.event !== event) return []
-      return result.text ? [{ role: 'tool', summary: boundedText(inspectionOutput(result.callId ?? '', result.text), 1800), seq }] : []
+      // Keep a zero-content marker until after the chronological window is cut.
+      // Filtering tools before slice(-16) backfilled older conversation and made
+      // a long tool burst revive context that was no longer recent.
+      return [{ role: 'tool', summary: '', seq }]
     }
     return []
-  }).slice(-16)
+  }).slice(-16).filter(entry => entry.role !== 'tool')
+  const referencedActivity = new Set([...failures, ...validation].map(entry => entry.call_id))
+  const recentActivity = new Set(allActivity.slice(-BASE_ACTIVITY_ENTRIES).map(entry => entry.call_id))
+  const activityCandidates = activity.filter(item => recentActivity.has(item.call_id) || referencedActivity.has(item.call_id))
+  const toolActivity = boundedEvidence(activityCandidates, item => referencedActivity.has(item.call_id), MAX_ACTIVITY_ENTRIES)
   const assignment = requesterAssignment(input.requester, input.root, requesterEvents, taskStartSeq)
   // Durable goal state remains authoritative until cleared; only transcript evidence is task-bounded.
   const task = rootTask(rootEvents)
@@ -444,7 +468,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
       unavailable_tools: unique(input.unavailableTools),
       mutation_policy: input.mutationPolicy,
     },
-    tool_activity: activity.slice(-16),
+    tool_activity: toolActivity,
     recent_tail: recentTail,
   }
   const meaningfulDelta = changedPaths.length > 0
