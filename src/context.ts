@@ -33,6 +33,16 @@ interface EventRecord {
   data?: unknown
 }
 
+interface ActivityRecord {
+  call_id: string
+  tool: string
+  arguments_summary?: string
+  call_seq: number
+  outcome: string
+  result_seq?: number
+  result_summary?: string
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -198,11 +208,13 @@ function redactValue(value: unknown): unknown {
 // had succeeded and none matched the trigger, while tool_activity already
 // summarizes the most recent calls with their outcomes.
 const MAX_VALIDATION_ENTRIES = 10
-const VALIDATION_SUCCESS_CONTEXT = 2
-const MAX_FAILURES = 8
+const MAX_UNRELATED_VALIDATION_FAILURES = 3
+const VALIDATION_SUCCESS_CONTEXT = 1
+const MAX_FAILURES = 4
 const BASE_ACTIVITY_ENTRIES = 16
 const MAX_ACTIVITY_ENTRIES = 20
 const ACTIVITY_SUMMARY_BYTES = 1200
+const WRAPPER_FAILURE_SUMMARY_BYTES = 400
 
 function newest(indices: readonly number[], limit: number): number[] {
   return limit <= 0 ? [] : indices.slice(-limit)
@@ -226,7 +238,7 @@ function boundedValidation<T extends { outcome: string; relevant_to_problem: boo
   // never evicts one. The remaining budget goes to the newest failures and then
   // to a short tail of successful checks.
   const keptRelated = newest(related, MAX_VALIDATION_ENTRIES)
-  const keptFailed = newest(failed, MAX_VALIDATION_ENTRIES - keptRelated.length)
+  const keptFailed = newest(failed, Math.min(MAX_UNRELATED_VALIDATION_FAILURES, MAX_VALIDATION_ENTRIES - keptRelated.length))
   const room = Math.max(0, MAX_VALIDATION_ENTRIES - keptRelated.length - keptFailed.length)
   const keptSuccessful = newest(successful, Math.min(VALIDATION_SUCCESS_CONTEXT, room))
   return [...keptRelated, ...keptFailed, ...keptSuccessful].sort((left, right) => left - right).map(index => entries[index]!)
@@ -299,9 +311,11 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
   // Tracker evidence ties a call to the trigger through its validation key. That
   // link is what the consultation is about, so it survives every cap below.
   const triggerKeys = new Set((input.trigger?.signals ?? []).flatMap(signal => signal.validationKey === undefined ? [] : [signal.validationKey]))
+  const triggerFingerprints = new Set((input.trigger?.signals ?? []).map(signal => signal.fingerprint))
   const triggerRelated = (callId: string): boolean => {
-    const key = observed.get(callId)?.validationKey
-    return key !== undefined && triggerKeys.has(key)
+    const evidence = observed.get(callId)
+    return evidence?.validationKey !== undefined && triggerKeys.has(evidence.validationKey)
+      || evidence?.fingerprint !== undefined && triggerFingerprints.has(evidence.fingerprint)
   }
   // A successful run_code wrapper only reports that its PTC program settled.
   // Its concrete sub-dispatches carry the actual tools, arguments and outcomes,
@@ -316,7 +330,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
   const allActivity = [...callById.entries()]
     .filter(([callId, call]) => deltaSeqs.has(eventSeq(call.event))
       || (resultById.get(callId) !== undefined && deltaSeqs.has(eventSeq(resultById.get(callId)!.event))))
-    .map(([callId, call]) => {
+    .map<ActivityRecord>(([callId, call]) => {
       const result = resultById.get(callId)
       const canonical = observed.get(callId)
       return {
@@ -331,8 +345,12 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
         }),
       }
     })
-  const activity = allActivity
-    .filter(item => !(item.tool === 'run_code' && item.outcome === 'succeeded' && ptcParents.has(item.call_id)))
+  const activity = allActivity.flatMap(item => {
+    if (item.tool !== 'run_code' || !ptcParents.has(item.call_id)) return [item]
+    if (item.outcome === 'succeeded') return []
+    const { arguments_summary: _arguments, ...wrapper } = item
+    return [{ ...wrapper, ...('result_summary' in wrapper ? { result_summary: boundedText(String(wrapper.result_summary), WRAPPER_FAILURE_SUMMARY_BYTES) } : {}) }]
+  })
   const failures = boundedEvidence(activity.filter(item => item.outcome === 'failed'), item => triggerRelated(item.call_id), MAX_FAILURES)
     .map(item => ({
       call_id: item.call_id,
@@ -341,6 +359,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     }))
   const validationEvidence = activity.flatMap(item => {
     const call = callById.get(item.call_id)
+    if (call?.name === 'run_code' && ptcParents.has(item.call_id)) return []
     const label = call && validationLabel(call.name, call.args)
     if (!label || item.outcome === 'result-not-observed') return []
     return [{
@@ -364,10 +383,6 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     other: validationEvidence.length - succeededChecks - failedChecks,
     relevant: validationEvidence.filter(entry => entry.relevant_to_problem).length,
   }
-  const changedPaths = unique(activity.flatMap(item => {
-    const call = callById.get(item.call_id)
-    return call && item.outcome === 'succeeded' && MUTATION_TOOL.test(call.name) ? collectPaths(call.args) : []
-  }))
   const attempts = unique(input.failedAttempts ?? []).map(action => ({
     action,
     outcome: 'failed',
@@ -402,6 +417,10 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
   const recentActivity = new Set(allActivity.slice(-BASE_ACTIVITY_ENTRIES).map(entry => entry.call_id))
   const activityCandidates = activity.filter(item => recentActivity.has(item.call_id) || referencedActivity.has(item.call_id))
   const toolActivity = boundedEvidence(activityCandidates, item => referencedActivity.has(item.call_id), MAX_ACTIVITY_ENTRIES)
+  const changedPaths = unique(toolActivity.flatMap(item => {
+    const call = callById.get(item.call_id)
+    return call && item.outcome === 'succeeded' && MUTATION_TOOL.test(call.name) ? collectPaths(call.args) : []
+  }))
   const assignment = requesterAssignment(input.requester, input.root, requesterEvents, taskStartSeq)
   // Durable goal state remains authoritative until cleared; only transcript evidence is task-bounded.
   const task = rootTask(rootEvents)

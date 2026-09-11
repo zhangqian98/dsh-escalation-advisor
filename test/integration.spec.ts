@@ -359,15 +359,19 @@ describe('real DSH AgentLoop and spawn integration', () => {
         textResponse('Verdict submitted.'),
       ],
     }, { defaultEnabledTools: ['scoped_read'], readOnlyTools: ['scoped_read'] })
-    const presetKey = {}
+    const presetKey = {}, childPresetKey = {}
     await h.ctx.plugin({
       name: 'fixture-agent-preset', inject: ['tools'], apply(context: Context) {
         const preset = createScope(context, presetKey)
-        context.effect(() => preset.rawDispose, 'fixture preset scope')
-        preset.ctx.tools.register(defineContentToolFixture({
+        const childPreset = createScope(context, childPresetKey)
+        context.effect(function* () { yield preset.rawDispose; yield childPreset.rawDispose }, 'fixture preset scopes')
+        const scopedRead = defineContentToolFixture({
           name: 'scoped_read', description: 'Read data visible only in the requester preset.', parameters: {},
           execute: async () => { reads += 1; return [{ type: 'text', text: 'scoped evidence' }] },
-        }))
+        })
+        preset.ctx.tools.register(scopedRead)
+        childPreset.ctx.tools.register(scopedRead)
+        childPreset.ctx.tools.presentAs('ptc')
         bindScopeParent(h.root, presetKey)
         class FixtureAgentPresets extends Service {
           constructor(serviceContext: Context) { super(serviceContext, 'agentPresets') }
@@ -375,7 +379,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
           composeFrom(childContext: Context): string {
             const childKey = scopeOf(childContext)
             if (!childKey) throw new Error('Fixture child has no agent scope')
-            bindScopeParent(childKey, presetKey)
+            bindScopeParent(childKey, childPresetKey)
             return 'fixture-preset'
           }
         }
@@ -390,6 +394,9 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const advisorRequests = h.adapter.forModel('advisor')
     expect(advisorRequests.length, JSON.stringify(advisorRunHistory(h.root), null, 2)).toBeGreaterThan(0)
     expect((advisorRequests[0]!.request.tools ?? []).map(tool => tool.name)).toContain('scoped_read')
+    expect((advisorRequests[0]!.request.tools ?? []).map(tool => tool.name)).toContain('advisor_verdict')
+    expect((advisorRequests[0]!.request.tools ?? []).map(tool => tool.name)).not.toContain('run_code')
+    expect(systemPromptOf(advisorRequests[0]!.request)).not.toContain('Writing code for run_code')
     expect(reads).toBe(1)
     expect(advisorChildren(h)[0]!.agent.session.snapshotEvents()).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'advisor/identity', data: expect.objectContaining({ allowedTools: expect.arrayContaining(['scoped_read']) }) }),

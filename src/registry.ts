@@ -101,7 +101,13 @@ export class AdvisorRegistry {
   }
 
   private restrict(agent: Agent, identity: AdvisorIdentity): void {
-    this.ctx.effect(() => agent.ctx.tools.restrict({ allow: identity.allowedTools.filter(name => name !== 'run_code') }), 'advisor: descendant tool ceiling')
+    this.ctx.effect(function* () {
+      // Advisor children have a small, explicit tool surface. Native schemas are
+      // materially smaller than the inherited PTC SDK and let the model call the
+      // same permitted tools without carrying the parent's run_code manual.
+      yield agent.ctx.tools.presentAs('native')
+      yield agent.ctx.tools.restrict({ allow: identity.allowedTools.filter(name => name !== 'run_code') })
+    }, 'advisor: native descendant tool ceiling')
   }
 
   identity(agent: Agent): AdvisorIdentity | undefined { return this.identities.get(String(agent.id)) }

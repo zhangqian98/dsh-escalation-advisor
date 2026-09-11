@@ -136,6 +136,16 @@ describe('buildCasePacket', () => {
     expect(packet.prior_advice[0].summary).toBe('Check auth ordering')
     expect(output.prompt).not.toContain('PRIVATE_WORKER_ADVICE')
   })
+
+  it('relates the triggering failure by fingerprint when it has no validation key', () => {
+    const root = fakeAgent('root', [user(0, 'Fix the parser'), call(1, 'broken', 'bash', { command: 'npm test parser' }), result(2, 'broken', 'parse failed', true)])
+    const packet = JSON.parse(buildCasePacket({
+      ...baseInput(root, root), mode: 'escalation',
+      trigger: { turn: 2, score: 4, shouldConsult: true, problemFingerprint: 'failure-fp', signals: [{ kind: 'tool-error', weight: 2, fingerprint: 'failure-fp', detail: 'bash: parse failed' }] },
+      observedEvidence: [{ callId: 'broken', tool: 'bash', argumentsSummary: 'npm test parser', outcome: 'unknown-failure', errorSummary: 'parse failed', repeatCount: 1, fingerprint: 'failure-fp' }],
+    }).prompt)
+    expect(packet.validation[0]).toMatchObject({ call_id: 'broken', relevant_to_problem: true })
+  })
   it('builds redacted JSON from durable root, child, and paired tool events', () => {
     const root = fakeAgent('root', [user(0, 'Ship the Unicode feature 你好')])
     const worker = fakeAgent('worker', [
@@ -274,10 +284,13 @@ describe('buildCasePacket', () => {
     const packet = JSON.parse(buildCasePacket(baseInput(root, root)).prompt)
     expect(packet.tool_activity.map((entry: { call_id: string }) => entry.call_id)).toEqual(['ptc', 'ptc:code:1'])
     expect(packet.failures).toEqual([{ call_id: 'ptc', tool: 'run_code', repeat_count: 1 }])
+    const wrapper = packet.tool_activity[0]
+    expect(wrapper).not.toHaveProperty('arguments_summary')
+    expect(Buffer.byteLength(wrapper.result_summary)).toBeLessThanOrEqual(400)
   })
 
   it('does not backfill old activity after removing successful PTC wrappers', () => {
-    const events: FakeEvent[] = [user(0, 'Inspect recent activity'), call(1, 'stale', 'read', { path: 'STALE_ACTIVITY_MARKER' }), result(2, 'stale', 'old')]
+    const events: FakeEvent[] = [user(0, 'Inspect recent activity'), call(1, 'stale', 'edit', { path: 'STALE_ACTIVITY_MARKER' }), result(2, 'stale', 'old')]
     let seq = 3
     for (let index = 0; index < 8; index++) {
       const parentCallId = 'ptc-' + index
@@ -292,6 +305,7 @@ describe('buildCasePacket', () => {
     expect(packet.tool_activity).toHaveLength(8)
     expect(packet.tool_activity.every((entry: { tool: string }) => entry.tool === 'read')).toBe(true)
     expect(JSON.stringify(packet.tool_activity)).not.toContain('STALE_ACTIVITY_MARKER')
+    expect(packet.workspace.observed_changed_paths).not.toContain('STALE_ACTIVITY_MARKER')
   })
 
   it.each(['code', 'ptc'])('ignores orphan %s results and excludes nested Advisor transport', (tag) => {
@@ -327,11 +341,11 @@ describe('buildCasePacket', () => {
       observedEvidence: [{ callId: 'related', tool: 'exec_command', argumentsSummary: 'npm test auth', outcome: 'validation-failure', errorSummary: 'auth assertion failed', repeatCount: 1, validationKey: 'auth-test' }],
     }).prompt)
     expect(packet.validation.map((entry: { call_id: string }) => entry.call_id))
-      .toEqual(['ok-28', 'ok-29', 'related', 'bad-0', 'bad-1', 'bad-2', 'bad-3'])
-    expect(packet.validation[2]).toMatchObject({ relevant_to_problem: true, outcome: 'failed' })
+      .toEqual(['ok-29', 'related', 'bad-1', 'bad-2', 'bad-3'])
+    expect(packet.validation[1]).toMatchObject({ relevant_to_problem: true, outcome: 'failed' })
     // The caps drop rows, so the aggregate has to carry the count the advisor
     // would otherwise lose.
-    expect(packet.validation_summary).toEqual({ total: 35, retained: 7, omitted: 28, succeeded: 30, failed: 5, other: 0, relevant: 1 })
+    expect(packet.validation_summary).toEqual({ total: 35, retained: 5, omitted: 30, succeeded: 30, failed: 5, other: 0, relevant: 1 })
   })
 
   it('keeps only the newest failures and never a stale successful backlog', () => {
@@ -344,9 +358,9 @@ describe('buildCasePacket', () => {
     const root = fakeAgent('root', events)
     const packet = JSON.parse(buildCasePacket(baseInput(root, root)).prompt)
     expect(packet.failures.map((entry: { call_id: string }) => entry.call_id))
-      .toEqual(['bad-4', 'bad-5', 'bad-6', 'bad-7', 'bad-8', 'bad-9', 'bad-10', 'bad-11'])
-    expect(packet.validation).toHaveLength(10)
-    expect(packet.validation_summary).toMatchObject({ total: 12, retained: 10, omitted: 2, succeeded: 0, failed: 12, other: 0, relevant: 0 })
+      .toEqual(['bad-8', 'bad-9', 'bad-10', 'bad-11'])
+    expect(packet.validation).toHaveLength(3)
+    expect(packet.validation_summary).toMatchObject({ total: 12, retained: 3, omitted: 9, succeeded: 0, failed: 12, other: 0, relevant: 0 })
   })
   it('keeps a trigger-related failure that predates eight unrelated ones', () => {
     const events: FakeEvent[] = [user(0, 'Fix the auth regression')]
@@ -365,7 +379,7 @@ describe('buildCasePacket', () => {
       observedEvidence: [{ callId: 'auth-dead', tool: 'exec_command', argumentsSummary: 'npm test auth', outcome: 'validation-failure', errorSummary: 'auth assertion failed', repeatCount: 3, validationKey: 'auth-test' }],
     }).prompt)
     expect(packet.failures.map((entry: { call_id: string }) => entry.call_id))
-      .toEqual(['auth-dead', 'noise-2', 'noise-3', 'noise-4', 'noise-5', 'noise-6', 'noise-7', 'noise-8'])
+      .toEqual(['auth-dead', 'noise-6', 'noise-7', 'noise-8'])
     expect(packet.failures[0]).toMatchObject({ call_id: 'auth-dead', repeat_count: 3, tool: 'exec_command' })
   })
 
@@ -394,7 +408,7 @@ describe('buildCasePacket', () => {
     }).prompt)
     expect(packet.validation).toHaveLength(10)
     expect(packet.validation.every((entry: { relevant_to_problem: boolean }) => entry.relevant_to_problem)).toBe(true)
-    expect(packet.failures).toHaveLength(8)
+    expect(packet.failures).toHaveLength(4)
     expect(packet.failures.every((entry: { call_id: string }) => entry.call_id.startsWith('related-'))).toBe(true)
   })
 })

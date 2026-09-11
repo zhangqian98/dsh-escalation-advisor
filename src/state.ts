@@ -61,6 +61,7 @@ export interface ToolOutcome {
 export interface TrackerEvidence {
   callId?: string
   tool: string
+  fingerprint?: string
   argumentsSummary: string
   outcome: OutcomeClass
   errorSummary: string
@@ -434,7 +435,7 @@ export class EscalationTracker {
     const state = this.state(sessionId), outcome = classifyToolOutcome(observed)
     const failureText = observed.errorMessage || observed.contentText || JSON.stringify(observed.value ?? '')
     const fingerprint = failureFingerprint(observed.name, failureText)
-    state.evidence.push({ ...(observed.callId ? { callId: observed.callId } : {}), tool: observed.name, argumentsSummary: JSON.stringify(observed.arguments ?? {}).slice(0, 2400), outcome: outcome.class, errorSummary: failureText.slice(0, 2400), repeatCount: state.lastFailureFingerprint === fingerprint ? state.repeatedFailureCount + 1 : 1, ...(outcome.validationKey ? { validationKey: outcome.validationKey } : {}) })
+    state.evidence.push({ ...(observed.callId ? { callId: observed.callId } : {}), tool: observed.name, fingerprint, argumentsSummary: JSON.stringify(observed.arguments ?? {}).slice(0, 2400), outcome: outcome.class, errorSummary: failureText.slice(0, 2400), repeatCount: state.lastFailureFingerprint === fingerprint ? state.repeatedFailureCount + 1 : 1, ...(outcome.validationKey ? { validationKey: outcome.validationKey } : {}) })
     if (state.evidence.length > 24) state.evidence.shift()
     if (outcome.class === 'permission-denial' || outcome.class === 'cancelled' || outcome.class === 'timeout' || outcome.class === 'tool-infrastructure-error' || outcome.class === 'expected-negative') return
     if (outcome.class === 'validation-failure' || outcome.class === 'unknown-failure') {

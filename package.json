@@ -1,6 +1,6 @@
 {
   "name": "dsh-escalation-advisor",
-  "version": "0.1.0-alpha.23",
+  "version": "0.1.0-alpha.24",
   "description": "Three-mode visible-session advisor plugin for DeepSeek Harness with configurable tool permissions, local-subagent coverage, and task-tree budgets.",
   "type": "module",
   "main": "./lib/index.js",

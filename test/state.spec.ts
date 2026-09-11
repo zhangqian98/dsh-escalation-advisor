@@ -15,6 +15,7 @@ describe('EscalationTracker', () => {
     const tracker = new EscalationTracker(), failure = { name: 'bash', arguments: { command: 'pnpm test' }, isError: true, errorMessage: 'Assertion failed at src/a.ts:10:2', contentText: 'Assertion failed' }
     tracker.observe('s', failure, config); expect(tracker.decision('s', 1, config).shouldConsult).toBe(false)
     tracker.observe('s', failure, config); const decision = tracker.decision('s', 2, config); expect(decision.shouldConsult).toBe(true); expect(decision.score).toBeGreaterThanOrEqual(config.scoreThreshold)
+    expect(decision.evidence?.at(-1)?.fingerprint).toBe(decision.problemFingerprint)
   })
   it('deduplicates one problem after consultation', () => {
     const tracker = new EscalationTracker(), failure = { name: 'bash', arguments: { command: 'pnpm test' }, isError: true, errorMessage: 'same error', contentText: 'same error' }
