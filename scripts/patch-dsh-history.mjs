@@ -10,7 +10,7 @@ export const ADVISOR_HISTORY_FIELDS = {
   'advisor/policy': { required: [], optional: ['version', 'mode', 'timeoutMs', 'inheritDefaultTools', 'allowTools', 'denyTools', 'escalationWait', 'continuousWait', 'toolPreset', 'tools'] },
   'advisor/model': { required: ['version', 'selection'], optional: [] },
   'advisor/identity': { required: ['version', 'invocationId', 'advisorId', 'requesterId', 'rootId', 'allowedTools'], optional: [] },
-  'advisor/run': { required: ['version', 'id', 'requesterId', 'mode', 'turn', 'taskRevision', 'attempt', 'status', 'timestamp'], optional: ['step', 'fingerprint', 'score', 'childSessionId', 'severity', 'summary', 'question', 'responseText', 'error', 'usage', 'verdictTool', 'structuredFallback'] },
+  'advisor/run': { required: ['version', 'id', 'requesterId', 'mode', 'turn', 'taskRevision', 'attempt', 'status', 'timestamp'], optional: ['step', 'fingerprint', 'score', 'childSessionId', 'severity', 'summary', 'question', 'responseText', 'error', 'usage', 'verdictTool', 'structuredFallback', 'collectorId', 'turns'] },
 }
 
 export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIELDS) {
@@ -59,7 +59,8 @@ export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIEL
   oneOf(data.mode, ['manual', 'escalation', 'continuous'])
   oneOf(data.status, ['reserved', 'started', 'delivered', 'stale', 'failed-transient', 'failed-permanent', 'cancelled', 'skipped'])
   if (data.severity !== undefined) oneOf(data.severity, ['none', 'nit', 'concern', 'blocker'])
-  for (const key of ['fingerprint', 'childSessionId', 'summary', 'question', 'responseText', 'error']) if (data[key] !== undefined) string(data[key])
+  for (const key of ['fingerprint', 'childSessionId', 'summary', 'question', 'responseText', 'error', 'collectorId']) if (data[key] !== undefined) { string(data[key]); if (key === 'collectorId' && !data[key]) fail('empty collector') }
+  if (data.turns !== undefined) { count(data.turns); if (data.turns < 1) fail('invalid turns') }
   if (data.structuredFallback !== undefined && typeof data.structuredFallback !== 'boolean') fail('invalid fallback flag')
   if (data.usage !== undefined) {
     if (!object(data.usage) || Object.keys(data.usage).some(key => !['inputTokens', 'outputTokens'].includes(key))) fail('invalid usage')
