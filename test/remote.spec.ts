@@ -112,6 +112,32 @@ describe('Advisor Remote policy API', () => {
     expect(root.session.seq).toBe(before)
   })
 
+  it('keys every consultation turn apart so review returns that turn\'s own report', async () => {
+    harness = await createIntegrationHarness({})
+    const { ctx, root } = harness
+    // Three turns of ONE conversation: they share `id` and child session, and
+    // `attempt` restarts on every follow-up call — the collector identity is
+    // the only thing that distinguishes the rows.
+    const base = { version: 1 as const, id: 'multi-turn', requesterId: String(root.id), mode: 'escalation' as const, taskRevision: 'task', attempt: 1, status: 'delivered' as const, childSessionId: 'advisor-child' }
+    for (const [index, requesterTurn] of [[0, 10], [1, 12], [2, 15]] as const) {
+      const text = `[Strong advisor — escalation; severity=concern; child=advisor-child]\nTurn ${index + 1} summary\nTurn ${index + 1} diagnosis`
+      root.session.append('advisor/run', { ...base, turn: requesterTurn, timestamp: new Date(1700000000000 + index * 1000).toISOString(), collectorId: `multi-turn#${index}.1`, turns: index + 1, question: `question-${index + 1}`, summary: `Turn ${index + 1} summary`, responseText: text })
+      root.session.append('user/message', createUserMessage({ source: { kind: 'plugin', plugin: 'dsh-escalation-advisor' }, content: [{ type: 'text', text }] }), { surfaceOp: 'append' })
+    }
+    const snapshot = JSON.parse(ctx.advisor.snapshot(String(root.id)))
+    expect(snapshot.runs).toHaveLength(3)
+    expect(new Set(snapshot.runs.map((run: { runKey: string }) => run.runKey)).size).toBe(3)
+    // Each row expands to ITS OWN injected report — never the latest turn's copy.
+    for (const [index, run] of (snapshot.runs as { runKey: string }[]).entries()) {
+      const report = JSON.parse(ctx.advisor.review(String(root.id), run.runKey))
+      expect(report.question).toBe(`question-${index + 1}`)
+      expect(report.source).toBe('context')
+      expect(report.text).toContain(`Turn ${index + 1} diagnosis`)
+    }
+    // The bare consultation id still resolves — to the LAST turn of the conversation.
+    expect(JSON.parse(ctx.advisor.review(String(root.id), 'multi-turn')).question).toBe('question-3')
+  })
+
   it('bounds the obligation payload to one task and marks it runtime-only', () => {
     const store = new ObligationStore()
     const item = store.recordFailure({ sessionId: 's1', taskStartSeq: 100, scope: 'task:s1:100', seq: 110, at: 1000, validationKey: 'k-auth', summary: 'x'.repeat(500) })

@@ -56,3 +56,14 @@ export function advisorRunHistory(root: Agent): AdvisorRunRecord[] {
   }
   return [...runs.values()].slice(-100)
 }
+
+/**
+ * The stable identity of ONE consultation-turn row for snapshots, review
+ * lookups, and UI keys: the per-attempt collector identity when the record
+ * carries one, else a best-effort key for history written before collector
+ * ids existed. `id` alone names the whole conversation and `attempt` restarts
+ * on every follow-up call, so neither can name a row on its own.
+ */
+export function advisorRunKey(run: AdvisorRunRecord): string {
+  return run.collectorId ?? `${run.id}:${run.turn}:${run.attempt}:${run.timestamp}`
+}

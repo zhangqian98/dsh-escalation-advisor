@@ -4,7 +4,7 @@ import { Remote, TypertRemoteService, type InvocationDescriptor } from '@deepsee
 import type {} from '@deepseek-ai/dsh-typert-registry'
 import type { Config } from './config.js'
 import { catalogFor, resetPolicy, updateModeOverride, updateTimeoutOverride, updateToolOverride, updateWaitOverride } from './policy.js'
-import { advisorRunHistory } from './telemetry.js'
+import { advisorRunHistory, advisorRunKey } from './telemetry.js'
 import type { AdvisorTaskLimiter } from './task-limiter.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
@@ -103,7 +103,7 @@ export class AdvisorRemoteService extends TypertRemoteService {
     const obligations = this.config.obligations
     return JSON.stringify({ ...catalogFor(defaults, root),
       model: configuredModel(advisorModelConfig(defaults, root.session)), modelDefault: configuredModel(defaults), modelOverridden: sessionModelSelection(root.session) !== null,
-      guidance: this.config.guidanceFor(root), runs: advisorRunHistory(root).map(({ responseText: _responseText, ...run }) => run), budget: this.config.limiter.snapshot(String(root.id)),
+      guidance: this.config.guidanceFor(root), runs: advisorRunHistory(root).map(run => ({ ...run, responseText: undefined, runKey: advisorRunKey(run) })), budget: this.config.limiter.snapshot(String(root.id)),
       obligations: advisorObligationSnapshot(obligations.store, String(root.id), obligations.taskStartSeq(root)) })
   }
 
@@ -112,17 +112,31 @@ export class AdvisorRemoteService extends TypertRemoteService {
   review(sessionId: string, runId: string): string {
     const root = this.root(sessionId)
     if (!runId || runId.length > 256) throw new Error('Invalid Advisor consultation ID')
-    const run = advisorRunHistory(root).findLast(item => item.id === runId)
+    const history = advisorRunHistory(root)
+    // `runId` is the per-turn row key (`runKey` in the snapshot): the collector
+    // identity for records that carry one, the compatibility key otherwise. A
+    // bare consultation id still resolves, to the LAST turn of that
+    // conversation — the fallback every pre-runKey caller needs.
+    const run = history.find(item => advisorRunKey(item) === runId) ?? history.findLast(item => item.id === runId)
     if (!run) throw new Error('Advisor consultation does not belong to this task')
     const requester = run.requesterId === String(root.id) ? root : this.ctx.agents.get(SessionId(run.requesterId))
     if (run.childSessionId && requester) {
       const events = requester.session.snapshotEvents()
+      // The injected report names only the child, which every turn of one
+      // conversation shares: for a later turn the latest match is the WRONG
+      // one. The stored responseText is a prefix of this turn's own injected
+      // text, so an exact-prefix match picks the right copy; a row with no
+      // stored text keeps the legacy latest-match behavior.
+      const prefix = typeof run.responseText === 'string' && run.mode !== 'manual'
+        ? run.responseText.replace(/\n…\[truncated\]$/, '')
+        : ''
       for (let index = events.length - 1; index >= 0; index--) {
         const event = events[index]!
         if (event.type !== 'user/message' || event.data.source.kind !== 'plugin' || event.data.source.plugin !== 'dsh-escalation-advisor') continue
         const text = textContent(event.data.content)
         const child = text.match(/\[Strong advisor — (?:manual|escalation|continuous); severity=(?:none|nit|concern|blocker); child=([^\]\n]+)\]/)?.[1]
-        if (child === run.childSessionId) return JSON.stringify({ text, source: 'context', question: run.question })
+        if (child !== run.childSessionId) continue
+        if (prefix === '' || text.startsWith(prefix)) return JSON.stringify({ text, source: 'context', question: run.question })
       }
     }
     return JSON.stringify({ text: run.responseText ?? '', source: run.responseText ? run.mode === 'manual' ? 'tool-result' : 'report' : 'missing', question: run.question })

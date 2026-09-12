@@ -44,6 +44,14 @@ window.__ModuleLoader__.load({
 
     function isAdvisorMessage(data) { return data?.source?.kind === 'plugin' && data.source.plugin === 'dsh-escalation-advisor' }
 
+    // The same row key the Host computes (`advisorRunKey`): the per-turn
+    // collector identity when the record carries one, else a best-effort key
+    // for older history. `id` alone names the whole conversation, so it can
+    // never distinguish two turns of it.
+    function runKeyOf(run) {
+      return run?.runKey ?? run?.collectorId ?? [run?.id, run?.turn, run?.attempt, run?.timestamp].join(':')
+    }
+
     function manualAdviceText(run) {
       try {
         const reply = JSON.parse(run.responseText)
@@ -66,7 +74,7 @@ window.__ModuleLoader__.load({
       ctx.uiConversation.events.register({
         kind: 'advisor-chat-message', target: 'chat',
         match: event => event.type === 'user/message' && event.surfaceOp === 'append' && isAdvisorMessage(event.data) ? { id: String(event.data.id), role: 'start' }
-          : event.type === 'advisor/run' && event.data.mode === 'manual' && event.data.status === 'delivered' && typeof event.data.responseText === 'string' ? { id: 'manual:' + event.data.id + ':' + event.data.attempt, role: 'start' } : null,
+          : event.type === 'advisor/run' && event.data.mode === 'manual' && event.data.status === 'delivered' && typeof event.data.responseText === 'string' ? { id: 'manual:' + runKeyOf(event.data), role: 'start' } : null,
         start: (_context, { event }) => ({ kind: 'steering', messageId: event.data.id, seq: event.seq, time: event.time,
           content: event.type === 'advisor/run' ? [{ type: 'text', text: manualAdviceText(event.data) }] : event.data.content,
           source: event.type === 'advisor/run' ? { kind: 'plugin', plugin: 'dsh-escalation-advisor' } : event.data.source }),
@@ -300,22 +308,23 @@ window.__ModuleLoader__.load({
       const [review, setReview] = React.useState(null)
       const [error, setError] = React.useState('')
       const [loading, setLoading] = React.useState(false)
+      const runKey = runKeyOf(run)
       React.useEffect(() => {
         if (!open) return
         let active = true
         setLoading(true); setError('')
-        ctx.remote.advisor.review(sessionId, run.id).then(result => {
+        ctx.remote.advisor.review(sessionId, runKey).then(result => {
           if (!result.ok) throw new Error(result.error.message)
           const value = JSON.parse(result.value)
           if (active) setReview(value)
         }).catch(error => { if (active) setError(error instanceof Error ? error.message : String(error)) })
           .finally(() => { if (active) setLoading(false) })
         return () => { active = false }
-      }, [ctx, sessionId, run.id, run.status, open])
+      }, [ctx, sessionId, runKey, run.status, open])
       const mode = { manual: '模型主动咨询', escalation: '失败信号触发', continuous: '持续审阅' }[run.mode] || run.mode
       const status = { reserved: '等待开始', started: '正在咨询', delivered: '已返回', stale: '结果已过期', 'failed-transient': '暂时失败', 'failed-permanent': '失败', cancelled: '已取消', skipped: '已跳过' }[run.status] || run.status
-      return h('div', { 'data-advisor-review': run.id, style: { padding: '10px 0', borderTop: '1px solid var(--dsw-alias-border-l3, #eee)' } },
-        h('strong', null, '第 ' + run.turn + ' 轮 · ' + mode + ' · ' + status),
+      return h('div', { 'data-advisor-review': runKey, style: { padding: '10px 0', borderTop: '1px solid var(--dsw-alias-border-l3, #eee)' } },
+        h('strong', null, '第 ' + run.turn + ' 轮 · ' + mode + ' · ' + status + (typeof run.turns === 'number' && run.turns > 1 ? ' · 咨询第 ' + run.turns + ' 轮' : '')),
         run.score !== undefined && h('p', { style: css.hint }, '触发分数 ' + run.score + (run.step === undefined ? '' : ' · 第 ' + run.step + ' 步')),
         (run.summary || run.error) && h('p', { style: { ...css.hint, overflowWrap: 'anywhere' } }, run.summary || run.error),
         run.status === 'delivered' && h('button', { type: 'button', style: css.button, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, open ? '收起完整内容' : run.mode === 'manual' ? '查看完整回复' : '查看完整回注'),
@@ -481,7 +490,7 @@ window.__ModuleLoader__.load({
             h('details', { open: true, style: { marginTop: 12, fontSize: 13 } }, h('summary', { style: { cursor: 'pointer' } }, '咨询记录与回注（' + (catalog.runs?.length ?? 0) + '）'),
               h('p', { style: css.hint }, '预算占用 ' + (catalog.budget?.used ?? 0) + ' · 活跃 ' + (catalog.budget?.active ?? 0) + ' · 排队 ' + (catalog.budget?.queued ?? 0)),
               h('button', { type: 'button', style: css.mini, disabled: !!busy, onClick: load }, '刷新状态'),
-              ...(catalog.runs ?? []).slice(-10).reverse().map(run => h(AdvisorReview, { key: sessionId + ':' + run.id + ':' + run.attempt, ctx, sessionId, run })))),
+              ...(catalog.runs ?? []).slice(-10).reverse().map(run => h(AdvisorReview, { key: sessionId + ':' + runKeyOf(run), ctx, sessionId, run })))),
             catalog && h('details', { open: true, style: { marginTop: 12, fontSize: 13 } }, h('summary', { style: { cursor: 'pointer' } }, '未完成验证（提醒，非阻断）（' + (catalog.obligations?.openCount ?? 0) + '）'),
               h(AdvisorObligations, { obligations: catalog.obligations })),
           !catalog && !error && h('p', { style: css.hint }, '正在读取当前会话设置…')))

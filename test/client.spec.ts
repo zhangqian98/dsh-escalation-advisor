@@ -67,8 +67,15 @@ describe('Advisor Web companion', () => {
       const unrelated = { node: { data: { source: { kind: 'plugin', plugin: 'other-plugin' } } } }
       expect(renderToString(React.createElement(nodeRenders.get('context')!, unrelated))).toContain('native context')
       expect(messageDefinition.match({ ...event, data: { ...event.data, source: { kind: 'user' } } })).toBeNull()
-      const manual = { type: 'advisor/run', seq: 51, time: 1001, data: { id: 'manual-review', attempt: 1, mode: 'manual', status: 'delivered', childSessionId: 'manual-child', responseText: JSON.stringify({ severity: 'concern', summary: 'Compare designs before editing', diagnosis: 'Evidence is incomplete', next_actions: ['Check concurrency'] }) } }
-      expect(messageDefinition.match(manual)).toMatchObject({ id: 'manual:manual-review:1' })
+      const manual = { type: 'advisor/run', seq: 51, time: 1001, data: { id: 'manual-review', turn: 1, attempt: 1, timestamp: '2026-01-01T00:00:00Z', collectorId: 'manual-review#0.1', turns: 1, mode: 'manual', status: 'delivered', childSessionId: 'manual-child', responseText: JSON.stringify({ severity: 'concern', summary: 'Compare designs before editing', diagnosis: 'Evidence is incomplete', next_actions: ['Check concurrency'] }) } }
+      expect(messageDefinition.match(manual)).toMatchObject({ id: 'manual:manual-review#0.1' })
+      // A second turn of the same consultation shares `id` and `attempt`, so the
+      // message identity must come from the per-turn collector id instead.
+      const turnTwo = { ...manual, seq: 52, time: 1002, data: { ...manual.data, collectorId: 'manual-review#1.1', turns: 2 } }
+      expect(messageDefinition.match(turnTwo)).toMatchObject({ id: 'manual:manual-review#1.1' })
+      // Records written before collector ids existed fall back to a composite key.
+      const legacy = { ...manual, data: { ...manual.data, collectorId: undefined, turns: undefined } }
+      expect(messageDefinition.match(legacy)).toMatchObject({ id: 'manual:manual-review:1:1:2026-01-01T00:00:00Z' })
       const manualState = messageDefinition.start({}, { event: manual })
       const manualBubble = renderToString(React.createElement(nodeRenders.get('steering')!, { node: { data: manualState } }))
       expect(manualBubble).toContain('Advisor · 主动咨询')
