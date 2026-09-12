@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
 import { deadlineSignal, installTurnObserver } from '../src/model-runner.js'
 import { defineContentToolFixture, defineTool } from '@deepseek-ai/dsh-tools'
+import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
 import { AdvisorRegistry } from '../src/registry.js'
 import { classifyToolOutcome, EscalationTracker } from '../src/state.js'
 import { ObligationStore } from '../src/obligations.js'
@@ -18,6 +19,7 @@ import {
   textResponse,
   toolCallResponse,
   type IntegrationHarness,
+  type ScriptEntry,
 } from './harness.js'
 
 const opened: IntegrationHarness[] = []
@@ -458,7 +460,7 @@ describe('P1: watermark survives evidence saturation and conclusions', () => {
       {
         // The adapter shifts one entry per request, so the queue-draining
         // function must fill the script: every model call pops a weak step.
-        weak: Array.from({ length: 60 }, () => () => weakSteps.shift() ?? textResponse('idle')),
+        weak: Array.from({ length: 60 }, () => () => (weakSteps.shift() as StreamChunk[] | undefined) ?? textResponse('idle')),
         advisor: advisorScript(
           advisorVerdictResponse({ summary: 'review-a' }),
           advisorVerdictResponse({ summary: 'review-b' }),
@@ -471,14 +473,14 @@ describe('P1: watermark survives evidence saturation and conclusions', () => {
     h.ctx.tools.register(defineTool({
       name: 'bash', description: 'Scripted shell.',
       parameters: { command: { type: 'string', required: true } },
-      output: { schema: { type: 'object', additionalProperties: false, properties: {} } },
+      output: { schema: { type: 'object', additionalProperties: false, properties: {} }, render: () => [{ type: 'text' as const, text: '' }] },
       execute: async (args) => { throw new Error('FAIL ' + String(args.command)) },
     }))
     h.ctx.tools.register(defineContentToolFixture({ name: 'edit', description: 'Fixture edit', parameters: { file_path: { type: 'string' }, content: { type: 'string' } }, async execute(args) { return [{ type: 'text', text: 'wrote ' + String(args.file_path) }] } }))
     await h.runRoot('Fix both suites')
     // Drain the queue, then keep spending goal rounds so the last failure gets a
     // fresh turn for its escalation check.
-    for (let round = 0; round < 12; round++) await h.runRoot('goal round ' + round, { kind: 'goal' })
+    for (let round = 0; round < 12; round++) await h.runRoot('goal round ' + round, { kind: 'goal', goalId: brandString<Branded<'GoalId'>>('watermark-fp'), revision: 1, round: round + 1 })
     expect(weakSteps).toHaveLength(0)
     // A's review, B's post-edit review, then A again: the third consult only
     // exists because A's coverage epoch is its own — a shared epoch moved by
