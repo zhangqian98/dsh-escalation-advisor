@@ -149,7 +149,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const manualCalls = new Map<string, number>()
   const manualReserved = new Map<string, number>()
   const revisions = new Map<string, number>()
-  const hiddenTools = new Map<Agent, () => void>()
+  const hiddenTools = new Map<Agent, { dispose: () => void; signature: string }>()
   /** True while the current root turn originated from an admitted goal round. */
   const goalRoundActive = new Set<string>()
   const inFlight = new Set<string>()
@@ -205,7 +205,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const disposed = new AbortController()
   ctx.effect(() => () => {
     disposed.abort()
-    for (const dispose of hiddenTools.values()) dispose()
+    for (const entry of hiddenTools.values()) entry.dispose()
     hiddenTools.clear()
   }, 'advisor: abort work and remove tool masks')
   installAdvisorPolicyCommand(ctx, currentConfig)
@@ -216,8 +216,17 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     return routeConfigured(config) && coverageEnabled(config, 'manual', roleOf(agent))
   }
   const refreshTool = (agent: Agent): void => {
-    if (manualEnabled(agent)) { hiddenTools.get(agent)?.(); hiddenTools.delete(agent) }
-    else if (!hiddenTools.has(agent)) hiddenTools.set(agent, agent.ctx.tools.restrict({ deny: [ADVISOR_TOOL_NAME] }))
+    // The verdict channel is host-wide only so the Advisor child can inherit it;
+    // every other agent must never see the tool. consult_advisor additionally
+    // hides wherever manual consultation is off for this agent.
+    const deny: string[] = []
+    if (registry.identity(agent) === undefined) deny.push(ADVISOR_VERDICT_TOOL)
+    if (!manualEnabled(agent)) deny.push(ADVISOR_TOOL_NAME)
+    const signature = deny.join(',')
+    if (hiddenTools.get(agent)?.signature === signature) return
+    hiddenTools.get(agent)?.dispose()
+    if (deny.length === 0) { hiddenTools.delete(agent); return }
+    hiddenTools.set(agent, { dispose: agent.ctx.tools.restrict({ deny }), signature })
   }
   const guidanceFor = (agent: Agent) => {
     const config = configFor(agent)
@@ -282,7 +291,11 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   })
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     if (context.agent) refreshTool(context.agent)
-    const assembly = await next()
+    let assembly = await next()
+    // The verdict channel never leaves the Advisor child's own surface.
+    if (context.agent && registry.identity(context.agent) === undefined) {
+      assembly = { ...assembly, tools: assembly.tools.filter(tool => tool.name !== ADVISOR_VERDICT_TOOL) }
+    }
     if (!context.agent || !manualEnabled(context.agent) || ctx.tools.get(ADVISOR_TOOL_NAME, context.agent) === undefined) {
       return { ...assembly, tools: assembly.tools.filter(tool => tool.name !== ADVISOR_TOOL_NAME), sections: assembly.sections.filter(section => section.name !== 'escalation-advisor-guidance'), contexts: assembly.contexts.filter(context => context.name !== 'advisor:guidance') }
     }
@@ -1007,7 +1020,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       }
     }
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
-    hiddenTools.get(agent)?.(); hiddenTools.delete(agent)
+    hiddenTools.get(agent)?.dispose(); hiddenTools.delete(agent)
     for (const controller of controllers.get(key) ?? []) controller.abort()
     controllers.delete(key)
     if (agent.session.header.parentSession === undefined) { limiter.clear(key); registry.clearRoot(key); workspaceEpoch.delete(key); structuralEpoch.delete(key); mutationPending.delete(key) }

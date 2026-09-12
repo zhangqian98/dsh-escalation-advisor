@@ -170,7 +170,7 @@ export function catalogFor(config: Config, agent: Agent): AdvisorPolicyCatalog {
   const allowedTools = policy.allowedTools.filter(name => !isCapabilityAmplifier(agent.ctx, name, config.capabilityAmplifierTools))
   const tools = agent.ctx.get('tools')
   const schemas = tools?.schemas(agent) ?? []
-  const hidden = new Set(['consult_advisor', 'structured_output', 'run_code'])
+  const hidden = new Set(['consult_advisor', 'advisor_verdict', 'structured_output', 'run_code'])
   return {
     mode: policy.mode,
     modeDefault: config.mode,
@@ -203,6 +203,7 @@ export function catalogFor(config: Config, agent: Agent): AdvisorPolicyCatalog {
 export function updateToolOverride(session: Session, name: string, value: AdvisorToolOverride): void {
   const tool = cleanToolName(name)
   if (!tool) throw new Error('tool name is required')
+  if (tool === 'advisor_verdict') throw new Error('The Advisor verdict channel is not a configurable tool.')
   if (value === 'allow' && isReservedTool(tool)) throw new Error('Advisor delegation tools are permanently disabled.')
   const current = sessionPolicyOverride(session)
   const allow = new Set(normalizeToolList(current.allowTools))

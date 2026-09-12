@@ -827,6 +827,24 @@ describe('P1: masked exits, stale tasks, recurrence, and worker mirrors', () => 
     // rather than keep a proof that could predate an unobserved change.
     expect((await obligationsOf(h)).some(entry => entry.includes('/open'))).toBe(true)
   }, 20000)
+
+  it('hides the verdict channel from every non-Advisor agent', async () => {
+    const h = await harness({ weak: [textResponse('done')], advisor: advisorScript(advisorVerdictResponse()) })
+    await h.runRoot('Say hi')
+    // Root's own surface and every requester-model request must not name it —
+    // the tool exists host-wide only so the Advisor child can inherit it.
+    expect(h.ctx.tools.get('advisor_verdict', h.root)).toBeUndefined()
+    expect(h.ctx.tools.schemas(h.root).map(tool => tool.name)).not.toContain('advisor_verdict')
+    for (const { request } of h.adapter.forModel('weak')) {
+      expect((request.tools ?? []).map((tool: { name: string }) => tool.name)).not.toContain('advisor_verdict')
+    }
+    // The Advisor child still receives it and the consultation completes.
+    const answer = JSON.parse((await runTool(h, 'consult_advisor', { question: 'Review' })).text) as { status: string }
+    expect(answer.status).toBe('ok')
+    const advisorRequests = h.adapter.forModel('advisor')
+    expect(advisorRequests.length).toBeGreaterThan(0)
+    expect((advisorRequests[0]!.request.tools ?? []).map((tool: { name: string }) => tool.name)).toContain('advisor_verdict')
+  }, 20000)
 })
 describe('P1: manual consultations suppress repeat automatic consultations', () => {
   it('covers the live problems of a manual review, not just its version', async () => {
