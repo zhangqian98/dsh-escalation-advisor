@@ -223,8 +223,26 @@ export class AdvisorRegistry {
         this.identities.set(String(agent.id), { ...data, advisorId: typeof data.advisorId === 'string' ? data.advisorId : '' })
       }
     }
-    const restored = this.identities.get(String(agent.id))
-    if (restored) this.restrict(agent, restored)
+    let restored = this.identities.get(String(agent.id))
+    if (restored !== undefined) {
+      // A child cold-resumed by an in-flight follow-up still logs the PREVIOUS
+      // turn's identity, and the dispatching turn's re-key lands only after the
+      // delivery resolves — after the resumed child's first step, which the
+      // gate would then refuse as an invocation mismatch. A live reservation
+      // that names this exact child belongs to that dispatching turn (it exists
+      // only between a genuine callAdvisor's authorize and its revocation), so
+      // adopt its invocation now, before the child can claim anything.
+      for (const [invocationId, reservation] of this.pendingByInvocation) {
+        if (reservation.childSessionId !== String(agent.id) || reservation.expiresAt <= Date.now()) continue
+        const adopted: AdvisorIdentity = { ...restored, invocationId }
+        this.identities.set(String(agent.id), adopted)
+        agent.session.append('advisor/identity', adopted)
+        this.consumed.add(invocationId)
+        restored = adopted
+        break
+      }
+      this.restrict(agent, restored)
+    }
   }
 
   /**

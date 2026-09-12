@@ -82,6 +82,12 @@ export interface AdvisorRunResult {
    * live turn's child index.
    */
   collectorId: string
+  /**
+   * THIS turn's invocation identity, for the consultation record's scoped
+   * revocation on eviction: it lets a dropped route release only an activation
+   * this very turn still owns, never a newer turn's.
+   */
+  invocationId: string
   usage?: { inputTokens: number; outputTokens: number }
   /** Requester sequence at packet construction; the continuous-review cursor. */
   lastSeq: number
@@ -456,6 +462,15 @@ export async function callAdvisor(
     } catch (error) {
       throw new AdvisorUnavailableError('Unable to authorize the Advisor turn: ' + (error instanceof Error ? error.message : String(error)), 'retryable_start', true)
     }
+    if (conversationId !== '') {
+      // Re-key a LIVE child BEFORE dispatch: its claim can outrun this call's
+      // post-await continuation (measured on cold resume), and a step that sees
+      // the previous turn's invocation is refused as unauthorized. A child that
+      // is not materialized adopts this invocation when the registry attaches
+      // the pending reservation below — see AdvisorRegistry.attach.
+      const existing = ctx.agents.get(SessionId(conversationId))
+      if (existing) lifecycle.registry.ensureTurnIdentity(existing, identity.invocationId)
+    }
     let messageId: string
     onAbort = (): void => { closureCancelled = !deadline.timedOut(); interrupt(subagents, conversationId, parent) }
     try {
@@ -573,7 +588,7 @@ export async function callAdvisor(
         throw new AdvisorUnavailableError('Advisor returned no usable verdict: ' + reconciled.reason, NO_VERDICT)
       }
       published = true
-      return { verdict: reconciled.verdict, childSessionId: conversationId, consultationId, collectorId, lastSeq: requesterSeq(parent), ...usageOfTurn(ctx, conversationId, closure.turn) }
+      return { verdict: reconciled.verdict, childSessionId: conversationId, consultationId, collectorId, invocationId: identity.invocationId, lastSeq: requesterSeq(parent), ...usageOfTurn(ctx, conversationId, closure.turn) }
     } finally {
       callSignal.removeEventListener('abort', onAbort)
     }
