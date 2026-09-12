@@ -13,11 +13,9 @@ permissions:
 jobs:
   check:
     strategy:
-      # One DSH release failing must not cancel the rest of the matrix.
       fail-fast: false
       matrix:
         node: ['22.19.0', '24']
-        dsh: ['0.1.2-rc.1', '0.1.5-alpha.2', '0.1.5-rc.1']
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -30,10 +28,37 @@ jobs:
       # DSH packages currently require a newer npm resolver than the npm 11.3
       # bundled by some Node 24 images. Match the working community-plugin CI.
       - run: npm install --global npm@11.7.0
-      # Pin EVERY @deepseek-ai package — direct and transitive — to the matrix
-      # version, so the cell tests one complete isolated runtime closure.
-      - run: node scripts/pin-dsh.mjs ${{ matrix.dsh }}
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
       - run: npm run build
       - run: npm run pack:check
+
+  # Every cell runs the suite against one complete DEPLOYED DSH closure:
+  # `vitest.runtime.config.ts` aliases every @deepseek-ai import through the
+  # install rooted at DSH_RUNTIME_PACKAGE_JSON, so no sibling package can float
+  # to the repository's devDependency version.
+  runtime:
+    strategy:
+      # One DSH release failing must not cancel the rest of the matrix.
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24']
+        dsh: ['0.1.2-rc.1', '0.1.5-alpha.2', '0.1.5-rc.1']
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --global npm@11.7.0
+      # Vitest and TypeScript come from the plugin's own devDependency tree.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install the deployed DSH runtime closure
+        run: npm install --prefix "$RUNNER_TEMP/dsh-${{ matrix.dsh }}" --no-save --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
+      - name: Test against the deployed runtime
+        env:
+          DSH_RUNTIME_PACKAGE_JSON: ${{ runner.temp }}/dsh-${{ matrix.dsh }}/node_modules/@deepseek-ai/dsh/package.json
+        run: npx vitest run --config vitest.runtime.config.ts
