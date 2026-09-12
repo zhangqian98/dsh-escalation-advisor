@@ -346,10 +346,13 @@ function usageOfTurn(ctx: Context, childSessionId: string, turn: number): { usag
   const usage = { inputTokens: 0, outputTokens: 0 }
   let known = false, missing = false
   for (const event of events) {
-    if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') continue
+    // `assistant/attempt` exists only on newer DSH event unions; compare through
+    // string so the check compiles against older snapshots where it never fires.
+    const type: string = event.type
+    if (type !== 'assistant/message' && type !== 'assistant/attempt') continue
     const eventTurn = (event.data as { turn?: number }).turn
     if (eventTurn !== turn) continue
-    if (event.type === 'assistant/attempt') { missing = true; continue }
+    if (type === 'assistant/attempt') { missing = true; continue }
     const tokens = (event.data as { usage?: { inputTokens?: number; outputTokens?: number } }).usage
     if (typeof tokens?.inputTokens !== 'number' || typeof tokens?.outputTokens !== 'number') { missing = true; continue }
     known = true
