@@ -279,6 +279,85 @@ function boundedEvidence<T>(entries: readonly T[], pin: (entry: T) => boolean, l
   return [...keptPinned, ...keptRest].sort((left, right) => left - right).map(index => entries[index]!)
 }
 
+/**
+ * Degrade an oversized packet STRUCTURALLY, never by cutting serialized JSON:
+ * a truncated string is unparseable, so instead whole low-priority sections are
+ * dropped first (recent tail, tool activity, prior advice), then bounded lists
+ * and long text shrink, and every removal is recorded in `truncation` so the
+ * Advisor can see what the budget cost. The emitted packet always parses; the
+ * worst case is a minimal but well-formed packet.
+ */
+export function fitCasePacket(packet: Record<string, unknown>): Record<string, unknown> {
+  const bytes = () => Buffer.byteLength(JSON.stringify(packet))
+  if (bytes() <= MAX_CASE_PACKET_BYTES) return packet
+  const omitted: Record<string, number> = {}
+  const drop = (owner: unknown, key: string): void => {
+    const holder = record(owner), list = holder?.[key]
+    if (!Array.isArray(list) || list.length === 0) return
+    omitted[key] = (omitted[key] ?? 0) + list.length
+    holder![key] = []
+  }
+  const keep = (owner: unknown, key: string, count: number): void => {
+    const holder = record(owner), list = holder?.[key]
+    if (!Array.isArray(list) || list.length <= count) return
+    omitted[key] = (omitted[key] ?? 0) + list.length - count
+    holder![key] = list.slice(0, count)
+  }
+  const shrink = (owner: unknown, key: string, max: number): void => {
+    const holder = record(owner), value = holder?.[key]
+    if (typeof value === 'string' && Buffer.byteLength(value) > max) holder![key] = truncateUtf8(value, max)
+  }
+  const steps: (() => void)[] = [
+    () => drop(packet, 'recent_tail'),
+    () => drop(packet, 'tool_activity'),
+    () => drop(packet, 'prior_advice'),
+    () => keep(packet.workspace, 'observed_changed_paths', 8),
+    () => {
+      // Keep the build-time omission counters truthful: they count input to output.
+      const supplied = record(packet.requester_supplied)
+      const truncation = { ...(record(packet.truncation) ?? {}) } as Record<string, number>
+      for (const [key, counter] of [['evidence', 'requester_evidence_omitted'], ['failed_attempts', 'failed_attempts_omitted']] as const) {
+        const list = supplied?.[key]
+        if (Array.isArray(list) && list.length > 4) truncation[counter] = (truncation[counter] ?? 0) + list.length - 4
+      }
+      keep(supplied, 'evidence', 4)
+      keep(supplied, 'failed_attempts', 4)
+      packet.truncation = truncation
+    },
+    () => { keep(packet, 'attempts', 4); keep(packet, 'failures', 2); keep(packet, 'validation', 6) },
+    () => {
+      shrink(packet.question, 'exact_question', 1200)
+      shrink(packet.question, 'current_hypothesis', 800)
+      shrink(packet.question, 'decision_needed', 400)
+      shrink(packet.task, 'root_objective', 800)
+      keep(packet.task, 'success_criteria', 4)
+      shrink(packet.task, 'requester_assignment', 400)
+      shrink(packet.requester, 'cwd', 200)
+      keep(packet.capabilities, 'allowed_tools', 10)
+      keep(packet.capabilities, 'unavailable_tools', 10)
+      const signals = record(packet.trigger)?.signals
+      if (Array.isArray(signals)) for (const signal of signals) shrink(signal, 'detail', 200)
+    },
+  ]
+  for (const step of steps) {
+    if (bytes() <= MAX_CASE_PACKET_BYTES) break
+    step()
+  }
+  if (Object.keys(omitted).length > 0) {
+    packet.truncation = { ...(record(packet.truncation) ?? {}), packet_budget_bytes: MAX_CASE_PACKET_BYTES, packet_omitted: omitted }
+  }
+  if (bytes() <= MAX_CASE_PACKET_BYTES) return packet
+  // Absolute floor: these fixed sections alone stay well under the cap, so the
+  // worst-case output is still a complete, parseable packet.
+  return {
+    schema_version: 1,
+    consultation: packet.consultation,
+    requester: packet.requester,
+    question: packet.question,
+    truncation: { packet_budget_bytes: MAX_CASE_PACKET_BYTES, packet_omitted: omitted, degraded_to: 'minimal' },
+  }
+}
+
 export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
   const requesterEvents = eventsOf(input.requester)
   const rootEvents = sessionId(input.requester) === sessionId(input.root) ? requesterEvents : eventsOf(input.root)
@@ -526,19 +605,7 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     || failures.length > 0
     || validation.length > 0
     || delta.some(event => event.type === 'assistant/message' && materialAssistantConclusion(messageText(event)))
-  let prompt = JSON.stringify(redactValue(packet))
-  if (Buffer.byteLength(prompt) > MAX_CASE_PACKET_BYTES) {
-    // Shrink the lowest-priority sections first: recent tail, then tool activity
-    // summaries are already bounded; fall back to a hard truncate with marker.
-    const budget = MAX_CASE_PACKET_BYTES - Buffer.byteLength('\n…[packet-truncated]')
-    let low = 0, high = prompt.length
-    while (low < high) {
-      const mid = Math.ceil((low + high) / 2)
-      if (Buffer.byteLength(prompt.slice(0, mid)) <= budget) low = mid
-      else high = mid - 1
-    }
-    prompt = prompt.slice(0, low) + '\n…[packet-truncated]'
-  }
+  const prompt = JSON.stringify(fitCasePacket(redactValue(packet) as Record<string, unknown>))
   return {
     // DSH owns token accounting for the complete model request, including its
     // system prompt and tool schemas. Bytes are not a model token limit.
