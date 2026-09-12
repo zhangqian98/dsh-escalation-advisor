@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,6 +13,8 @@ permissions:
 jobs:
   check:
     strategy:
+      # One DSH release failing must not cancel the rest of the matrix.
+      fail-fast: false
       matrix:
         node: ['22.19.0', '24']
         dsh: ['0.1.2-rc.1', '0.1.5-alpha.2', '0.1.5-rc.1']
@@ -27,10 +30,10 @@ jobs:
       # DSH packages currently require a newer npm resolver than the npm 11.3
       # bundled by some Node 24 images. Match the working community-plugin CI.
       - run: npm install --global npm@11.7.0
+      # Pin EVERY @deepseek-ai package — direct and transitive — to the matrix
+      # version, so the cell tests one complete isolated runtime closure.
+      - run: node scripts/pin-dsh.mjs ${{ matrix.dsh }}
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Pin DSH matrix version
-        if: matrix.dsh != '0.1.5-alpha.2'
-        run: npm install --no-save --ignore-scripts --no-audit --no-fund @deepseek-ai/dsh-agent@${{ matrix.dsh }} @deepseek-ai/dsh-commands@${{ matrix.dsh }} @deepseek-ai/dsh-llm@${{ matrix.dsh }} @deepseek-ai/dsh-session@${{ matrix.dsh }} @deepseek-ai/dsh-settings@${{ matrix.dsh }} @deepseek-ai/dsh-subagent@${{ matrix.dsh }} @deepseek-ai/dsh-system-prompt@${{ matrix.dsh }} @deepseek-ai/dsh-tools@${{ matrix.dsh }} @deepseek-ai/dsh-typert-protocol@${{ matrix.dsh }}
       - run: npm run check
       - run: npm run build
       - run: npm run pack:check
