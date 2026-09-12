@@ -14,6 +14,7 @@ import {
   advisorScript,
   advisorVerdictResponse,
   createIntegrationHarness,
+  deferred,
   textResponse,
   toolCallResponse,
   type IntegrationHarness,
@@ -604,6 +605,13 @@ describe('P1: editing Advisor delivery', () => {
   }, 20000)
 })
 describe('P1: masked exits, stale tasks, recurrence, and worker mirrors', () => {
+  let callSeq = 0
+  async function runTool(h: IntegrationHarness, name: string, args: Record<string, unknown>): Promise<{ text: string }> {
+    const tools = h.ctx.get('tools') as { execute(input: unknown): Promise<{ content: readonly unknown[] }> }
+    const result = await tools.execute({ callId: ToolCallId('fresh-' + (++callSeq)), name, arguments: args, agent: h.root, signal: new AbortController().signal })
+    const text = (result.content as readonly { type?: string; text?: string }[]).flatMap(block => block.type === 'text' ? [String(block.text ?? '')] : []).join('')
+    return { text }
+  }
   function shellOutcomes(entries: [string, { exitCode: number; output: string }[]][]): Map<string, { exitCode: number; output: string }[]> {
     return new Map(entries)
   }
@@ -720,6 +728,49 @@ describe('P1: masked exits, stale tasks, recurrence, and worker mirrors', () => 
     // outdates it: without the root-mirrored mutation it would stay resolved.
     expect((await obligationsOf(h)).some(entry => entry.includes('/open'))).toBe(true)
   }, 30000)
+
+  it('marks a consultation stale while an unclassified tool is still in flight', async () => {
+    // The epoch alone cannot see a mutation whose result has not landed: an
+    // unclassified tool holds its in-flight mark from dispatch to result, so a
+    // review delivered inside that window goes stale instead of publishing
+    // against a workspace that was changing underneath it.
+    const h = await harness({ weak: [textResponse('done')], advisor: advisorScript(advisorVerdictResponse(), advisorVerdictResponse()) })
+    const gate = deferred()
+    h.ctx.tools.register(defineTool({
+      name: 'mcp_probe', description: 'Unclassified tool.',
+      parameters: {},
+      output: { schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true } } }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+      execute: async () => { await gate.promise; return { ok: true } },
+    }))
+    const tools = h.ctx.get('tools') as { execute(input: unknown): Promise<unknown> }
+    const inFlight = tools.execute({ callId: ToolCallId('probe-1'), name: 'mcp_probe', arguments: {}, agent: h.root, signal: new AbortController().signal })
+    await new Promise(resolve => setTimeout(resolve, 20)) // let dispatch mark it in-flight
+    const during = JSON.parse((await runTool(h, 'consult_advisor', { question: 'Review mid-probe' })).text) as { status: string }
+    expect(during.status).toBe('unavailable')
+    gate.resolve()
+    await inFlight
+    const after = JSON.parse((await runTool(h, 'consult_advisor', { question: 'Review after the probe' })).text) as { status: string }
+    expect(after.status).toBe('ok')
+    expect(advisorRunHistory(h.root).map(run => run.status)).toEqual(['stale', 'delivered'])
+  }, 20000)
+
+  it('reopens a resolved proof when an unclassified tool result lands', async () => {
+    const h = await harness({
+      weak: [toolCallResponse('f1', 'bash', { command: 'npm test' }), toolCallResponse('p1', 'bash', { command: 'npm test' }), toolCallResponse('u1', 'mcp_probe', {}), textResponse('done'), textResponse('spare')],
+      advisor: [],
+    })
+    registerBash(h, shellOutcomes([['npm test', [{ exitCode: 1, output: 'FAIL' }, { exitCode: 0, output: 'green' }]]]))
+    h.ctx.tools.register(defineTool({
+      name: 'mcp_probe', description: 'Unclassified tool.',
+      parameters: {},
+      output: { schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true } } }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+      execute: async () => ({ ok: true }),
+    }))
+    await h.runRoot('Fail, verify, then run an unclassified tool')
+    // The unknown call may have written: a resolved obligation must reopen
+    // rather than keep a proof that could predate an unobserved change.
+    expect((await obligationsOf(h)).some(entry => entry.includes('/open'))).toBe(true)
+  }, 20000)
 })
 describe('P1: manual consultations suppress repeat automatic consultations', () => {
   it('covers the live problems of a manual review, not just its version', async () => {

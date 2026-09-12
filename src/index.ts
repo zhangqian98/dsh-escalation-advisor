@@ -139,7 +139,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const tracker = new EscalationTracker()
   const obligations = new ObligationStore()
   /** Dispatch seq per tool call: the only trustworthy bound on a validation window. */
-  const dispatchSeq = new Map<string, { seq: number; taskStartSeq: number; tick: number; agentKey: string }>()
+  const dispatchSeq = new Map<string, { seq: number; taskStartSeq: number; tick: number; agentKey: string; mutation?: boolean; rootId?: string }>()
   /** Global dispatch counter. Session seqs are not comparable across agents, so
    * eviction uses this shared tick instead of any one session's numbering. */
   let dispatchTick = 0
@@ -159,6 +159,24 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const reviewed = new Map<string, { turn: number; seq: number }>()
   /** Workspace mutation epoch per task tree: bumped on any potential mutation tool result. */
   const workspaceEpoch = new Map<string, number>()
+  /** Mutations currently IN FLIGHT per task tree. A review that started before a
+   * mutation's result and ends while it is still running saw a workspace that
+   * was changing underneath it — the epoch alone cannot see that window, so the
+   * delivery check below requires quiescence, not just an unchanged epoch. */
+  const mutationPending = new Map<string, number>()
+  const pendingOf = (agent: Agent): number => {
+    try { return mutationPending.get(String(taskRootAgent(ctx, agent).id)) ?? 0 } catch { return 0 }
+  }
+  /** Whether this execution counts against workspace freshness: every tool whose
+   * effect is not proven read-only, plus path-carrying names. Unknown tools count
+   * conservatively — an unlisted tool may write — while plugin-internal and
+   * orchestration tools never do. */
+  const mutationToolCall = (agent: Agent, name: string, args: unknown): boolean => {
+    if (INTERNAL_TOOLS.has(name) || name === 'advisor_obligation' || name === ADVISOR_TOOL_NAME || isCapabilityAmplifier(ctx, name, currentConfig().capabilityAmplifierTools)) return false
+    if (registry.identity(agent) !== undefined) return false
+    const config = configFor(agent)
+    return toolEffect(name, config.readOnlyTools, config.mutatingTools) !== 'read-only' || mutationKey(name, args) !== undefined
+  }
   /** Structural mutation epoch per task tree: bumped only on path-carrying
    * edit/write-family tools (including worker mirrors below). Unlike the
    * conservative epoch above, a repeat shell failure does not move it, so the
@@ -463,9 +481,11 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         })
         if (!result) { record({ status: 'skipped' }); return undefined }
         if (!fresh(agent, revision)) { record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity }); return undefined }
-        // Workspace-epoch staleness is enforced by the caller comparing the
-        // epoch captured at dispatch against the current epoch (see below).
-        if (epochOf(agent) !== epochAtDispatch) {
+        // Workspace staleness is the epoch the caller captured at dispatch plus
+        // quiescence: a mutation still in flight means the review observed a
+        // workspace that was changing underneath it — its result has not landed
+        // yet, so the epoch alone cannot see it.
+        if (epochOf(agent) !== epochAtDispatch || pendingOf(agent) !== 0) {
           record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, error: 'Workspace changed during the Advisor run; the review is kept for audit but not steered.' })
           // The route survives so the conversation can still be continued by
           // explicit id, but a stale run never DELIVERED: it must not move the
@@ -708,10 +728,28 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     if (exec.agent) {
       const agentKey = String(exec.agent.id)
       dispatchTick += 1
-      dispatchSeq.set(String(exec.callId), { seq: exec.agent.session.seq, taskStartSeq: taskStarts.get(agentKey) ?? 0, tick: dispatchTick, agentKey })
+      // A mutation counts for its whole execution window, not only at its
+      // result: mark it in-flight at dispatch so a consult observing the
+      // workspace mid-window cannot read a false quiescence.
+      let rootId = ''
+      try { rootId = String(taskRootAgent(ctx, exec.agent).id) } catch {}
+      const mutation = rootId !== '' && mutationToolCall(exec.agent, exec.name, exec.arguments)
+      if (mutation) mutationPending.set(rootId, (mutationPending.get(rootId) ?? 0) + 1)
+      dispatchSeq.set(String(exec.callId), { seq: exec.agent.session.seq, taskStartSeq: taskStarts.get(agentKey) ?? 0, tick: dispatchTick, agentKey, ...(mutation ? { mutation: true, rootId } : {}) })
       // Expire by shared tick distance so in-flight calls keep their start
-      // boundary no matter which session dispatched around them.
-      for (const [id, entry] of dispatchSeq) if (dispatchTick - entry.tick > 512) dispatchSeq.delete(id)
+      // boundary no matter which session dispatched around them. An expired
+      // pending mutation may have written without ever reporting, so the epoch
+      // moves conservatively and the in-flight count is released.
+      for (const [id, entry] of dispatchSeq) {
+        if (dispatchTick - entry.tick <= 512) continue
+        dispatchSeq.delete(id)
+        if (entry.mutation && entry.rootId) {
+          const left = (mutationPending.get(entry.rootId) ?? 1) - 1
+          if (left <= 0) mutationPending.delete(entry.rootId)
+          else mutationPending.set(entry.rootId, left)
+          workspaceEpoch.set(entry.rootId, (workspaceEpoch.get(entry.rootId) ?? 0) + 1)
+        }
+      }
     }
     return await next()
   })
@@ -766,16 +804,28 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     // reviews stale, never proofs.
     const effect = toolEffect(exec.name, config.readOnlyTools, config.mutatingTools)
     const structural = mutationKey(exec.name, exec.arguments) !== undefined
-    const reviewTraffic = advisorResult && effect !== 'mutating' && !structural
-    const countsAsMutation = !reviewTraffic && (effect === 'mutating' || structural)
-    if (countsAsMutation) {
+    const reviewTraffic = advisorResult && effect === 'read-only' && !structural
+    const pluginTraffic = INTERNAL_TOOLS.has(exec.name) || exec.name === 'advisor_obligation'
+    const orchestration = isCapabilityAmplifier(ctx, exec.name, config.capabilityAmplifierTools)
+    // Unknown tools count conservatively: an unclassified tool may write, and a
+    // completed unknown call must still move the epoch. Plugin bookkeeping and
+    // orchestration calls are not evidence of workspace change themselves.
+    const countsAsMutation = !reviewTraffic && !pluginTraffic && !orchestration && (effect !== 'read-only' || structural)
+    // The dispatch entry released at its expiry already moved both clocks; an
+    // entry that survived releases its in-flight mark exactly here.
+    if (dispatched?.mutation === true && dispatched.rootId) {
+      const left = (mutationPending.get(dispatched.rootId) ?? 1) - 1
+      if (left <= 0) mutationPending.delete(dispatched.rootId)
+      else mutationPending.set(dispatched.rootId, left)
+    }
+    if (countsAsMutation || dispatched?.mutation === true) {
       // An editing Advisor's own effects must not stale its own review (the verdict
       // reports them), and no concurrent read-only review can exist beside it:
       // the exclusive workspace lease serializes editors against every reader.
       // Its edits still invalidate older proofs via the mirror below.
       if (!advisorResult) {
         try {
-          const rootId = String(taskRootAgent(ctx, exec.agent).id)
+          const rootId = dispatched?.rootId || String(taskRootAgent(ctx, exec.agent).id)
           workspaceEpoch.set(rootId, (workspaceEpoch.get(rootId) ?? 0) + 1)
         } catch {}
       }
@@ -938,11 +988,20 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     try { registry.revokeTurn(key) } catch {}
     try { registry.pruneConsumed() } catch {}
     tracker.clear(key); manualCalls.delete(key); manualReserved.delete(key); revisions.delete(key); reviewed.delete(key); futureNotes.delete(key); taskStarts.delete(key); obligations.clear(key); goalRoundActive.delete(key); reviewWatermark.delete(key)
-    for (const [id, entry] of dispatchSeq) if (entry.agentKey === key) dispatchSeq.delete(id)
+    for (const [id, entry] of dispatchSeq) {
+      if (entry.agentKey !== key) continue
+      dispatchSeq.delete(id)
+      if (entry.mutation && entry.rootId) {
+        const left = (mutationPending.get(entry.rootId) ?? 1) - 1
+        if (left <= 0) mutationPending.delete(entry.rootId)
+        else mutationPending.set(entry.rootId, left)
+        workspaceEpoch.set(entry.rootId, (workspaceEpoch.get(entry.rootId) ?? 0) + 1)
+      }
+    }
     for (const pending of retryableStarts.keys()) if (pending.startsWith(key + '|')) retryableStarts.delete(pending)
     hiddenTools.get(agent)?.(); hiddenTools.delete(agent)
     for (const controller of controllers.get(key) ?? []) controller.abort()
     controllers.delete(key)
-    if (agent.session.header.parentSession === undefined) { limiter.clear(key); registry.clearRoot(key); workspaceEpoch.delete(key); structuralEpoch.delete(key) }
+    if (agent.session.header.parentSession === undefined) { limiter.clear(key); registry.clearRoot(key); workspaceEpoch.delete(key); structuralEpoch.delete(key); mutationPending.delete(key) }
   })
 }
