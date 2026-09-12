@@ -544,6 +544,21 @@ function structuredOutcome(observed: ObservedToolResult): OutcomeClass | undefin
   if (hasStructuredFlag(observed.value, ['infrastructure', 'networkerror', 'unavailable']) || codes.some((code) => /ECONN|ENOTFOUND|EAI_AGAIN|NETWORK|INTERNAL|INFRASTRUCTURE|SERVICE_UNAVAILABLE|PROVIDER|UNAVAILABLE|RATE_LIMIT/.test(code))) return 'tool-infrastructure-error'
   return undefined
 }
+/**
+ * True when the invocation is exactly the detected check end to end: no masking
+ * shell text, no pipeline tail deciding the exit. A check's own execution is
+ * evidence, not a workspace mutation — callers use this to keep faithful
+ * validation runs out of mutation tracking entirely (epoch, pending marks and
+ * obligation events alike). A run carrying any surrounding shell text is NOT
+ * faithful and still counts, since that text may have written.
+ */
+export function faithfulValidationCall(name: string, args: unknown): boolean {
+  const command = argumentText(args).toLowerCase()
+  if (validationKey(name, args) === undefined) return false
+  const checkIndex = validationMatchIndex(command)
+  return checkIndex !== undefined && compoundExecution(command, checkIndex, name) === undefined
+}
+
 export function classifyToolOutcome(observed: ObservedToolResult): ToolOutcome {
   const exitCode = findExitCode(observed.value), validation = validationKey(observed.name, observed.arguments, observed.scope)
   // The exit code belongs to the whole shell invocation, not necessarily to the

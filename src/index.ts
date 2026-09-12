@@ -14,7 +14,7 @@ import { buildCasePacket, hasNewMaterialConclusion, textContent } from './contex
 import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, requesterSeq, START_REJECTED, type AdvisorRunResult, type AdvisorContinuation } from './model-runner.js'
 import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
 import { GOAL_ROUND_ADVISOR_ROUTE, toolGuidance } from './prompts.js'
-import { EscalationTracker, classifyToolOutcome, mutationKey, type EscalationDecision } from './state.js'
+import { EscalationTracker, classifyToolOutcome, faithfulValidationCall, mutationKey, type EscalationDecision } from './state.js'
 import { MAX_AUTO_REMINDERS_PER_TASK, ObligationStore, opensObligation, type Obligation } from './obligations.js'
 import { AdvisorTaskLimiter, AdvisorTaskLimitError } from './task-limiter.js'
 import { AdvisorWorkspaceLock } from './workspace-lock.js'
@@ -174,6 +174,10 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const mutationToolCall = (agent: Agent, name: string, args: unknown): boolean => {
     if (INTERNAL_TOOLS.has(name) || name === 'advisor_obligation' || name === ADVISOR_TOOL_NAME || isCapabilityAmplifier(ctx, name, currentConfig().capabilityAmplifierTools)) return false
     if (registry.identity(agent) !== undefined) return false
+    // A faithful validation run is the check itself, not interference: no
+    // in-flight mark, no epoch move, no obligation event. Only text AROUND the
+    // check (a compound or a pipeline tail) keeps the call counting.
+    if (faithfulValidationCall(name, args)) return false
     const config = configFor(agent)
     return toolEffect(name, config.readOnlyTools, config.mutatingTools) !== 'read-only' || mutationKey(name, args) !== undefined
   }
@@ -829,8 +833,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     const orchestration = isCapabilityAmplifier(ctx, exec.name, config.capabilityAmplifierTools)
     // Unknown tools count conservatively: an unclassified tool may write, and a
     // completed unknown call must still move the epoch. Plugin bookkeeping and
-    // orchestration calls are not evidence of workspace change themselves.
-    const countsAsMutation = !reviewTraffic && !pluginTraffic && !orchestration && (effect !== 'read-only' || structural)
+    // orchestration calls are not evidence of workspace change themselves, and
+    // a faithful validation run is the check itself — never a mutation event.
+    const countsAsMutation = !reviewTraffic && !pluginTraffic && !orchestration && !faithfulValidationCall(exec.name, exec.arguments) && (effect !== 'read-only' || structural)
     // The dispatch entry released at its expiry already moved both clocks; an
     // entry that survived releases its in-flight mark exactly here.
     if (dispatched?.mutation === true && dispatched.rootId) {

@@ -619,6 +619,21 @@ describe('P1: proof freshness across shells, turns, and dispatch loss', () => {
     expect(items.some(entry => entry.includes('/open'))).toBe(true)
   }, 20000)
 
+  it('keeps a resolved proof resolved through a later faithful validation run', async () => {
+    // The check itself is evidence, not interference: a plain `npm test`
+    // re-run records no mutation event, so the resolution it produced is not
+    // reopened by its own follow-up. (A compound or piped run still counts.)
+    const h = await harness({
+      weak: [toolCallResponse('t1', 'bash', { command: 'npm test' }), toolCallResponse('t2', 'bash', { command: 'npm test' }), toolCallResponse('t3', 'bash', { command: 'npm test' }), textResponse('done')],
+    })
+    shellFixture(h, new Map([['npm test', [{ exitCode: 1, output: 'FAIL' }, { exitCode: 0, output: 'green' }, { exitCode: 0, output: 'green again' }]]]))
+    await h.runRoot('Verify the suite')
+    const items = await obligationsOf(h)
+    expect(items.length).toBeGreaterThan(0)
+    expect(items.some(entry => entry.includes('/open'))).toBe(false)
+    expect(items.every(entry => entry.includes('resolved'))).toBe(true)
+  }, 20000)
+
   it('keeps every consultation turn visible instead of collapsing follow-ups', async () => {
     const { advisorRunHistory } = await import('../src/telemetry.js')
     const run = (id: string, attempt: number, status: string, collectorId?: string, turns?: number) => ({
