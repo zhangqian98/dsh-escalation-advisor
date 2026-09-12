@@ -398,7 +398,21 @@ describe('P1: watermark survives evidence saturation and conclusions', () => {
     expect(outcome('npm test | tee log | grep ok', 0).compound).toBe(true)
     expect(outcome('npm test | true', 0).compound).toBe(true)
     expect(outcome('npm test | ./mutate.sh', 0).compound).toBe(true)
-    expect(outcome('npm test | tee build.log', 0).compound ?? false).toBe(false)
+    // A POSIX pipeline reports its LAST stage: `npm test | tee` exits with
+    // tee's status, so the check's exit never reached the harness — the run has
+    // no per-process exit provenance and cannot close anything.
+    expect(outcome('npm test | tee build.log', 0).compound).toBe(true)
+    expect(outcome('npm test | tee build.log', 0).exitSource).toBe('pipeline-tail')
+    expect(outcome('npm test | tail -20', 0).compound).toBe(true)
+    // The pipe only masks when it follows the check: `tee log | npm test`
+    // reports the check's own exit in any shell.
+    expect(outcome('tee log | npm test', 0).compound ?? false).toBe(false)
+    // PowerShell is different: cmdlet stages never touch $LASTEXITCODE, so a
+    // cmdlet tail keeps the check's own exit. A native-looking tail (more,
+    // less, head) is not a cmdlet and still masks.
+    expect(outcome('npm test | Select-Object -First 40', 0, 'pwsh').compound ?? false).toBe(false)
+    expect(outcome('npm test | Tee-Object build.log', 0, 'pwsh').compound ?? false).toBe(false)
+    expect(outcome('npm test | more', 0, 'pwsh').compound).toBe(true)
     expect(outcome('npm test; > wiped.ts', 0).compound).toBe(true)
     // Reporting tails keep attribution in PowerShell (bare literals report) and
     // before the check in any shell; in bash a quoted tail executes, so it masks.
@@ -412,7 +426,9 @@ describe('P1: watermark survives evidence saturation and conclusions', () => {
     expect(outcome('time npm test', 0).compound ?? false).toBe(false)
     expect(outcome('npm test > out.log 2>&1', 0).compound ?? false).toBe(false)
     expect(outcome('cd sub && npm test', 0).compound ?? false).toBe(false)
-    expect(outcome('npm test 2>&1 | Select-Object -First 40', 0).compound ?? false).toBe(false)
+    expect(outcome('npm test 2>&1 | Select-Object -First 40', 0, 'pwsh').compound ?? false).toBe(false)
+    expect(outcome('npm test', 0).exitSource).toBe('check')
+    expect(outcome('npm test; true', 0).exitSource).toBe('masked')
     // Identity is unaffected: masked and plain runs name the same target.
     expect(outcome('npm test; true', 0).validationKey).toBe(outcome('npm test', 0).validationKey)
   })

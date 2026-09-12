@@ -66,6 +66,11 @@ export interface ToolOutcome {
    * pipes, conditional chains, substitutions). Identity still names the target,
    * but a compound success proves nothing about the check itself. */
   compound?: boolean
+  /** Which process produced the reported exit status: 'check' is the validation
+   * invocation itself — the only status that can prove a check. Otherwise the
+   * producer is named for audit: a downstream 'pipeline-tail' stage, or
+   * 'masked' surrounding shell text. Absent when no validation was located. */
+  exitSource?: 'check' | ExitMasking
 }
 export interface TrackerEvidence {
   callId?: string
@@ -396,12 +401,15 @@ function reportingOnlySegment(command: string, tokens: CommandSpan[], toolName: 
   if (/^[\"']/.test(raw)) return isPwshLike(toolName)
   return false
 }
-/** Pass-through pipeline consumers: formatters and pagers, not filters or mutators
- * (`true`, `grep`, scripts all decide the pipeline exit themselves). A quoted
- * consumer is an inert value only in PowerShell; in POSIX shells it executes. */
-const REPORTING_PIPE_TARGETS = new Set([
-  'select-object', 'out-string', 'format-table', 'format-list', 'format-wide',
-  'tee', 'tee-object', 'head', 'tail', 'less', 'more', 'cat',
+/** Pass-through pipeline consumers that keep the check's exit in PowerShell:
+ * cmdlets (and their aliases) never touch `$LASTEXITCODE`. Names that resolve
+ * to native binaries in some hosts (more, less, head, tail) are NOT here:
+ * a native stage would produce the pipeline exit itself. In POSIX shells the
+ * tail stage always produces the exit, so no consumer is safe there — the
+ * caller gates this list on the shell. */
+const REPORTING_PIPE_CMDLETS = new Set([
+  'select-object', 'out-string', 'out-default', 'out-null', 'format-table',
+  'format-list', 'format-wide', 'tee-object', 'tee', 'cat',
 ])
 function pipeConsumerAllowed(command: string, tokens: CommandSpan[], toolName: string): boolean {
   if (tokens.length === 0) return true
@@ -409,13 +417,23 @@ function pipeConsumerAllowed(command: string, tokens: CommandSpan[], toolName: s
   const quoted = /^[\"']/.test(raw)
   if (quoted && isPwshLike(toolName)) return true
   const base = raw.replace(/^[\"']|[\"']$/g, '').split(/[\\/]/).pop()?.toLowerCase().replace(/\.(?:exe|cmd|bat|ps1)$/, '') ?? ''
-  return REPORTING_PIPE_TARGETS.has(base)
+  return REPORTING_PIPE_CMDLETS.has(base)
 }
-function compoundExecution(command: string, checkIndex: number | undefined, toolName = ''): boolean {
-  if (/\$\(|`[^`]*`/.test(command)) return true
-  if (/(^|[\s;|&(){}])\s*(if|then|elif|else|fi|for|while|until|case|esac|function)\b/i.test(command)) return true
+/**
+ * Which shell construct keeps the reported exit from being the check's own.
+ * 'pipeline-tail': a downstream pipeline stage produced the status (POSIX
+ * shells report the last stage; multi-stage pipelines are never attributed).
+ * 'masked': surrounding shell text — separators, chains, conditionals,
+ * substitutions — could have produced it. `undefined`: the reported status is
+ * the check's own.
+ */
+export type ExitMasking = 'pipeline-tail' | 'masked'
+
+function compoundExecution(command: string, checkIndex: number | undefined, toolName = ''): ExitMasking | undefined {
+  if (/\$\(|`[^`]*`/.test(command)) return 'masked'
+  if (/(^|[\s;|&(){}])\s*(if|then|elif|else|fi|for|while|until|case|esac|function)\b/i.test(command)) return 'masked'
   const segments = shellSegments(command).filter(tokens => tokens.length > 0)
-  if (segments.length <= 1) return false
+  if (segments.length <= 1) return undefined
   const bounds = segments.map(tokens => ({ start: tokens[0]!.start, end: tokens[tokens.length - 1]!.end }))
   const checkSeg = checkIndex === undefined ? -1 : bounds.findIndex(bound => checkIndex >= bound.start && checkIndex < bound.end)
   const gaps: string[] = []
@@ -436,20 +454,20 @@ function compoundExecution(command: string, checkIndex: number | undefined, tool
       // Pipe continuations are skipped here; the single-pipe rule below owns them.
       for (let j = Math.max(checkSeg + 1, 1); j < segments.length; j++) {
         if (pipeOnlyGap(gaps[j]!)) continue
-        if (!reportingOnlySegment(command, segments[j]!, toolName)) return true
+        if (!reportingOnlySegment(command, segments[j]!, toolName)) return 'masked'
       }
       continue
     }
     // `|&` is a pipe, not backgrounding; normalize before the `&` test.
     const piped = gap.replace(/\|&/g, '|')
-    if (/(^|[^&])&(?!&)/.test(piped)) return true
-    if (/\|\|/.test(gap)) return true
+    if (/(^|[^&])&(?!&)/.test(piped)) return 'masked'
+    if (/\|\|/.test(gap)) return 'masked'
     // `a && check` ending at the check still reports it; a chain that continues
     // past it is already covered by the reporting-only rule above.
     if (/&&/.test(gap) && (checkSeg < 0 || i > checkSeg)) {
       for (let j = Math.max(checkSeg + 1, 1); j < segments.length; j++) {
         if (pipeOnlyGap(gaps[j]!)) continue
-        if (!reportingOnlySegment(command, segments[j]!, toolName)) return true
+        if (!reportingOnlySegment(command, segments[j]!, toolName)) return 'masked'
       }
       continue
     }
@@ -457,14 +475,18 @@ function compoundExecution(command: string, checkIndex: number | undefined, tool
     if (found > 0) pipeConsumer = i
     pipes += found
   }
-  if (pipes > 1) return true
+  // The pipeline exit belongs to its LAST stage. A pipe that joins segments
+  // ending at or before the check leaves the check as the tail, so its exit is
+  // still the reported one; a pipe PAST the check hands the status to the
+  // consumer. Only a PowerShell cmdlet consumer preserves $LASTEXITCODE — in
+  // POSIX shells and with native consumers, the reported code is the
+  // consumer's, and `npm test | tail` exits 0 however the check ended.
+  if (pipes > 1) return 'pipeline-tail'
   if (pipes === 1) {
-    // Exactly one reporting stage is tolerated, and only for a pass-through
-    // consumer: anything else decides the pipeline exit itself.
-    if (pipeConsumer < 0 || pipeConsumer >= segments.length) return true
-    if (!pipeConsumerAllowed(command, segments[pipeConsumer]!, toolName)) return true
+    if (pipeConsumer <= checkSeg) return undefined
+    if (!isPwshLike(toolName) || !pipeConsumerAllowed(command, segments[pipeConsumer]!, toolName)) return 'pipeline-tail'
   }
-  return false
+  return undefined
 }
 
 function validationKey(name: string, args: unknown, scope?: string): string | undefined {
@@ -527,12 +549,14 @@ export function classifyToolOutcome(observed: ObservedToolResult): ToolOutcome {
   // The exit code belongs to the whole shell invocation, not necessarily to the
   // extracted check: compound text around it can mask the check's own failure.
   const command = argumentText(observed.arguments).toLowerCase()
-  const compound = validation !== undefined && compoundExecution(command, validationMatchIndex(command), observed.name)
+  const masking = validation !== undefined ? compoundExecution(command, validationMatchIndex(command), observed.name) : undefined
+  const compound = masking !== undefined
+  const exitSource = validation === undefined ? undefined : masking ?? 'check'
   const exclusion = structuredOutcome(observed)
-  if (exclusion) return { class: exclusion, exitCode, validationKey: validation }
-  if (!observed.isError && isExpectedNegativeExit(observed.name, observed.arguments, exitCode)) return { class: 'expected-negative', exitCode, validationKey: validation }
-  if (observed.isError || (exitCode !== undefined && exitCode !== 0)) return { class: validation ? 'validation-failure' : 'unknown-failure', exitCode, validationKey: validation, ...(compound ? { compound: true } : {}) }
-  return { class: 'success', exitCode, validationKey: validation, ...(compound ? { compound: true } : {}) }
+  if (exclusion) return { class: exclusion, exitCode, validationKey: validation, exitSource }
+  if (!observed.isError && isExpectedNegativeExit(observed.name, observed.arguments, exitCode)) return { class: 'expected-negative', exitCode, validationKey: validation, exitSource }
+  if (observed.isError || (exitCode !== undefined && exitCode !== 0)) return { class: validation ? 'validation-failure' : 'unknown-failure', exitCode, validationKey: validation, exitSource, ...(compound ? { compound: true } : {}) }
+  return { class: 'success', exitCode, validationKey: validation, exitSource, ...(compound ? { compound: true } : {}) }
 }
 function mutationPaths(args: unknown): string[] {
   const record = recordOf(args), candidates: string[] = []
