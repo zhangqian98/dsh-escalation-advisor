@@ -27,6 +27,8 @@ export interface AdvisorRunRecord {
   collectorId?: string
   /** Consultation turn index this attempt belongs to (1-based); lets a restore continue counting. */
   turns?: number
+  /** The task root's latest user-message seq at dispatch: the durable task anchor a restored continuation is checked against. */
+  taskAnchor?: number
 }
 
 declare module '@deepseek-ai/dsh-session/types' {

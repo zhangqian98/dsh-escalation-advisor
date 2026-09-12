@@ -209,11 +209,19 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     return { available: true, reason: '使用指导已启用', text: toolGuidance(config.mode) }
   }
   await ctx.plugin(AdvisorRemoteService, { currentConfig, limiter, guidanceFor, obligations: { store: obligations, taskStartSeq: (agent: Agent) => taskStarts.get(String(agent.id)) ?? 0 } })
+  const latestUserSeq = (agent: Agent): number => agent.session.snapshotEvents().findLast(event => event.type === 'user/message' && event.data.source.kind === 'user')?.seq ?? 0
   const revisionOf = (agent: Agent): string => {
     const root = taskRootAgent(ctx, agent)
-    const latestUser = (subject: Agent) => subject.session.snapshotEvents().findLast(event => event.type === 'user/message' && event.data.source.kind === 'user')?.seq ?? 0
-    return [String(root.id), revisions.get(String(root.id)) ?? 0, latestUser(root), revisions.get(String(agent.id)) ?? 0, latestUser(agent)].join(':')
+    return [String(root.id), revisions.get(String(root.id)) ?? 0, latestUserSeq(root), revisions.get(String(agent.id)) ?? 0, latestUserSeq(agent)].join(':')
   }
+  /**
+   * The task a consultation belongs to, durable across a restart: the seq of
+   * the task ROOT's latest user message. `taskStarts` is in-memory and resets
+   * on reload; this anchor is read from persisted events, so a restored record
+   * is usable exactly while the task it was opened under is still current — a
+   * new user message moves the anchor and old consultations stop resolving.
+   */
+  const taskAnchorOf = (agent: Agent): number => latestUserSeq(taskRootAgent(ctx, agent))
   const fresh = (agent: Agent, revision: string): boolean => ctx.agents.get(agent.id) === agent && revisionOf(agent) === revision
   const hasMutation = (agent: Agent): boolean => {
     const config = currentConfig(), root = taskRootAgent(ctx, agent)
@@ -278,22 +286,14 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
    * root task are honored: an unknown or foreign id is refused, never silently
    * started as a fresh consultation.
    */
-  type ConsultationRecord = { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number; mode: ConsultationMode; deliveredSeq: number }
+  type ConsultationRecord = { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number; mode: ConsultationMode; taskAnchor: number; invocationId?: string; deliveredSeq: number }
   const consultations = new Map<string, ConsultationRecord>()
   // A delivery counter, not wall-clock time and not map insertion order: "latest" has
   // to be deterministic, and a follow-up delivered into an OLDER conversation must
   // become the latest one. Only a delivered consultation is ever recorded, so failed
   // and in-flight attempts cannot move it.
   let delivered = 0
-  const rememberConsultation = (value: Omit<ConsultationRecord, 'deliveredSeq'>): void => {
-    // Keyed by the BARE uuid: the handle a caller holds is `<uuid>#<turn>.<attempt>`,
-    // but one conversation is ONE record whatever handle form addresses it — the id
-    // the FIRST turn minted, or that same uuid on its own.
-    // Map.set on an existing key does NOT move it to the end, so delete first:
-    // otherwise a just-continued consultation stays eviction-oldest by creation order.
-    const mapKey = handleBase(value.consultationId)
-    if (consultations.has(mapKey)) consultations.delete(mapKey)
-    consultations.set(mapKey, { ...value, deliveredSeq: ++delivered })
+  const evictConsultations = (): void => {
     while (consultations.size > 64) {
       let oldest: string | undefined
       let oldestSeq = Number.POSITIVE_INFINITY
@@ -303,18 +303,39 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       if (oldest === undefined) break
       const evicted = consultations.get(oldest)
       consultations.delete(oldest)
-      // Revoking a leaked activation for an evicted conversation is safe: only
-      // an exact invocation match is revoked, so a live turn is never affected.
+      // Dropping the route must not drop a live turn: revoke only an activation
+      // still owned by the EVICTED record's invocation — a newer turn on the same
+      // child (or a restored record that carries no invocation) is never touched.
       try {
-        if (evicted !== undefined) registry.revokeTurn(evicted.childSessionId)
+        if (evicted?.invocationId !== undefined) registry.revokeTurn(evicted.childSessionId, evicted.invocationId)
       } catch {}
     }
+  }
+  const rememberConsultation = (value: Omit<ConsultationRecord, 'deliveredSeq'>, deliveredNow = true): void => {
+    // Keyed by the BARE uuid: the handle a caller holds is `<uuid>#<turn>.<attempt>`,
+    // but one conversation is ONE record whatever handle form addresses it — the id
+    // the FIRST turn minted, or that same uuid on its own.
+    // Map.set on an existing key does NOT move it to the end, so delete first:
+    // otherwise a just-continued consultation stays eviction-oldest by creation order.
+    const mapKey = handleBase(value.consultationId)
+    const existing = consultations.get(mapKey)
+    if (existing !== undefined) consultations.delete(mapKey)
+    // A stale run keeps its restore address but must not move the delivered
+    // ordering: "last" still means the most recently DELIVERED consultation.
+    // A consultation that never delivered keeps sequence 0 — never the alias
+    // target, and evicted before any delivered one.
+    const deliveredSeq = deliveredNow ? ++delivered : (existing?.deliveredSeq ?? 0)
+    consultations.set(mapKey, { ...value, deliveredSeq })
+    evictConsultations()
   }
 
   // P0-durable: rebuild delivered MANUAL continuations from the persisted
   // advisor/run log so a restart / plugin-reload can continue the same child.
   // Only manual consultations are restored (automatic ones are re-triggered by
-  // fresh evidence); only delivered runs with a live continuable child.
+  // fresh evidence). The child does NOT have to be live: the record is only a
+  // route, and `sendMessage` cold-resumes a missing direct child — its own
+  // direct-parent authorization stays the final check. Without this, a restart
+  // silently makes every earlier consultation unavailable.
   const restoreConsultations = (root: Agent): void => {
     try {
       const rootId = String(root.id)
@@ -326,10 +347,6 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // a stale turn index and collide with the newer turn's channel identity.
         const kept = consultations.get(mapKey)
         if (kept !== undefined && (kept.turns ?? 0) >= (run.turns ?? 1)) continue
-        // The child must still exist and be a continuable descendant of this root.
-        let child: Agent | undefined
-        try { child = ctx.agents.get(SessionId(run.childSessionId)) } catch { child = undefined }
-        if (!child) continue
         consultations.set(mapKey, {
           consultationId: run.id,
           childSessionId: run.childSessionId,
@@ -337,30 +354,26 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
           rootId,
           turns: run.turns ?? 1,
           mode: 'manual',
+          // Records written before task scoping adopt the CURRENT task's anchor;
+          // records that carry one are refused at lookup once the task moves on.
+          taskAnchor: run.taskAnchor ?? latestUserSeq(root),
           deliveredSeq: ++delivered,
         })
       }
-      while (consultations.size > 64) {
-        let oldest: string | undefined
-        let oldestSeq = Number.POSITIVE_INFINITY
-        for (const [key, record] of consultations) {
-          if (record.deliveredSeq < oldestSeq) { oldestSeq = record.deliveredSeq; oldest = key }
-        }
-        if (oldest === undefined) break
-        consultations.delete(oldest)
-      }
+      evictConsultations()
     } catch (error) {
       logger.warn('Advisor consultation restore failed: ' + redactSecrets(error instanceof Error ? error.message : String(error)))
     }
   }
   // The `last` alias resolves only inside the calling agent's own scope: its own
   // delivered MANUAL consultations on this exact root task. Automatic consultations
-  // never move it, and a sibling agent can never reach another agent's conversation
-  // through it.
-  const latestManualConsultation = (requesterId: string, rootId: string): ConsultationRecord | undefined => {
+  // never move it, a sibling agent can never reach another agent's conversation
+  // through it, and a record from an earlier task — or one that never delivered —
+  // is ineligible.
+  const latestManualConsultation = (requesterId: string, rootId: string, taskAnchor: number): ConsultationRecord | undefined => {
     let latest: ConsultationRecord | undefined
     for (const record of consultations.values()) {
-      if (record.mode !== 'manual' || record.requesterId !== requesterId || record.rootId !== rootId) continue
+      if (record.mode !== 'manual' || record.deliveredSeq === 0 || record.requesterId !== requesterId || record.rootId !== rootId || record.taskAnchor !== taskAnchor) continue
       if (latest === undefined || record.deliveredSeq > latest.deliveredSeq) latest = record
     }
     return latest
@@ -399,7 +412,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutMs)])
       const runRecord: AdvisorRunRecord = {
         version: 1, id, requesterId: String(agent.id), mode, turn: trigger.turn, ...(trigger.step === undefined ? {} : { step: trigger.step }), collectorId, turns: turns + 1,
-        taskRevision: revision, ...(trigger.decision ? { fingerprint: trigger.decision.problemFingerprint, score: trigger.decision.score } : {}),
+        taskRevision: revision, taskAnchor: taskAnchorOf(agent), ...(trigger.decision ? { fingerprint: trigger.decision.problemFingerprint, score: trigger.decision.score } : {}),
         attempt, status: 'reserved', timestamp: new Date().toISOString(), question: redactSecrets(args.question),
       }
       const record = (patch: Partial<AdvisorRunRecord>) => { Object.assign(runRecord, Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)), { timestamp: new Date().toISOString() }); recordRun(agent, root, runRecord) }
@@ -454,7 +467,10 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // epoch captured at dispatch against the current epoch (see below).
         if (epochOf(agent) !== epochAtDispatch) {
           record({ status: 'stale', childSessionId: result.answer.childSessionId, usage: result.answer.usage, summary: result.answer.verdict.summary, severity: result.answer.verdict.severity, error: 'Workspace changed during the Advisor run; the review is kept for audit but not steered.' })
-          rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode })
+          // The route survives so the conversation can still be continued by
+          // explicit id, but a stale run never DELIVERED: it must not move the
+          // "last" pointer or the delivered LRU ordering.
+          rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode, taskAnchor: taskAnchorOf(agent), invocationId: result.answer.invocationId }, false)
           return undefined
         }
         // Bound telemetry: the full verdict lives in the Advisor child transcript;
@@ -485,7 +501,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         }
         // The id stays stable for the whole conversation so a follow-up turn can
         // address the SAME child session instead of starting a new consultation.
-        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode })
+        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode, taskAnchor: taskAnchorOf(agent), invocationId: result.answer.invocationId })
         return result.answer
 
       } catch (error) {
@@ -554,18 +570,22 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       if (typeof args.consultation_id === 'string' && args.consultation_id.trim()) {
         const requested = args.consultation_id.trim()
         const rootId = String(taskRootAgent(ctx, agent).id)
+        // Task scope is part of the binding, not just ownership: a consultation
+        // opened under an earlier task is refused by id AND by the alias, so a
+        // stale or restored route can never leak across a task boundary.
+        const taskAnchor = taskAnchorOf(agent)
         // The alias is resolved HERE, once, into a concrete record, and the resolved
         // binding is what the whole call carries — a retry cannot retarget it. When it
         // resolves to nothing the call is refused outright: silently starting a fresh
         // consultation would let a caller believe it continued one when it did not.
         if (requested.toLowerCase() === LATEST_ALIAS) {
-          const latest = latestManualConsultation(key, rootId)
+          const latest = latestManualConsultation(key, rootId, taskAnchor)
           if (!latest) { refundReservation(); return unavailable('There is no earlier manual consultation to continue: "last" means the most recent DELIVERED manual consultation by this agent on this task, and there is none. A failed or still-running consultation does not count. Start a new consultation by omitting consultation_id.') }
           continuation = { consultationId: latest.consultationId, publicId: handleOf(latest.consultationId, 0), childSessionId: latest.childSessionId, turns: latest.turns }
         } else {
           const found = consultations.get(handleBase(requested))
           if (!found) { refundReservation(); return unavailable('Unknown consultation id: this agent has no open consultation with that id. Start a new consultation by omitting consultation_id.') }
-          if (found.requesterId !== key || found.rootId !== rootId) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
+          if (found.requesterId !== key || found.rootId !== rootId || found.taskAnchor !== taskAnchor) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
           continuation = { consultationId: found.consultationId, publicId: requested, childSessionId: found.childSessionId, turns: found.turns }
         }
       }

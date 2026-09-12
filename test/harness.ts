@@ -762,6 +762,7 @@ export async function createDeployedRuntimeHarness(
   scripts: Record<string, ScriptEntry[]>,
   config: Partial<Config> = {},
   sessionRoot: string = mkdtempSync(join(tmpdir(), 'dsh-deployed-runtime-sessions-')),
+  options: { resumeRoot?: boolean } = {},
 ): Promise<DeployedRuntimeHarness> {
   const [Cordis, LlmRuntime, SessionStore, SessionProjection, SystemPrompt, ToolRuntime, AgentRegistry,
     Invariants, AgentInvariant, AgentLoopInvariant, SessionInvariant, AgentLoop, SubagentRuntime, Spawn] =
@@ -822,7 +823,11 @@ export async function createDeployedRuntimeHarness(
   ctx.on('agent/created', ({ agent }) => { agentsCreated.push(String(agent.id)) })
 
   const createRoot = async (id: string): Promise<Agent> => ctx.agentLoop.create(SessionId(id), { provider: 'mock', model: 'weak' })
-  const root = await createRoot('deployed-runtime-root')
+  // A "restart" re-materializes the persisted root through the same durable
+  // path a deployment uses — never a fresh session with the same id.
+  const root = options.resumeRoot === true
+    ? (await ctx.agentLoop.resume(ctx, { resumeSessionId: SessionId('deployed-runtime-root'), agentOptions: { provider: 'mock', model: 'weak' } })).agent
+    : await createRoot('deployed-runtime-root')
 
   let callSeq = 0
   return {

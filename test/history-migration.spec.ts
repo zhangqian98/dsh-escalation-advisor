@@ -11,7 +11,7 @@ describe('Advisor historical migration schema', () => {
       { type: 'advisor/identity', data: { version: 1, invocationId: 'invocation', advisorId: 'child', requesterId: 'root', rootId: 'root', allowedTools: ['read'] } },
       // Complete AdvisorRunRecord as written by alpha.27 consult(): every field
       // a delivered multi-turn manual consultation actually persists.
-      { type: 'advisor/run', data: { version: 1, id: 'review', requesterId: 'root', mode: 'manual', turn: 4, step: 2, taskRevision: 'old:42', attempt: 1, status: 'delivered', timestamp: '2026-09-10T00:00:00Z', collectorId: 'review#2.1.nonce', turns: 2, childSessionId: 'child', fingerprint: 'fp', score: 3, severity: 'concern', summary: 's', question: 'q', responseText: 'Original reply', verdictTool: 'advisor_verdict', structuredFallback: false, usage: { inputTokens: 10, outputTokens: 5 } } },
+      { type: 'advisor/run', data: { version: 1, id: 'review', requesterId: 'root', mode: 'manual', turn: 4, step: 2, taskRevision: 'old:42', taskAnchor: 12, attempt: 1, status: 'delivered', timestamp: '2026-09-10T00:00:00Z', collectorId: 'review#2.1.nonce', turns: 2, childSessionId: 'child', fingerprint: 'fp', score: 3, severity: 'concern', summary: 's', question: 'q', responseText: 'Original reply', verdictTool: 'advisor_verdict', structuredFallback: false, usage: { inputTokens: 10, outputTokens: 5 } } },
     ]
     const original = structuredClone(events)
     events.forEach(event => validate(event))
@@ -30,6 +30,8 @@ describe('Advisor historical migration schema', () => {
       { type: 'advisor/run', data: { version: 1, id: 'r', requesterId: 'root', mode: 'manual', turn: 1, taskRevision: 't', attempt: 1, status: 'delivered', timestamp: 'x', collectorId: '' } },
       { type: 'advisor/run', data: { version: 1, id: 'r', requesterId: 'root', mode: 'manual', turn: 1, taskRevision: 't', attempt: 1, status: 'delivered', timestamp: 'x', turns: 0 } },
       { type: 'advisor/run', data: { version: 1, id: 'r', requesterId: 'root', mode: 'manual', turn: 1, taskRevision: 't', attempt: 1, status: 'delivered', timestamp: 'x', turns: 1.5 } },
+      { type: 'advisor/run', data: { version: 1, id: 'r', requesterId: 'root', mode: 'manual', turn: 1, taskRevision: 't', attempt: 1, status: 'delivered', timestamp: 'x', taskAnchor: -1 } },
+      { type: 'advisor/run', data: { version: 1, id: 'r', requesterId: 'root', mode: 'manual', turn: 1, taskRevision: 't', attempt: 1, status: 'delivered', timestamp: 'x', taskAnchor: 'seq' } },
     ]) expect(() => validate(event)).toThrow()
   })
 })

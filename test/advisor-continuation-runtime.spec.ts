@@ -74,6 +74,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 
 import { ADVISOR_SYSTEM_PROMPT } from '../src/prompts.js'
@@ -696,5 +698,99 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
     expect(viaAlias.child_session_id).toBe(firstChild)
     expect(viaAlias.child_session_id).not.toBe(otherChild)
     expect(viaAlias.consultation_id).toBe(firstIssued)
+  }, TEST_TIMEOUT)
+
+  it('restores a delivered consultation after a full restart and continues the SAME cold child', async () => {
+    // Boot 1: one delivered manual consultation, then the WHOLE runtime is
+    // disposed — nothing in-memory survives, only the durable session logs.
+    const sessionRoot = freshSessionRoot()
+    const harness1 = await createDeployedRuntimeHarness({
+      weak: [textResponse('requester idle')],
+      advisor: advisorScript(advisorVerdictResponse({ summary: T1.verdictSummary, diagnosis: T1.verdictDiagnosis })),
+    }, {}, sessionRoot)
+    // Boot 1 is disposed by hand below so the session root survives for boot 2;
+    // the safety net only disposes the fiber, never the durable store.
+    disposals.push(() => harness1.ctx.fiber.dispose())
+    const first = await harness1.runTool(CONSULT, { question: T1.question, current_hypothesis: T1.hypothesis }, harness1.root)
+    expect(first.isError, first.text).toBe(false)
+    const answer1 = asAnswer(first.value)
+    const issued = String(answer1.consultation_id)
+    const base = issued.replace(COLLECTOR_SUFFIX, '')
+    const childId = String(answer1.child_session_id)
+    expect(childId.length).toBeGreaterThan(0)
+    await until(() => childReleased(harness1, childId), `child ${childId} to be released`)
+    const assistantMessagesBefore = (await harness1.readPersisted(childId)).events
+      .filter(event => event.type === 'assistant/message').length
+    await harness1.ctx.fiber.dispose()
+
+    // Boot 2 over the SAME session root: the root is RESUMED from persistence,
+    // so the consultation route must be rebuilt without any live child — a cold
+    // restore. The child is only re-materialized when the follow-up lands.
+    const harness2 = await createDeployedRuntimeHarness({
+      weak: [textResponse('new task idle')],
+      advisor: advisorScript(advisorVerdictResponse({ summary: T2.verdictSummary, diagnosis: T2.verdictDiagnosis })),
+    }, {}, sessionRoot, { resumeRoot: true })
+    disposals.push(() => harness2.dispose())
+    expect(String(harness2.root.id)).toBe(String(harness1.root.id))
+    expect(harness2.liveAgent(childId)).toBeUndefined()
+    expect(harness2.liveSession(childId)).toBeUndefined()
+
+    // A direct uninvited delivery is still refused by the activation gate — the
+    // restored route is not a standing authorization. Cold-resuming the child is
+    // allowed (that is what a follow-up needs), but the turn it spawns must die
+    // at the gate before any model work.
+    const advisorCallsBeforeDirect = harness2.adapter.forModel('advisor').length
+    const delivered = await harness2.ctx.subagents.sendMessage(harness2.root, SessionId(childId), [{ type: 'text', text: 'DIRECT-INPUT-MARKER: keep working' }], { signal: new AbortController().signal }).then(() => true, () => false)
+    if (delivered) {
+      await until(() => harness2.liveAgent(childId) !== undefined, `child ${childId} to cold-resume for the direct delivery`)
+      await Promise.race([harness2.liveAgent(childId)!.whenIdle(), new Promise(resolve => setTimeout(resolve, 15_000))])
+    }
+    const afterDirect = await harness2.readPersisted(childId)
+    expect(harness2.adapter.forModel('advisor')).toHaveLength(advisorCallsBeforeDirect)
+    expect(afterDirect.events.filter(event => event.type === 'assistant/message')).toHaveLength(assistantMessagesBefore)
+    evidence('--- direct input refused at the gate ---',
+      `delivered            : ${delivered}`,
+      `advisor model calls  : ${advisorCallsBeforeDirect} (unchanged)`,
+      `assistant messages   : ${assistantMessagesBefore} -> ${afterDirect.events.filter(event => event.type === 'assistant/message').length}`,
+      `closed turns         : ${JSON.stringify(closedTurns(afterDirect.events))}`,
+      `tail                 : ${JSON.stringify(afterDirect.events.slice(-6).map(event => [event.type, (event.data as { turn?: number; reason?: { kind?: string } }).turn, (event.data as { reason?: { kind?: string } }).reason?.kind]))}`)
+
+    // The follow-up on the ORIGINAL consultation id cold-resumes the same child
+    // and lands as turn 2 — the restored record kept the turn count.
+    const followUp = await harness2.runTool(CONSULT, { question: T2.question, current_hypothesis: T2.hypothesis, consultation_id: issued }, harness2.root)
+    const persisted = await harness2.readPersisted(childId)
+    evidence('--- child log after follow-up ---',
+      `identity events: ${JSON.stringify(persisted.events.filter(e => e.type === 'advisor/identity').map(e => [e.seq, (e.data as { invocationId?: string }).invocationId]))}`,
+      `turns          : ${JSON.stringify(persisted.events.filter(e => e.type === 'turn/start' || e.type === 'turn/end').map(e => [e.seq, e.type, (e.data as { turn?: number }).turn, (e.data as { reason?: { kind?: string } }).reason?.kind]))}`)
+    expect(followUp.isError, followUp.text).toBe(false)
+    const answer2 = asAnswer(followUp.value)
+    expect(answer2).toMatchObject({
+      status: 'ok', severity: 'concern', summary: T2.verdictSummary, diagnosis: T2.verdictDiagnosis,
+      child_session_id: childId, consultation_id: issued,
+    })
+    expect(closedTurns(persisted.events).filter(closed => closed.reason === 'completed')).toHaveLength(2)
+    const rootRuns = (await harness2.readPersisted(String(harness2.root.id))).events
+      .filter(event => event.type === 'advisor/run' && (event.data as { id?: string; status?: string }).id === base && (event.data as { status?: string }).status === 'delivered')
+      .map(event => (event.data as { turns?: number }).turns)
+    expect(rootRuns).toEqual([1, 2])
+    expect(harness2.agentsCreated).toContain(childId) // re-materialized by cold resume
+
+    // A NEW user message moves the task anchor: the same consultation id must
+    // now be refused — a route from a previous task is never resurrected.
+    harness2.root.followup(createUserMessage({ content: [{ type: 'text', text: 'NEW-TASK-MARKER' }], source: { kind: 'user' } }))
+    await harness2.root.whenIdle()
+    const refused = await harness2.runTool(CONSULT, { question: 'continue anyway', consultation_id: issued }, harness2.root)
+    expect(refused.isError, refused.text).toBe(false)
+    expect(asAnswer(refused.value)).toMatchObject({
+      status: 'unavailable', child_session_id: '', consultation_id: '',
+      diagnosis: expect.stringContaining('belongs to another agent or task'),
+    })
+
+    evidence('--- restart restore: same child, preserved turn count, task-scoped ---',
+      `issued consultation_id : ${issued}`,
+      `closed turns (persisted): ${JSON.stringify(closedTurns(persisted.events))}`,
+      `delivered turns on root : ${JSON.stringify(rootRuns)}`,
+      `materializations        : ${JSON.stringify(harness2.agentsCreated.filter(id => id === childId))}`,
+      `new-task refusal        : ${JSON.stringify(asAnswer(refused.value).diagnosis)}`)
   }, TEST_TIMEOUT)
 })
