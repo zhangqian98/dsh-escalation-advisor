@@ -47,14 +47,14 @@ This local compatibility patch checks the exact DSH version and original file ch
 Install the exact npm release into the Web profile, then restart DSH:
 
 ```bash
-dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.26
+dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.27
 dsh web
 ```
 
 The immutable GitHub release tag remains available as a source install:
 
 ```bash
-dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.26
+dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.27
 ```
 
 For a local checkout, build and install the generated tarball rather than linking the source directory:
@@ -63,7 +63,7 @@ For a local checkout, build and install the generated tarball rather than linkin
 npm ci
 npm run check
 npm pack
-dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.26.tgz
+dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.27.tgz
 ```
 
 Configure the strong model in **Settings → Plugins → DSH Escalation Advisor**. The plugin stores only provider/model route IDs and reuses authentication already configured in DSH Models.
