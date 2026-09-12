@@ -194,10 +194,12 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     try { return structuralEpoch.get(String(taskRootAgent(ctx, agent).id)) ?? 0 } catch { return 0 }
   }
   /** Evidence watermark: problems a delivered consultation already covered, plus the
-   * evidence revision, structural epoch and requester seq it covered them at.
-   * Escalation re-arms on an uncovered fingerprint or a structural workspace change;
+   * evidence revision and requester seq it covered them at. Each fingerprint keeps
+   * its OWN structural epoch — a review of problem B must not make problem A look
+   * freshly covered when the workspace changed between the two reviews. Escalation
+   * re-arms on an uncovered fingerprint or a structural change since ITS review;
    * continuous review (fingerprint-less) re-arms on new evidence or conclusions. */
-  const reviewWatermark = new Map<string, { evidenceVersion: number; fingerprints: Set<string>; seq: number; epoch: number }>()
+  const reviewWatermark = new Map<string, { evidenceVersion: number; fingerprints: Map<string, { epoch: number; seq: number }>; seq: number }>()
   const futureNotes = new Map<string, UserMessage[]>()
   const controllers = new Map<string, Set<AbortController>>()
   const disposed = new AbortController()
@@ -508,14 +510,19 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         {
           const key = String(agent.id)
           const fp = trigger.decision?.problemFingerprint
-          const entry = reviewWatermark.get(key) ?? { evidenceVersion: 0, fingerprints: new Set<string>(), seq: 0, epoch: 0 }
-          if (fp) entry.fingerprints.add(fp)
+          const epoch = structuralOf(agent)
+          const entry = reviewWatermark.get(key) ?? { evidenceVersion: 0, fingerprints: new Map<string, { epoch: number; seq: number }>(), seq: 0 }
+          // Every covered fingerprint records THIS delivery's structural epoch:
+          // a shared epoch would let a later review of problem B refresh problem
+          // A's coverage across an intervening workspace change.
+          if (fp) entry.fingerprints.set(fp, { epoch, seq: result.lastSeq })
           // A manual review carries no trigger decision, so it covers the live
           // problems instead: without this it would suppress nothing at all.
-          for (const live of tracker.currentFingerprints(key)) entry.fingerprints.add(live)
+          for (const live of tracker.currentFingerprints(key)) entry.fingerprints.set(live, { epoch, seq: result.lastSeq })
+          // Bound the fingerprint map: the oldest coverage is the least useful.
+          while (entry.fingerprints.size > 64) entry.fingerprints.delete(entry.fingerprints.keys().next().value!)
           entry.evidenceVersion = tracker.observationCount(key)
           entry.seq = result.lastSeq
-          entry.epoch = structuralOf(agent)
           reviewWatermark.set(key, entry)
           reviewed.set(key, { turn: trigger.turn, seq: result.lastSeq })
         }
@@ -874,12 +881,13 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         const fp = decision?.problemFingerprint
         if (fp !== undefined) {
           // Escalation re-arms on a new (uncovered) problem or a structural
-          // workspace change since the review — never on a bare repeat of a
-          // covered problem, no matter how many times the bounded evidence
-          // array shifted under it. (The conservative shell-inclusive epoch is
-          // deliberately NOT consulted here: a repeat failure through bash would
-          // otherwise re-arm every time.)
-          if (mark.fingerprints.has(fp) && structuralOf(agent) === mark.epoch) return
+          // workspace change since THAT problem's review — never on a bare
+          // repeat of a covered problem, no matter how many times the bounded
+          // evidence array shifted under it. (The conservative shell-inclusive
+          // epoch is deliberately NOT consulted here: a repeat failure through
+          // bash would otherwise re-arm every time.)
+          const covered = mark.fingerprints.get(fp)
+          if (covered !== undefined && structuralOf(agent) === covered.epoch) return
         } else if (tracker.observationCount(key) <= mark.evidenceVersion) {
           // Continuous review has no fingerprint: new tool evidence or a material
           // assistant conclusion re-arms it.

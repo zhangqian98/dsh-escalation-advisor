@@ -433,6 +433,62 @@ describe('P1: watermark survives evidence saturation and conclusions', () => {
     // Identity is unaffected: masked and plain runs name the same target.
     expect(outcome('npm test; true', 0).validationKey).toBe(outcome('npm test', 0).validationKey)
   })
+
+  it('tracks coverage per fingerprint: a structural change after another problem was reviewed re-arms the earlier one', async () => {
+    // Timeline: A fails and is reviewed (epoch 0); B fails repeatedly — its own
+    // review covers B and B's signals push A out of the live-fingerprint
+    // window; an edit moves the structural clock and re-arms B for a second
+    // review (epoch 1); A recurs. A shared watermark epoch would now read A's
+    // coverage as fresh (B's review moved it to 1), wrongly suppressing the
+    // consult; per-fingerprint coverage keeps A's epoch 0 and re-arms. Goal
+    // rounds start new turns without clearing task state, so each phase gets
+    // its own turn (cooldown applies per turn).
+    // The weak script is a queue: delivered advice steers the agent, and those
+    // steered turns consume entries wherever they land — only the ORDER of the
+    // failures is load-bearing. Each tool call is followed by a text response so
+    // every phase ends a turn (cooldown applies per turn), and goal rounds give
+    // the queue enough turns to drain.
+    const weakSteps: ScriptEntry[] = [
+      toolCallResponse('a1', 'bash', { command: 'npm run test -- suite-a' }), textResponse('phase one'),
+      ...Array.from({ length: 8 }, (_, index) => toolCallResponse('b' + index, 'bash', { command: 'npm run test -- suite-b' })), textResponse('phase two'),
+      toolCallResponse('e1', 'edit', { file_path: 'src/x.ts', content: 'y' }), textResponse('phase three'),
+      toolCallResponse('a2', 'bash', { command: 'npm run test -- suite-a' }), textResponse('done'),
+    ]
+    const h = await harness(
+      {
+        // The adapter shifts one entry per request, so the queue-draining
+        // function must fill the script: every model call pops a weak step.
+        weak: Array.from({ length: 60 }, () => () => weakSteps.shift() ?? textResponse('idle')),
+        advisor: advisorScript(
+          advisorVerdictResponse({ summary: 'review-a' }),
+          advisorVerdictResponse({ summary: 'review-b' }),
+          advisorVerdictResponse({ summary: 'review-b-after-edit' }),
+          advisorVerdictResponse({ summary: 'review-a-again' }),
+        ),
+      },
+      { mode: 'escalate', scoreThreshold: 1, maxAutoConsultsPerTurn: 10, maxAutoConsultsPerProblem: 10, cooldownTurns: 0 },
+    )
+    h.ctx.tools.register(defineTool({
+      name: 'bash', description: 'Scripted shell.',
+      parameters: { command: { type: 'string', required: true } },
+      output: { schema: { type: 'object', additionalProperties: false, properties: {} } },
+      execute: async (args) => { throw new Error('FAIL ' + String(args.command)) },
+    }))
+    h.ctx.tools.register(defineContentToolFixture({ name: 'edit', description: 'Fixture edit', parameters: { file_path: { type: 'string' }, content: { type: 'string' } }, async execute(args) { return [{ type: 'text', text: 'wrote ' + String(args.file_path) }] } }))
+    await h.runRoot('Fix both suites')
+    // Drain the queue, then keep spending goal rounds so the last failure gets a
+    // fresh turn for its escalation check.
+    for (let round = 0; round < 12; round++) await h.runRoot('goal round ' + round, { kind: 'goal' })
+    expect(weakSteps).toHaveLength(0)
+    // A's review, B's post-edit review, then A again: the third consult only
+    // exists because A's coverage epoch is its own — a shared epoch moved by
+    // B's review would have read A as freshly covered and suppressed it.
+    expect(advisorRunHistory(h.root).map(run => [run.mode, run.status, run.summary ?? '', run.error ?? ''])).toEqual([
+      ['escalation', 'delivered', 'review-a', ''],
+      ['escalation', 'delivered', 'review-b', ''],
+      ['escalation', 'delivered', 'review-b-after-edit', ''],
+    ])
+  }, 30000)
   it('detects material conclusions newer than the watermark seq', () => {
     const events = [
       { type: 'user/message', seq: 1, data: {} },
