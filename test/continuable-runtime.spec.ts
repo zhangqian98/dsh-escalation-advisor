@@ -26,7 +26,7 @@
  */
 
 import { createRequire } from 'node:module'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -415,12 +415,13 @@ describe.skipIf(!GATED)('DEPLOYED runtime: continuable cold resume through publi
     const versions = runtimeVersions()
     evidence('--- resolved runtime package versions ---', JSON.stringify(versions, null, 2))
     expect(GATED).toContain('dsh')
-    expect(versions['@deepseek-ai/dsh']).toBe('0.1.2-rc.1')
+    // The anchor's own version is what every matrix cell claims to test; the
+    // sibling packages float within the deployed release's `^` ranges.
+    const anchorVersion = (JSON.parse(readFileSync(GATED!, 'utf8')) as { version: string }).version
+    expect(versions['@deepseek-ai/dsh']).toBe(anchorVersion)
     for (const [name, version] of Object.entries(versions)) {
       expect(`${name}@${version}`).not.toContain('UNRESOLVED')
     }
-    expect(versions['@deepseek-ai/dsh-session-persistence-jsonl']).toBe('0.1.2-rc.1')
-    expect(versions['@deepseek-ai/dsh-session-query-sqlite']).toBe('0.1.2-rc.1')
   }, 60_000)
 
   it('cold-resumes an evicted child and closes a follow-up turn that retains context, persona, allow-list and the plugin tool', async () => {
@@ -484,12 +485,17 @@ describe.skipIf(!GATED)('DEPLOYED runtime: continuable cold resume through publi
       const persistence = harness.ctx.get('sessionPersistence') as unknown as SessionPersistence
       const logFile = harness.logFileFor(childId)
       expect(logFile.startsWith(sessionRoot)).toBe(true)
-      const raw = await (persistence as unknown as {
-        readRaw(id: SessionId, signal?: AbortSignal): Promise<{ filename: string; content: string } | undefined>
-      }).readRaw(childId as SessionId)
-      expect(raw).toBeDefined()
-      expect(raw!.content).toContain(MARKER)
-      expect(raw!.content).toContain('subagent/descriptor')
+      // `readRaw` exists only on the flat (pre-handle) persistence contract;
+      // newer runtimes drop the raw-artifact surface entirely.
+      const raw = typeof (persistence as { readRaw?: unknown }).readRaw === 'function'
+        ? await (persistence as unknown as {
+            readRaw(id: SessionId, signal?: AbortSignal): Promise<{ filename: string; content: string } | undefined>
+          }).readRaw(childId as SessionId)
+        : undefined
+      if (raw !== undefined) {
+        expect(raw.content).toContain(MARKER)
+        expect(raw.content).toContain('subagent/descriptor')
+      }
       const readBack = await query.readSession(childId as SessionId)
       expect(String(readBack.session.id)).toBe(childId)
       const persistedTypes = (readBack.events as SessionEvent[]).map(event => String(event.type))
@@ -501,11 +507,13 @@ describe.skipIf(!GATED)('DEPLOYED runtime: continuable cold resume through publi
         '--- storage evidence: the child session on disk and through the query service ---',
         `root            : ${sessionRoot}`,
         `jsonl artifact  : ${logFile}`,
-        `artifact file   : ${raw!.filename}`,
-        `readRaw bytes   : ${raw!.content.length}`,
+        ...(raw === undefined ? ['readRaw          : (not exposed by this persistence contract)'] : [
+          `artifact file   : ${raw.filename}`,
+          `readRaw bytes   : ${raw.content.length}`,
+          `readRaw excerpt : ${raw.content.slice(0, 700)}`,
+        ]),
         `query.readSession events: ${persistedTypes.length} (${persistedTypes.slice(0, 8).join(', ')}...)`,
         `query.listEvents records: ${listed.length}`,
-        `readRaw excerpt : ${raw!.content.slice(0, 700)}`,
 
       )
 
@@ -676,19 +684,25 @@ describe.skipIf(!GATED)('DEPLOYED runtime: continuable cold resume through publi
         provider: 'spawn',
         label: 'Mislabeled one-shot child',
       })
-      // Give the coordinator a bounded window to land the append, then read the
-      // artifact back from the durable backend itself.
-      await vi.waitFor(async () => {
-        const raw = await (harness.ctx.get('sessionPersistence') as unknown as {
-          readRaw(id: SessionId): Promise<{ content: string } | undefined>
-        }).readRaw(mislabeledId)
-        expect(raw?.content).toContain('one-shot')
-      }, { timeout: 30_000, interval: 10 })
-
-      const mislabeledRaw = await (harness.ctx.get('sessionPersistence') as unknown as {
-        readRaw(id: SessionId): Promise<{ content: string } | undefined>
-      }).readRaw(mislabeledId)
-      expect(mislabeledRaw?.content).toContain('one-shot')
+      // Give the coordinator a bounded window to land the append, then read it
+      // back from the durable layer itself — the raw artifact when the flat
+      // contract exposes one, otherwise the query service's persisted view.
+      const persistence = harness.ctx.get('sessionPersistence') as {
+        readRaw?(id: SessionId): Promise<{ content: string } | undefined>
+      }
+      if (typeof persistence.readRaw === 'function') {
+        await vi.waitFor(async () => {
+          const raw = await persistence.readRaw!(mislabeledId)
+          expect(raw?.content).toContain('one-shot')
+        }, { timeout: 30_000, interval: 10 })
+        const mislabeledRaw = await persistence.readRaw(mislabeledId)
+        expect(mislabeledRaw?.content).toContain('one-shot')
+      } else {
+        await vi.waitFor(async () => {
+          const read = await (harness.ctx.get('sessionQuery') as { readSession(id: SessionId): Promise<{ events: readonly SessionEvent[] }> }).readSession(mislabeledId)
+          expect(read.events.some(event => event.type === 'subagent/descriptor' && (event.data as { mode?: string }).mode === 'one-shot')).toBe(true)
+        }, { timeout: 30_000, interval: 10 })
+      }
       expect(harness.ctx.agents.get(mislabeledId)).toBeUndefined()
 
       const refusal = await refusalOf(harness.sendToChild(String(mislabeledId), 'TURN TWO PROMPT'))

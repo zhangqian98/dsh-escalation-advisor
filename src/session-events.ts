@@ -1,7 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
 
-const EVENT_TYPES = ['advisor/policy', 'advisor/identity', 'advisor/run', 'advisor/model'] as const
+export const ADVISOR_SESSION_EVENT_TYPES = ['advisor/policy', 'advisor/identity', 'advisor/run', 'advisor/model'] as const
+const EVENT_TYPES = ADVISOR_SESSION_EVENT_TYPES
 const added = new Set<string>()
 let owners = 0
 

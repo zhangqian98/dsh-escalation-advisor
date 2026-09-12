@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent, type AgentOptions } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import InvariantRegistry from '@deepseek-ai/dsh-invariants'
@@ -20,22 +20,24 @@ import LlmRuntime, {
 } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, SessionLogOffset, type SessionEvent } from '@deepseek-ai/dsh-session'
 import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
-import SessionPersistence, {
-  SessionAlreadyExistsError,
-  SessionAlreadyOwnedError,
-  SessionHandleClosedError,
-  SessionPersistenceNotFoundError,
-  SessionPersistenceRevision,
-  SessionReadOnlyError,
-  type SessionAccess,
-  type SessionHandle,
-  type SessionHandleAppendOptions,
-  type SessionHandleFlushOptions,
-  type SessionHandleReadOptions,
-  type SessionHandleReadResult,
-  type SessionHeader,
-  type SessionPersistenceCreateOptions,
-  type SessionPersistenceSnapshot,
+// The persistence contract was redesigned between DSH 0.1.2 (flat service:
+// create/append/load/inspect/prepare, backed by PersistenceCoordinator) and
+// 0.1.5 (per-session handles). Names that only exist on one side MUST be
+// reached through the namespace object — a missing ESM named export throws at
+// link time, before any test can run. Type imports erase at runtime, so they
+// still reference the installed (dev) version's declarations.
+import SessionPersistence from '@deepseek-ai/dsh-session-persistence'
+import * as PersistenceModule from '@deepseek-ai/dsh-session-persistence'
+import type {
+  SessionAccess,
+  SessionHandle,
+  SessionHandleAppendOptions,
+  SessionHandleFlushOptions,
+  SessionHandleReadOptions,
+  SessionHandleReadResult,
+  SessionHeader,
+  SessionPersistenceCreateOptions,
+  SessionPersistenceSnapshot,
 } from '@deepseek-ai/dsh-session-persistence'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SettingsProvider, { type SettingsNamespace } from '@deepseek-ai/dsh-settings'
@@ -46,11 +48,12 @@ import SubagentRuntime, {
   type SubagentRun,
   type SubagentStartRequest,
 } from '@deepseek-ai/dsh-subagent'
-import { queueHostSubagentPrompt, steerHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
+import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import * as Spawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { ADVISOR_VERDICT_TOOL } from '../src/verdict-tool.js'
+import { ADVISOR_SESSION_EVENT_TYPES } from '../src/session-events.js'
 import * as Advisor from '../src/index.js'
 import type { Config } from '../src/config.js'
 
@@ -149,7 +152,7 @@ class MemorySessionHandle implements SessionHandle {
 
   async append(events: readonly SessionEvent[], options: SessionHandleAppendOptions = {}): Promise<void> {
     this.assertOpen('append')
-    if (this.access !== 'write') throw new SessionReadOnlyError(this.id, 'append')
+    if (this.access !== 'write') throw new PersistenceModule.SessionReadOnlyError(this.id, 'append')
     options.signal?.throwIfAborted()
     for (const event of events) {
       if (Number(event.seq) !== this.record.events.length) {
@@ -176,7 +179,7 @@ class MemorySessionHandle implements SessionHandle {
   }
 
   private assertOpen(operation: string): void {
-    if (this.closed) throw new SessionHandleClosedError(this.id, operation)
+    if (this.closed) throw new PersistenceModule.SessionHandleClosedError(this.id, operation)
   }
 }
 
@@ -205,7 +208,7 @@ export class MemorySessionPersistence extends SessionPersistence {
     options: SessionPersistenceCreateOptions = {},
   ): Promise<SessionHandle> {
     options.signal?.throwIfAborted()
-    if (this.stored.has(String(header.id))) throw new SessionAlreadyExistsError(header.id)
+    if (this.stored.has(String(header.id))) throw new PersistenceModule.SessionAlreadyExistsError(header.id)
     const record: MemoryStoredSession = {
       header,
       inheritedEventCount: options.inheritedEventCount ?? SessionLogOffset(0),
@@ -219,8 +222,8 @@ export class MemorySessionPersistence extends SessionPersistence {
 
   override async open(id: SessionId, access: SessionAccess): Promise<SessionHandle> {
     const record = this.stored.get(String(id))
-    if (record === undefined) throw new SessionPersistenceNotFoundError(id)
-    if (access === 'write' && record.writerOpen) throw new SessionAlreadyOwnedError(id)
+    if (record === undefined) throw new PersistenceModule.SessionPersistenceNotFoundError(id)
+    if (access === 'write' && record.writerOpen) throw new PersistenceModule.SessionAlreadyOwnedError(id)
     return new MemorySessionHandle(record, access)
   }
 
@@ -240,11 +243,116 @@ export class MemorySessionPersistence extends SessionPersistence {
   private snapshotOf(record: MemoryStoredSession): SessionPersistenceSnapshot {
     return {
       header: record.header,
-      revision: SessionPersistenceRevision(`memory-${record.revision}`),
+      revision: PersistenceModule.SessionPersistenceRevision(`memory-${record.revision}`),
       eventCount: record.events.length,
     }
   }
 }
+
+/**
+ * The pre-handle persistence contract (DSH 0.1.2): a flat service whose methods
+ * are all implemented by {@link PersistenceCoordinator} over a backend that
+ * only supplies raw-artifact primitives. The in-memory backend below never
+ * writes a torn tail, so `commitRepair` only ever appends synthetic closers.
+ */
+class MemorySessionPersistenceFlat extends Service {
+  // The coordinator's write path reads `ctx.sessions`.
+  static inject = ['sessions']
+  private readonly stored = new Map<string, MemoryStoredSession>()
+  // Typed loosely on purpose: the coordinator exists only on flat-API runtimes.
+  private readonly coordinator: {
+    create(meta: SessionHeader, inheritedEventCount?: SessionLogOffset): Promise<void>
+    ensureMaterialized(session: unknown): Promise<void>
+    append(id: SessionId, events: readonly SessionEvent[]): Promise<void>
+    prepare(id: SessionId, signal?: AbortSignal): Promise<unknown>
+    load(id: SessionId): Promise<unknown>
+    inspect(id: SessionId, signal?: AbortSignal): Promise<unknown>
+    borrowSession(id: SessionId, signal?: AbortSignal): Promise<unknown>
+    readFrom(id: SessionId, fromSeq: SessionLogOffset, signal?: AbortSignal): Promise<unknown>
+  }
+
+  constructor(ctx: Context) {
+    super(ctx, 'sessionPersistence')
+    const revisionOf = (record: MemoryStoredSession) => PersistenceModule.SessionPersistenceRevision(`memory-${record.revision}`)
+    const recordFor = (id: SessionId | SessionHeader): MemoryStoredSession => {
+      const record = this.stored.get(String(typeof id === 'object' ? id.id : id))
+      if (record === undefined) throw new PersistenceModule.SessionPersistenceNotFoundError(typeof id === 'object' ? id.id : id)
+      return record
+    }
+    const coordinatorCtor = (PersistenceModule as unknown as { PersistenceCoordinator: new (ctx: Context, backend: unknown) => MemorySessionPersistenceFlat['coordinator'] }).PersistenceCoordinator
+    this.coordinator = new coordinatorCtor(ctx, {
+      name: 'memory',
+      loadStored: async (id: SessionId) => {
+        const record = this.stored.get(String(id))
+        if (record === undefined) return undefined
+        return {
+          meta: structuredClone(record.header),
+          inheritedEventCount: record.inheritedEventCount,
+          events: structuredClone(record.events),
+          revision: revisionOf(record),
+        }
+      },
+      readStoredRevision: async (id: SessionId) => {
+        const record = this.stored.get(String(id))
+        return record === undefined ? undefined : revisionOf(record)
+      },
+      materializeHeader: async (storage: { meta: SessionHeader; inheritedEventCount: SessionLogOffset }) => {
+        const key = String(storage.meta.id)
+        if (!this.stored.has(key)) {
+          this.stored.set(key, { header: structuredClone(storage.meta), inheritedEventCount: storage.inheritedEventCount, events: [], revision: 0, writerOpen: false })
+        }
+      },
+      appendBatch: async (storage: { meta: SessionHeader }, events: readonly SessionEvent[]) => {
+        const record = recordFor(storage.meta)
+        for (const event of events) {
+          if (Number(event.seq) !== record.events.length) {
+            throw new Error(`MemorySessionPersistence: non-contiguous append at seq ${String(event.seq)} over ${record.events.length} stored events`)
+          }
+          record.events.push(structuredClone(event))
+        }
+        record.revision += 1
+      },
+      commitRepair: async (storage: { meta: SessionHeader }, _tornMarker: unknown, closers: readonly SessionEvent[]) => {
+        const record = recordFor(storage.meta)
+        for (const event of closers) {
+          if (Number(event.seq) !== record.events.length) {
+            throw new Error(`MemorySessionPersistence: non-contiguous repair at seq ${String(event.seq)} over ${record.events.length} stored events`)
+          }
+          record.events.push(structuredClone(event))
+        }
+        record.revision += 1
+      },
+      list: async () => [...this.stored.values()].map(record => structuredClone(record.header)),
+    })
+  }
+
+  readonly supportsRawArtifacts = false
+  locate(): undefined { return undefined }
+
+  create(meta: SessionHeader, inheritedEventCount?: SessionLogOffset) {
+    return this.coordinator.create(meta, inheritedEventCount)
+  }
+  ensureMaterialized(session: unknown) { return this.coordinator.ensureMaterialized(session) }
+  append(id: SessionId, events: readonly SessionEvent[]) { return this.coordinator.append(id, events) }
+  prepare(id: SessionId, signal?: AbortSignal) { return this.coordinator.prepare(id, signal) }
+  load(id: SessionId) { return this.coordinator.load(id) }
+  inspect(id: SessionId, signal?: AbortSignal) { return this.coordinator.inspect(id, signal) }
+  borrowSession(id: SessionId, signal?: AbortSignal) { return this.coordinator.borrowSession(id, signal) }
+  readFrom(id: SessionId, fromSeq: SessionLogOffset, signal?: AbortSignal) { return this.coordinator.readFrom(id, fromSeq, signal) }
+  list(signal?: AbortSignal) { return this.listStoredHeaders(signal) }
+  listSnapshots(signal?: AbortSignal) { return this.listStoredHeaders(signal).then(headers => headers.map(header => ({ header, revision: this.revisionOfHeader(header) }))) }
+
+  private async listStoredHeaders(_signal?: AbortSignal): Promise<SessionHeader[]> {
+    return [...this.stored.values()].map(record => structuredClone(record.header))
+  }
+  private revisionOfHeader(header: SessionHeader) {
+    const record = this.stored.get(String(header.id))
+    return PersistenceModule.SessionPersistenceRevision(`memory-${record?.revision ?? 0}`)
+  }
+}
+
+/** Which persistence contract the resolved runtime speaks: handles (0.1.5+) or flat service (0.1.2). */
+const HANDLE_PERSISTENCE_API = 'SessionHandleClosedError' in PersistenceModule
 
 export const TEST_CONFIG: Config = {
   enabled: true,
@@ -359,7 +467,9 @@ export async function createIntegrationHarness(
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
-  if (options.sessionPersistence !== false) await ctx.plugin(MemorySessionPersistence)
+  if (options.sessionPersistence !== false) {
+    await ctx.plugin(HANDLE_PERSISTENCE_API ? MemorySessionPersistence : MemorySessionPersistenceFlat)
+  }
   ctx.llm.registerAdapter(['mock'], adapter)
   await ctx.plugin(Advisor, { ...TEST_CONFIG, ...config })
 
@@ -814,6 +924,20 @@ export async function createDeployedRuntimeHarness(
 
   const Advisor = await import('../src/index.js')
   await ctx.plugin(Advisor, { ...TEST_CONFIG, ...config })
+  // Vitest serves the plugin's `@deepseek-ai/dsh-session` import as a SECOND
+  // module instance, so `installAdvisorEventCompatibility` only ever mutates
+  // that copy. The deployed packages the plugin runs inside (persistence,
+  // session-query) resolve the same specifier through Node and see the native
+  // instance — extend it here with the identical vocabulary, restored on
+  // dispose, mirroring the plugin's own add/remove semantics.
+  const nativeCatalog = ((await loadDeployed('@deepseek-ai/dsh-session')) as { KNOWN_SESSION_EVENT_TYPES?: Set<string> }).KNOWN_SESSION_EVENT_TYPES
+  if (nativeCatalog instanceof Set) {
+    ctx.effect(() => {
+      const added = new Set<string>()
+      for (const type of ADVISOR_SESSION_EVENT_TYPES) if (!nativeCatalog.has(type)) { nativeCatalog.add(type); added.add(type) }
+      return () => { for (const type of added) nativeCatalog.delete(type) }
+    }, 'advisor: deployed-catalog compatibility')
+  }
   // Fail loud rather than silently measuring a context the plugin never extended.
   const toolRegistry = ctx.get('tools') as any
   for (const required of ['consult_advisor', 'advisor_verdict']) {
