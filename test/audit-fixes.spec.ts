@@ -6,7 +6,7 @@ import { defineContentToolFixture, defineTool } from '@deepseek-ai/dsh-tools'
 import { AdvisorRegistry } from '../src/registry.js'
 import { classifyToolOutcome, EscalationTracker } from '../src/state.js'
 import { ObligationStore } from '../src/obligations.js'
-import { MAX_CASE_PACKET_BYTES, buildCasePacket, hasNewMaterialConclusion } from '../src/context.js'
+import { MAX_CASE_PACKET_BYTES, buildCasePacket, fitCasePacket, hasNewMaterialConclusion } from '../src/context.js'
 import { AdvisorVerdictCollector } from '../src/verdict-tool.js'
 import { VERDICT_FIELD_BUDGETS, parseVerdict, verdictFromStructured } from '../src/verdict.js'
 import { advisorRunHistory } from '../src/telemetry.js'
@@ -288,14 +288,83 @@ describe('P1: packet and verdict budgets', () => {
     expect(parsed.truncation.failed_attempts_omitted).toBe(92)
   })
 
+  it('degrades an oversized packet structurally: always parseable, omissions recorded', () => {
+    // A packet that cannot fit even after the build-time caps, but that the
+    // graduated degradation can still rescue: sections are big enough to
+    // overflow 48 KB together, small enough to survive once the low-priority
+    // ones are dropped.
+    const huge = 'x'.repeat(64 * 1024)
+    const mid = 'y'.repeat(2048)
+    const packet = {
+      schema_version: 1,
+      consultation: { id: 'c', mode: 'manual', task_start_seq: 0, last_seq: 5 },
+      requester: { role: 'root', session_id: 'root', cwd: mid },
+      task: { root_objective: 'o'.repeat(8192), success_criteria: Array.from({ length: 12 }, () => 'c'.repeat(1024)) },
+      question: { exact_question: 'q'.repeat(4096), current_hypothesis: 'h'.repeat(4096), decision_needed: 'd'.repeat(4096) },
+      requester_supplied: { evidence: Array.from({ length: 8 }, () => mid), failed_attempts: Array.from({ length: 8 }, () => mid), authority: 'claims-for-review' },
+      attempts: Array.from({ length: 8 }, () => ({ action: mid, outcome: 'failed' })),
+      failures: Array.from({ length: 4 }, (_, index) => ({ call_id: 'f' + index, tool: 'bash', repeat_count: 1 })),
+      validation: Array.from({ length: 10 }, (_, index) => ({ call_id: 'v' + index, tool: 'bash', outcome: 'failed', relevant_to_problem: false })),
+      workspace: { observed_changed_paths: Array.from({ length: 40 }, () => 'p'.repeat(512)) },
+      prior_advice: Array.from({ length: 4 }, () => ({ summary: mid })),
+      capabilities: { allowed_tools: ['read'], unavailable_tools: [], mutation_policy: 'propose-only' },
+      tool_activity: Array.from({ length: 20 }, (_, index) => ({ call_id: 't' + index, tool: 'bash', arguments_summary: mid, outcome: 'failed' })),
+      recent_tail: Array.from({ length: 12 }, () => ({ role: 'assistant', summary: mid })),
+      truncation: { requester_evidence_omitted: 100 },
+    }
+    expect(Buffer.byteLength(JSON.stringify(packet))).toBeGreaterThan(MAX_CASE_PACKET_BYTES)
+    const fitted = fitCasePacket(packet)
+    const serialized = JSON.stringify(fitted)
+    // The whole point: it parses, it fits, and the omissions are visible.
+    expect(() => JSON.parse(serialized)).not.toThrow()
+    expect(Buffer.byteLength(serialized)).toBeLessThanOrEqual(MAX_CASE_PACKET_BYTES)
+    const parsed = JSON.parse(serialized)
+    expect(parsed.truncation.packet_budget_bytes).toBe(MAX_CASE_PACKET_BYTES)
+    expect(parsed.recent_tail).toHaveLength(0)
+    expect(parsed.tool_activity).toHaveLength(0)
+    // The build-time counter stays truthful through the extra degradation.
+    expect(parsed.truncation.requester_evidence_omitted).toBe(104)
+    // The absolute floor: even pathological input yields a minimal valid packet.
+    const pathological = { schema_version: 1, consultation: { id: 'c' }, question: { exact_question: huge }, filler: Array.from({ length: 100 }, () => huge) }
+    const floor = fitCasePacket(pathological)
+    expect(() => JSON.parse(JSON.stringify(floor))).not.toThrow()
+    expect(Buffer.byteLength(JSON.stringify(floor))).toBeLessThanOrEqual(MAX_CASE_PACKET_BYTES)
+    expect((floor.truncation as { degraded_to?: string } | undefined)?.degraded_to).toBe('minimal')
+  })
+
   it('bounds verdict fields and the total delivered verdict', () => {
     const big = 'x'.repeat(100000)
     const parsed = verdictFromStructured({ severity: 'concern', summary: big, diagnosis: big, next_actions: [big, big], evidence_used: [{ kind: 'log', reference: big }], validation_plan: [big, big, big] }, big)
     expect(Buffer.byteLength(parsed.summary)).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.summary + 64)
     expect(Buffer.byteLength(parsed.diagnosis)).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.diagnosis + 1024)
-    expect(Buffer.byteLength(JSON.stringify(parsed))).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.totalDelivered + 1024)
+    // The whole structured verdict fits the aggregate budget exactly — not with
+    // slack, and not by cutting serialized JSON.
+    expect(Buffer.byteLength(JSON.stringify(parsed))).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.totalDelivered)
     const unstructured = parseVerdict(big)
     expect(Buffer.byteLength(unstructured.raw)).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.totalDelivered + 64)
+    expect(Buffer.byteLength(JSON.stringify(unstructured))).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.totalDelivered)
+  })
+
+  it('fits a verdict whose bounded arrays alone exceed the aggregate budget', () => {
+    const big = 'x'.repeat(20000)
+    // Every bounded array at its per-field cap: ~100 KB before the fitter runs.
+    const parsed = verdictFromStructured({
+      severity: 'blocker', summary: 'All checks failed', diagnosis: big,
+      next_actions: Array.from({ length: 8 }, () => 'a'.repeat(1024)),
+      evidence_used: Array.from({ length: 16 }, () => ({ kind: 'log', reference: 'r'.repeat(512) })),
+      assumptions: Array.from({ length: 12 }, () => 's'.repeat(512)),
+      recommended_next_action: 'r'.repeat(2048),
+      validation_plan: Array.from({ length: 12 }, () => 'v'.repeat(1024)),
+      changes_made: Array.from({ length: 12 }, () => ({ paths: ['p'.repeat(200)], reason: 'r'.repeat(1024), validation: Array.from({ length: 12 }, () => 'v'.repeat(1024)) })),
+      confidence: 0.9, disposition: 'review', needs_more_evidence: false,
+    }, big)
+    expect(Buffer.byteLength(JSON.stringify(parsed))).toBeLessThanOrEqual(VERDICT_FIELD_BUDGETS.totalDelivered)
+    // The fitter preserves the verdict's spine: severity, summary and the
+    // first next-actions still carry signal.
+    expect(parsed.severity).toBe('blocker')
+    expect(parsed.summary).toBe('All checks failed')
+    expect(parsed.diagnosis.length).toBeGreaterThan(0)
+    expect(JSON.parse(JSON.stringify(parsed))).toMatchObject({ severity: 'blocker' })
   })
 })
 

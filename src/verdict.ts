@@ -30,16 +30,19 @@ export interface AdvisorVerdict {
   raw: string
 }
 
+// The enforced JSON-schema subset supports no maxItems/maxLength keywords —
+// limits travel as descriptions and are enforced by the budgets below.
 export const VERDICT_SCHEMA: ObjectJsonSchema = {
   type: 'object',
   properties: {
     severity: { type: 'string', enum: ['none', 'nit', 'concern', 'blocker'] },
     disposition: { type: 'string' },
-    summary: { type: 'string' },
-    diagnosis: { type: 'string' },
-    next_actions: { type: 'array', items: { type: 'string' } },
+    summary: { type: 'string', description: 'One line, at most 1 KB.' },
+    diagnosis: { type: 'string', description: 'At most 6 KB.' },
+    next_actions: { type: 'array', description: 'At most 8 items, 1 KB each.', items: { type: 'string' } },
     evidence_used: {
       type: 'array',
+      description: 'At most 16 items; reference at most 512 bytes.',
       items: {
         type: 'object',
         properties: {
@@ -50,13 +53,14 @@ export const VERDICT_SCHEMA: ObjectJsonSchema = {
         additionalProperties: false,
       },
     },
-    assumptions: { type: 'array', items: { type: 'string' } },
-    recommended_next_action: { type: 'string' },
-    validation_plan: { type: 'array', items: { type: 'string' } },
+    assumptions: { type: 'array', description: 'At most 12 items, 512 bytes each.', items: { type: 'string' } },
+    recommended_next_action: { type: 'string', description: 'At most 2 KB.' },
+    validation_plan: { type: 'array', description: 'At most 12 items, 1 KB each.', items: { type: 'string' } },
     needs_more_evidence: { type: 'boolean' },
     confidence: { type: 'number' },
     changes_made: {
       type: 'array',
+      description: 'At most 12 items; reason at most 1 KB, validation 12 items of 1 KB each.',
       items: {
         type: 'object',
         properties: {
@@ -167,6 +171,57 @@ function findJsonObject(text: string): string | null {
   return null
 }
 
+/** Largest prefix of `text` whose JSON serialization stays within `bytes`. */
+function fitStringToJsonBytes(text: string, bytes: number): string {
+  if (bytes <= 0) return ''
+  // The escaped length of a prefix is not linear in characters, so measure the
+  // serialized form — marker included — instead of trusting byte arithmetic.
+  let low = 0
+  let high = text.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    const candidate = mid === text.length ? text : text.slice(0, mid) + '…'
+    if (Buffer.byteLength(JSON.stringify(candidate)) <= bytes) low = mid
+    else high = mid - 1
+  }
+  return low === text.length ? text : text.slice(0, low) + '…'
+}
+
+/**
+ * Fit the WHOLE structured verdict under the delivered budget, degrading in a
+ * fixed order: the redundant raw transcript first, then bounded arrays, and
+ * finally the diagnosis to whatever room the remaining skeleton leaves. The
+ * result always serializes within the budget — a fixed-round loop cannot
+ * promise that, because trimming by the overage count does not account for
+ * JSON escaping or the per-field suffix markers.
+ */
+export function fitVerdictToBudget(verdict: AdvisorVerdict): AdvisorVerdict {
+  const within = (value: AdvisorVerdict) => Buffer.byteLength(JSON.stringify(value)) <= VERDICT_FIELD_BUDGETS.totalDelivered
+  if (within(verdict)) return verdict
+  const fitted: AdvisorVerdict = { ...verdict, raw: '' }
+  const shrinkItems = (items: string[] | undefined, keep: number, maxBytes: number): string[] | undefined =>
+    items === undefined ? undefined : items.slice(0, keep).map(item => truncateUtf8(item, maxBytes))
+  fitted.assumptions = shrinkItems(fitted.assumptions, 4, 256)
+  fitted.validationPlan = shrinkItems(fitted.validationPlan, 4, 512)
+  fitted.nextActions = shrinkItems(fitted.nextActions, 4, 512) ?? []
+  if (fitted.evidenceUsed !== undefined) fitted.evidenceUsed = fitted.evidenceUsed.slice(0, 8).map(item => ({ kind: truncateUtf8(item.kind, 64), reference: truncateUtf8(item.reference, 256) }))
+  if (fitted.changesMade !== undefined) fitted.changesMade = fitted.changesMade.slice(0, 6).map(change => ({ paths: change.paths.slice(0, 6), reason: truncateUtf8(change.reason, 512), validation: change.validation.slice(0, 4) }))
+  if (fitted.recommendedNextAction !== undefined) fitted.recommendedNextAction = truncateUtf8(fitted.recommendedNextAction, 1024)
+  if (within(fitted)) return fitted
+  // Second pass: the bounded arrays to their floor before long text is cut.
+  delete fitted.assumptions
+  fitted.evidenceUsed = fitted.evidenceUsed?.slice(0, 4)
+  fitted.validationPlan = fitted.validationPlan?.slice(0, 2)
+  fitted.nextActions = fitted.nextActions.slice(0, 2)
+  fitted.changesMade = fitted.changesMade?.slice(0, 2)
+  if (within(fitted)) return fitted
+  // The diagnosis takes exactly the room the remaining skeleton leaves — this
+  // branch always fits, because the skeleton alone stays far under the cap.
+  const skeleton: AdvisorVerdict = { severity: fitted.severity, summary: fitted.summary, diagnosis: '', nextActions: fitted.nextActions, raw: '' }
+  const room = VERDICT_FIELD_BUDGETS.totalDelivered - Buffer.byteLength(JSON.stringify(skeleton))
+  return { severity: fitted.severity, summary: fitted.summary, diagnosis: fitStringToJsonBytes(fitted.diagnosis, Math.max(0, room)), nextActions: fitted.nextActions, raw: '' }
+}
+
 export function verdictFromStructured(value: unknown, rawInput = ''): AdvisorVerdict {
   const parsed = asRecord(value) ?? {}
   const severityRaw = asString(parsed.severity).toLowerCase()
@@ -188,24 +243,10 @@ export function verdictFromStructured(value: unknown, rawInput = ''): AdvisorVer
   const summary = asString(parsed.summary, VERDICT_FIELD_BUDGETS.summary) || 'Advisor review'
   const diagnosis = asString(parsed.diagnosis, VERDICT_FIELD_BUDGETS.diagnosis) || raw.slice(0, VERDICT_FIELD_BUDGETS.diagnosis) || 'No diagnosis returned.'
   const nextActions = asStringArray(parsed.next_actions ?? parsed.nextActions ?? parsed.actions, 8, VERDICT_FIELD_BUDGETS.action)
-  // Enforce a total delivered budget: fields above are individually capped but
-  // their sum can still exceed the telemetry/context budget. The raw transcript
-  // excerpt is trimmed first (it duplicates the structured fields), then the
-  // diagnosis, so the published verdict always fits the budget.
-  let trimmedRaw = raw
-  let trimmedDiagnosis = diagnosis
-  for (let round = 0; round < 3; round++) {
-    let totalBytes = 0
-    try { totalBytes = Buffer.byteLength(JSON.stringify({ summary, diagnosis: trimmedDiagnosis, nextActions, evidenceUsed, assumptions, recommendedNextAction, validationPlan, changesMade, raw: trimmedRaw })) } catch { break }
-    const over = totalBytes - VERDICT_FIELD_BUDGETS.totalDelivered
-    if (over <= 0) break
-    if (trimmedRaw.length > 0) trimmedRaw = truncateUtf8(trimmedRaw, Math.max(0, Buffer.byteLength(trimmedRaw) - over))
-    else trimmedDiagnosis = truncateUtf8(trimmedDiagnosis, Math.max(0, Buffer.byteLength(trimmedDiagnosis) - over))
-  }
-  return {
+  return fitVerdictToBudget({
     severity,
     summary,
-    diagnosis: trimmedDiagnosis,
+    diagnosis,
     nextActions,
     ...(confidenceRaw === undefined ? {} : { confidence: Math.max(0, Math.min(1, confidenceRaw)) }),
     ...(disposition ? { disposition } : {}),
@@ -215,8 +256,8 @@ export function verdictFromStructured(value: unknown, rawInput = ''): AdvisorVer
     ...(validationPlan.length ? { validationPlan } : {}),
     ...(needsMoreEvidence === undefined ? {} : { needsMoreEvidence }),
     ...(changesMade.length ? { changesMade } : {}),
-    raw: trimmedRaw,
-  }
+    raw,
+  })
 }
 
 function fallbackSeverity(raw: string): AdvisorSeverity {
@@ -234,11 +275,11 @@ export function parseVerdict(rawInput: string): AdvisorVerdict {
     try { return verdictFromStructured(JSON.parse(candidate), raw) } catch {}
   }
   const severity = fallbackSeverity(raw)
-  return {
+  return fitVerdictToBudget({
     severity,
     summary: severity === 'none' ? 'No issue found' : 'Advisor returned unstructured guidance',
     diagnosis: raw || 'No advisor text was returned.',
     nextActions: [],
     raw,
-  }
+  })
 }
