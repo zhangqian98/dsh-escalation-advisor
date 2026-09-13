@@ -59,14 +59,6 @@ export interface AdvisorTurnResult {
   readonly usage?: { inputTokens: number; outputTokens: number }
 }
 
-/** Temporary diagnostic trace for the rc.1 turn-closure stall (env-gated, sync). Remove before release. */
-export function traceAdvisor(tag: string, extra?: Record<string, unknown>): void {
-  try {
-    if (typeof process === 'undefined' || process.env.DSH_ADVISOR_TRACE !== '1') return;
-    process.stderr.write('[adv-trace] ' + Date.now() + ' ' + tag + (extra ? ' ' + JSON.stringify(extra) : '') + '\n');
-  } catch { /* never disturb the run */ }
-}
-
 export class AdvisorUnavailableError extends Error {
   constructor(message: string, readonly code = 'advisor_unavailable', readonly transient = false) { super(redactSecrets(message)); this.name = 'AdvisorUnavailableError' }
 }
@@ -407,7 +399,6 @@ export async function callAdvisor(
    */
   normalizeConsultationId = (value: string): string => value.replace(/#.*$/, ''),
 ): Promise<AdvisorRunResult> {
-  traceAdvisor('call-enter', { kind: continuation.kind, timeoutMs: config.timeoutMs })
   if (!config.provider.trim() || !config.model.trim()) throw new AdvisorUnavailableError('Advisor provider/model is not configured.', 'configuration')
   const subagents = parent.ctx.get('subagents') ?? ctx.get('subagents')
   if (!subagents) throw new AdvisorUnavailableError('DSH subagent runtime is unavailable.', 'configuration')
@@ -512,9 +503,7 @@ export async function callAdvisor(
       if (address) {
         // Authorization is the EXACT live requesting Agent: the runtime rejects a
         // sender that is not the live direct parent of the addressed child.
-        traceAdvisor('dispatch-send-enter');
         messageId = String(await subagents.sendMessage(parent, SessionId(conversationId), [{ type: 'text', text: prefix + continuation.prompt }], { signal: callSignal }))
-        traceAdvisor('dispatch-send-return');
         ownDelivery = true
         // Bind BEFORE replaying buffered claims: an early claim replays through
         // onClaim during observed.bind and must find the message binding, or its
@@ -522,7 +511,6 @@ export async function callAdvisor(
         if (!lifecycle.registry.bindTurn({ invocationId: identity.invocationId, childSessionId: conversationId, messageId })) throw new AdvisorUnavailableError('Unable to bind the Advisor delivery to its authorization.', 'retryable_start', true)
         observed.bind(conversationId, messageId)
       } else {
-        traceAdvisor('dispatch-start-enter');
         const request: AdvisorStartRequest = {
           prompt: [{ type: 'text', text: prefix + continuation.prompt }], parent,
           // Explicit undefined clears the spawn provider's inherited parent cap;
@@ -535,7 +523,6 @@ export async function callAdvisor(
         const child = await subagents.startContinuable({
           provider: config.subagentProvider.trim() || 'spawn', label, signal: callSignal, request,
         })
-        traceAdvisor('dispatch-start-return');
         conversationId = String(child.childId)
         messageId = String(child.messageId)
         ownDelivery = true
@@ -573,9 +560,7 @@ export async function callAdvisor(
     boundChild = true
     try {
 
-      traceAdvisor('closure-await-enter');
       const closed = await observed.closed
-      traceAdvisor('closure-settled', { hasTurnEnd: closed.turnEnd !== undefined, claimedTurn: closed.claimedTurn });
       claimed = closed.messageId !== undefined
       const turnEnd = closed.turnEnd
       if (turnEnd === undefined) {
@@ -598,7 +583,6 @@ export async function callAdvisor(
         if (closed.messageId !== undefined && closed.claimedTurn !== undefined) lifecycle.registry.noteClaimedTurn(conversationId, closed.messageId, closed.claimedTurn);
       } catch {}
       const reconciled = lifecycle.collector.reconcile(collectorId, { stopReason: kind, turnEnd: { seq: closure.seq, kind }, turn: closure.turn, ...(closed.messageId === undefined ? {} : { messageId: closed.messageId }), ...(messageId === undefined ? {} : { authorizedMessageId: messageId }) })
-      traceAdvisor('reconciled', { published: reconciled.published, reason: reconciled.published ? undefined : reconciled.reason });
       if (!reconciled.published) {
         if (kind !== 'completed') {
           const facts = reasonFacts(turnEnd)
@@ -607,13 +591,11 @@ export async function callAdvisor(
         throw new AdvisorUnavailableError('Advisor returned no usable verdict: ' + reconciled.reason, NO_VERDICT)
       }
       published = true
-      traceAdvisor('delivering');
       return { verdict: reconciled.verdict, childSessionId: conversationId, consultationId, collectorId, invocationId: identity.invocationId, lastSeq: requesterSeq(parent), ...usageOfTurn(ctx, conversationId, closure.turn) }
     } finally {
       callSignal.removeEventListener('abort', onAbort)
     }
   } catch (error) {
-    traceAdvisor('call-throw', { code: error instanceof AdvisorUnavailableError ? error.code : 'non-advisor', message: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160) });
     // The child may hold an open turn from a failure after accepted delivery
     // (bind/onPublished/collector wiring): stop it so nothing runs on after the
     // authorization is revoked below. A closed or absent target is a no-op, and
