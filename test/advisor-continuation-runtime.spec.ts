@@ -336,13 +336,18 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
     expect(first.isError, first.text).toBe(false)
     const answerOne = asAnswer(first.value)
 
-    // The verdict object shape is unchanged by the migration: the seven fields
-    // the requester always saw, plus the rich fields of the structured verdict.
+    // The answer shape carries the pinned consultation identity: the seven fields
+    // the requester always saw, plus the rich fields of the structured verdict,
+    // plus the pinned model route and tool ceiling (no profile is configured in
+    // this harness, so no advisor_profile key is present).
     expect(Object.keys(answerOne).sort()).toEqual([
-      'assumptions', 'changes_made', 'child_session_id', 'confidence', 'consultation_id',
-      'diagnosis', 'disposition', 'evidence_used', 'needs_more_evidence', 'next_actions',
+      'assumptions', 'capabilities', 'changes_made', 'child_session_id', 'confidence', 'consultation_id',
+      'diagnosis', 'disposition', 'evidence_used', 'model', 'needs_more_evidence', 'next_actions',
       'recommended_next_action', 'severity', 'status', 'summary', 'validation_plan',
     ])
+    expect(typeof answerOne.model).toBe('string');
+    expect((answerOne.model as string).length).toBeGreaterThan(0);
+    expect(Array.isArray(answerOne.capabilities)).toBe(true);
     expect(answerOne).toMatchObject({
       status: 'ok',
       severity: 'concern',
