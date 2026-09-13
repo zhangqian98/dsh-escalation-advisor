@@ -1,7 +1,10 @@
 import z from '@deepseek-ai/schemastery'
+import { parseAdvisorProfiles, parseProfileRoutes, type AdvisorProfile, type ProfileRouteTable } from './profiles.js'
 
 export const ADVISOR_MODES = ['manual', 'escalate', 'continuous'] as const
 export type AdvisorMode = (typeof ADVISOR_MODES)[number]
+export const ADVISOR_TRIGGERS = ['manual', 'escalation', 'completion', 'continuous'] as const
+export type AdvisorTrigger = (typeof ADVISOR_TRIGGERS)[number]
 export const SEVERITIES = ['none', 'nit', 'concern', 'blocker'] as const
 export type AdvisorSeverity = (typeof SEVERITIES)[number]
 export const WAIT_MODES = ['block', 'background'] as const
@@ -63,6 +66,30 @@ export interface Config {
   cooldownTurns: number
   continuousMinSeverity: AdvisorSeverity
   injectNits: boolean
+  /** Whether completion (pre-delivery) review runs for the root/main agent. Off by default to preserve existing behavior. */
+  completionMainAgent?: boolean
+  /** Whether completion review runs for local subagents. Off by default; when on it blocks worker settlement. */
+  completionLocalSubagents?: boolean
+  /** Wait behavior for completion review. */
+  completionWait?: AdvisorWaitMode
+  /** Minimum severity that steers/blocks delivery. */
+  completionMinSeverity?: AdvisorSeverity
+  /** Max completion review cycles per delivery (1 = review once, then allow finish). */
+  maxCompletionCycles?: number
+  /** Max subagent depth Advisor covers (-1 = all depths). */
+  localSubagentMaxDepth?: number
+  /** When non-empty, only these subagent labels/personas are covered. */
+  includeSubagentLabels?: string[]
+  /** Subagent labels/personas never covered. */
+  excludeSubagentLabels?: string[]
+  /** Named strong-model profiles the requester may select from. */
+  advisorProfiles?: AdvisorProfile[]
+  /** Default profile id for new consultations (empty = first allowed). */
+  defaultProfileId?: string
+  /** Allowed profile ids for this task tree (empty = all configured profiles). */
+  allowedProfileIds?: string[]
+  /** Per-trigger default profile routing for NEW consultations. */
+  profileRoutes?: ProfileRouteTable
 }
 
 export const Config = z.object({
@@ -100,10 +127,26 @@ export const Config = z.object({
   cooldownTurns: z.number().step(1).min(0).max(100).default(1),
   continuousMinSeverity: z.union([...SEVERITIES]).default('concern'),
   injectNits: z.boolean().default(true),
+  completionMainAgent: z.boolean().default(false),
+  completionLocalSubagents: z.boolean().default(false),
+  completionWait: z.union([...WAIT_MODES]).default('block'),
+  completionMinSeverity: z.union([...SEVERITIES]).default('concern'),
+  maxCompletionCycles: z.number().step(1).min(1).max(5).default(1),
+  localSubagentMaxDepth: z.number().step(1).min(-1).max(32).default(-1),
+  includeSubagentLabels: z.array(String).default([]),
+  excludeSubagentLabels: z.array(String).default([]),
+  advisorProfiles: z.any().default([]),
+  defaultProfileId: z.string().default(''),
+  allowedProfileIds: z.array(String).default([]),
+  profileRoutes: z.any().default({}),
 })
-
 export function routeConfigured(config: Config): boolean {
-  return config.enabled && config.provider.trim().length > 0 && config.model.trim().length > 0
+  if (config.enabled !== true) return false;
+  if (config.provider.trim().length > 0 && config.model.trim().length > 0) return true;
+  try {
+    const profiles = parseAdvisorProfiles((config as unknown as Record<string, unknown>).advisorProfiles);
+    return profiles.some(profile => profile.provider.trim().length > 0 && profile.model.trim().length > 0);
+  } catch { return false; }
 }
 
 export function severityRank(severity: AdvisorSeverity): number {

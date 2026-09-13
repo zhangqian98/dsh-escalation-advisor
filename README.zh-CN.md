@@ -30,7 +30,7 @@ Advisor 运行在**可见的 DSH 子会话**中，不是隐藏的 LLM 请求。�
 把经过验证的精确版本安装到 Web profile，然后启动或重启 DSH：
 
 ```bash
-dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.27
+dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.28
 dsh web
 ```
 
@@ -41,7 +41,7 @@ dsh web
 也可以安装不可变的 GitHub release tag：
 
 ```bash
-dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.27
+dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.28
 ```
 
 不要使用移动的 `alpha` 标签来代替已经验证的精确版本；DSH prerelease 之间可能存在运行时契约变化。
@@ -54,7 +54,7 @@ dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-al
 npm ci
 npm run check
 npm pack
-dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.27.tgz
+dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.28.tgz
 ```
 
 ## 兼容性
@@ -294,7 +294,7 @@ $env:DSH_RUNTIME_PACKAGE_JSON = "$env:APPDATA/npm/node_modules/@deepseek-ai/dsh/
 npx vitest run --config vitest.runtime.config.ts
 ```
 
-发布 tag 必须为 `v<package-version>`，例如 `v0.1.0-alpha.27`。Release 工作流会校验 tag 与 package version、运行完整检查、生成 npm tarball、上传到 GitHub Release，并通过 npm Trusted Publishing（OIDC）发布到 npm 的 `alpha` dist-tag。工作流不保存长期 npm 发布 token。
+发布 tag 必须为 `v<package-version>`，例如 `v0.1.0-alpha.28`。Release 工作流会校验 tag 与 package version、运行完整检查、生成 npm tarball、上传到 GitHub Release，并通过 npm Trusted Publishing（OIDC）发布到 npm 的 `alpha` dist-tag。工作流不保存长期 npm 发布 token。
 
 ## 许可证
 

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -9,10 +9,10 @@ import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { Config as ConfigSchema, routeConfigured, severityRank, type Config as AdvisorConfig } from './config.js'
-import { coverageEnabled, type AdvisorAgentRole } from './coverage.js'
-import { buildCasePacket, hasNewMaterialConclusion, textContent } from './context.js'
+import { coverageEnabled, subagentInScope, type AdvisorAgentRole } from './coverage.js'
+import { buildCasePacket, hasNewMaterialConclusion, narrowCoveredByVerdict, textContent } from './context.js'
 import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, requesterSeq, START_REJECTED, type AdvisorRunResult, type AdvisorContinuation } from './model-runner.js'
-import { effectiveAdvisorPolicy, installAdvisorPolicyCommand } from './policy.js'
+import { effectiveAdvisorPolicy, installAdvisorPolicyCommand, sessionPolicyOverride, triggerEnabledForRole } from './policy.js'
 import { GOAL_ROUND_ADVISOR_ROUTE, toolGuidance } from './prompts.js'
 import { EscalationTracker, classifyToolOutcome, faithfulValidationCall, mutationKey, type EscalationDecision } from './state.js'
 import { MAX_AUTO_REMINDERS_PER_TASK, ObligationStore, opensObligation, type Obligation } from './obligations.js'
@@ -26,7 +26,8 @@ import type { AdvisorVerdict } from './verdict.js'
 import { ADVISOR_VERDICT_TOOL, AdvisorVerdictCollector, registerAdvisorVerdictTool } from './verdict-tool.js'
 import { AdvisorRemoteService } from './remote.js'
 import { installAdvisorEventCompatibility } from './session-events.js'
-import { advisorModelConfig } from './model-selection.js'
+import { advisorModelConfig, sessionProfileSelection } from './model-selection.js'
+import { effectiveAllowedProfiles, intersectToolCeiling, parseAdvisorProfiles, parseProfileRoutes, profileTools, resolveProfileForNewConsultation, type AdvisorProfile } from './profiles.js'
 
 export const name = 'dsh-escalation-advisor'
 export const inject = ['tools', 'settings', 'systemPrompt', 'agents']
@@ -35,7 +36,10 @@ export type PluginConfig = AdvisorConfig
 export const SETTINGS_NAMESPACE = 'escalation-advisor'
 export const ADVISOR_TOOL_NAME = 'consult_advisor'
 const INTERNAL_TOOLS = new Set(['structured_output', 'run_code', ADVISOR_VERDICT_TOOL])
-interface AskAdvisorArgs { question: string; goal?: string; current_hypothesis?: string; decision_needed?: string; evidence?: string[]; failed_attempts?: string[]; attempts?: string; context?: string; consultation_id?: string }
+interface AskAdvisorArgs { question: string; goal?: string; current_hypothesis?: string; decision_needed?: string; evidence?: string[]; failed_attempts?: string[]; attempts?: string; context?: string; consultation_id?: string; advisor_profile?: string }
+interface ConsultationSnapshot { provider: string; model: string; reasoningEffort: string; toolCeiling: string[]; advisorProfile?: string; routingReason: string; snapshotMissing?: boolean }
+function snapshotHash(tools: readonly string[]): string { try { return createHash('sha256').update([...tools].sort().join('\n')).digest('hex').slice(0, 16) } catch { return '' } }
+function cleanProfileArg(value: unknown): string | undefined { if (typeof value !== 'string') return undefined; const id = value.trim().slice(0, 64); if (!id || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(id)) return undefined; return id }
 interface ReviewTrigger { turn: number; step?: number; decision?: EscalationDecision }
 
 /**
@@ -116,11 +120,13 @@ function dispositionNote(item: Obligation): string {
     : recorded + ' (outrun by later evidence), not verified'
 }
 function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor unavailable', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', consultation_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
-function toolAnswer(answer: AdvisorRunResult, consultationId: string) {
+function toolAnswer(answer: AdvisorRunResult, consultationId: string, snapshot?: ConsultationSnapshot) {
   const verdict = answer.verdict
   return { status: 'ok' as const, severity: verdict.severity, summary: verdict.summary, diagnosis: verdict.diagnosis, next_actions: verdict.nextActions, confidence: verdict.confidence ?? 0, child_session_id: answer.childSessionId,
     // The durable handle for delivering a follow-up turn in the SAME Advisor conversation.
     consultation_id: consultationId,
+    ...(snapshot?.advisorProfile ? { advisor_profile: snapshot.advisorProfile } : {}),
+    ...(snapshot ? { model: snapshot.provider + '/' + snapshot.model, capabilities: [...snapshot.toolCeiling] } : {}),
     disposition: verdict.disposition ?? 'review', evidence_used: verdict.evidenceUsed ?? [], assumptions: verdict.assumptions ?? [], recommended_next_action: verdict.recommendedNextAction ?? '', validation_plan: verdict.validationPlan ?? [], needs_more_evidence: verdict.needsMoreEvidence ?? false, changes_made: verdict.changesMade ?? [] }
 }
 
@@ -217,7 +223,42 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   const roleOf = (agent: Agent): AdvisorAgentRole => registry.identity(agent) ? 'advisor' : agent.session.header.parentSession === undefined ? 'root' : 'local-subagent'
   const manualEnabled = (agent: Agent): boolean => {
     const config = configFor(agent)
-    return routeConfigured(config) && coverageEnabled(config, 'manual', roleOf(agent))
+    if (!routeConfigured(config)) return false
+    try {
+      const root = taskRootAgent(ctx, agent)
+      const override = sessionPolicyOverride(root.session)
+      if (!triggerEnabledForRole(config, override, 'manual', roleOf(agent) === 'advisor' ? 'root' : roleOf(agent) as 'root' | 'local-subagent')) return false
+      if (roleOf(agent) === 'advisor') return false
+      if (roleOf(agent) === 'local-subagent') {
+        const depth = subagentDepth(ctx, agent)
+        if (!subagentInScope({ config, override, depth, label: subagentLabel(agent) })) return false
+      }
+      return true
+    } catch { return routeConfigured(config) && coverageEnabled(config, 'manual', roleOf(agent)) }
+  }
+  function subagentDepth(ctxRef: Context, agent: Agent): number {
+    let depth = 0
+    let current: Agent | undefined = agent
+    const seen = new Set<string>()
+    while (current && current.session.header.parentSession !== undefined && !seen.has(String(current.id))) {
+      seen.add(String(current.id))
+      depth += 1
+      const parent = ctxRef.agents.get(current.session.header.parentSession)
+      if (!parent) break
+      current = parent
+      if (depth > 32) break
+    }
+    return depth
+  }
+  function subagentLabel(agent: Agent): string {
+    try {
+      const header = agent.session.header as unknown as Record<string, unknown>
+      const label = (header as { label?: unknown }).label
+      if (typeof label === 'string') return label
+      const agentRec = agent as unknown as Record<string, unknown>
+      if (typeof agentRec.label === 'string') return agentRec.label as string
+    } catch { /* ignore */ }
+    return ''
   }
   const refreshTool = (agent: Agent): void => {
     // The verdict channel is host-wide only so the Advisor child can inherit it;
@@ -237,7 +278,13 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     refreshTool(agent)
     if (!config.enabled) return { available: false, reason: 'Advisor 已关闭', text: '' }
     if (!routeConfigured(config)) return { available: false, reason: '尚未配置顾问模型', text: '' }
-    if (!coverageEnabled(config, 'manual', roleOf(agent))) return { available: false, reason: '当前角色未启用主动咨询', text: '' }
+    try {
+      const root = taskRootAgent(ctx, agent)
+      const override = sessionPolicyOverride(root.session)
+      const role = roleOf(agent)
+      if (role === 'advisor') return { available: false, reason: '当前角色未启用主动咨询', text: '' }
+      if (!triggerEnabledForRole(config, override, 'manual', role as 'root' | 'local-subagent')) return { available: false, reason: '当前角色未启用主动咨询', text: '' }
+    } catch { if (!coverageEnabled(config, 'manual', roleOf(agent))) return { available: false, reason: '当前角色未启用主动咨询', text: '' } }
     if (ctx.tools.get(ADVISOR_TOOL_NAME, agent) === undefined) return { available: false, reason: '当前 agent 无权使用咨询工具', text: '' }
     return { available: true, reason: '使用指导已启用', text: toolGuidance(config.mode) }
   }
@@ -317,13 +364,85 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     else if (message.source.kind === 'user') goalRoundActive.delete(key)
   })
 
+  function snapshotFromRun(run: AdvisorRunRecord): ConsultationSnapshot {
+    if (run.provider && run.model && Array.isArray(run.toolCeiling)) {
+      return {
+        provider: run.provider,
+        model: run.model,
+        reasoningEffort: run.reasoningEffort ?? '',
+        toolCeiling: [...run.toolCeiling],
+        ...(run.advisorProfile ? { advisorProfile: run.advisorProfile } : {}),
+        routingReason: run.routingReason ?? 'restored',
+      }
+    }
+    // Legacy runs predate pinning: keep the route restorable but force a fresh
+    // consultation for model/tool claims instead of mislabeling today's defaults.
+    return { provider: '', model: '', reasoningEffort: '', toolCeiling: [], routingReason: 'legacy-missing', snapshotMissing: true }
+  }
+
+  function resolveSnapshotForNew(args: {
+    config: AdvisorConfig
+    policyAllowedTools: string[]
+    trigger: 'manual' | 'escalation' | 'completion' | 'continuous'
+    role: AdvisorAgentRole
+    explicitProfileId?: string
+    sessionDefaultProfileId?: string | null
+    sessionAllowedProfileIds?: string[]
+  }): { snapshot: ConsultationSnapshot; profile?: AdvisorProfile } {
+    const cfg = args.config as unknown as Record<string, unknown>
+    const profiles = parseAdvisorProfiles(cfg.advisorProfiles)
+    const globalAllowed = Array.isArray(cfg.allowedProfileIds) ? (cfg.allowedProfileIds as string[]) : []
+    const sessionAllowed = Array.isArray(args.sessionAllowedProfileIds) ? args.sessionAllowedProfileIds : []
+    const { constrained, allowed: effectiveAllowed } = effectiveAllowedProfiles(globalAllowed, sessionAllowed)
+    const globalDefault = typeof cfg.defaultProfileId === 'string' ? (cfg.defaultProfileId as string) : ''
+    const defaultProfileId = args.sessionDefaultProfileId ?? globalDefault
+    const routes = parseProfileRoutes(cfg.profileRoutes)
+    if (profiles.length > 0) {
+      if (constrained && effectiveAllowed.length === 0) throw new AdvisorUnavailableError('No advisor profile is allowed for this task: the global and session allow-lists do not overlap.', 'configuration')
+      const resolved = resolveProfileForNewConsultation({
+        profiles,
+        allowedProfileIds: effectiveAllowed,
+        defaultProfileId,
+        routes,
+        ...(args.explicitProfileId ? { explicitProfileId: args.explicitProfileId } : {}),
+        trigger: args.trigger,
+      })
+      if (args.explicitProfileId && !resolved) throw new AdvisorUnavailableError('Unknown advisor_profile "' + args.explicitProfileId + '" for this task. Omit consultation_id to list allowed profiles.', 'configuration')
+      if (resolved) {
+        const ceiling = intersectToolCeiling(args.policyAllowedTools, resolved)
+        return {
+          profile: resolved,
+          snapshot: {
+            provider: resolved.provider,
+            model: resolved.model,
+            reasoningEffort: resolved.reasoningEffort ?? '',
+            toolCeiling: ceiling,
+            advisorProfile: resolved.id,
+            routingReason: args.explicitProfileId ? 'explicit' : routes[args.trigger] === resolved.id ? 'trigger-route' : defaultProfileId === resolved.id ? 'default' : 'first-allowed',
+          },
+        }
+      }
+      throw new AdvisorUnavailableError('No configured advisor profile is available for this task: the allow-list matches no known profile. Legacy routing is disabled while profiles are configured.', 'configuration')
+    }
+    const base = args.config
+    return {
+      snapshot: {
+        provider: base.provider.trim(),
+        model: base.model.trim(),
+        reasoningEffort: base.reasoningEffort.trim(),
+        toolCeiling: [...args.policyAllowedTools],
+        routingReason: args.explicitProfileId ? 'explicit-legacy-missing' : 'legacy',
+      },
+    }
+  }
+
   /**
    * Continuable Advisor conversations, by the durable consultation id the
    * requesting agent sends back to continue one. Only ids issued by THIS live
    * root task are honored: an unknown or foreign id is refused, never silently
    * started as a fresh consultation.
    */
-  type ConsultationRecord = { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number; mode: ConsultationMode; taskAnchor: number; invocationId?: string; deliveredSeq: number }
+  type ConsultationRecord = { consultationId: string; childSessionId: string; requesterId: string; rootId: string; turns: number; mode: ConsultationMode; taskAnchor: number; invocationId?: string; deliveredSeq: number; snapshot: ConsultationSnapshot }
   const consultations = new Map<string, ConsultationRecord>()
   // A delivery counter, not wall-clock time and not map insertion order: "latest" has
   // to be deterministic, and a follow-up delivered into an OLDER conversation must
@@ -384,6 +503,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // a stale turn index and collide with the newer turn's channel identity.
         const kept = consultations.get(mapKey)
         if (kept !== undefined && (kept.turns ?? 0) >= (run.turns ?? 1)) continue
+        const snapshot = snapshotFromRun(run)
         consultations.set(mapKey, {
           consultationId: run.id,
           childSessionId: run.childSessionId,
@@ -394,6 +514,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
           // Records written before task scoping adopt the CURRENT task's anchor;
           // records that carry one are refused at lookup once the task moves on.
           taskAnchor: run.taskAnchor ?? latestUserSeq(root),
+          snapshot,
           deliveredSeq: ++delivered,
         })
       }
@@ -423,15 +544,31 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   ctx.effect(() => () => consultations.clear(), 'advisor: drop continuation records')
 
   const epochOf = (agent: Agent): number => workspaceEpoch.get(String(taskRootAgent(ctx, agent).id)) ?? 0
-  const consult = async (agent: Agent, mode: ConsultationMode, trigger: ReviewTrigger, args: AskAdvisorArgs, signal: AbortSignal, revision: string, options: { onStarted?: () => void; continuation?: { consultationId: string; publicId: string; childSessionId: string; turns: number } } = {}) => {
-    // Unique per consult() call: attempts restart at 1 on every follow-up call,
-    // so the turn identity must not recycle across calls sharing one consultation.
+  const consult = async (agent: Agent, mode: ConsultationMode, trigger: ReviewTrigger, args: AskAdvisorArgs, signal: AbortSignal, revision: string, options: { onStarted?: () => void; continuation?: { consultationId: string; publicId: string; childSessionId: string; turns: number; snapshot: ConsultationSnapshot } } = {}) => {
     const attemptNonce = randomUUID()
     const root = taskRootAgent(ctx, agent), id = options.continuation?.consultationId ?? randomUUID()
-    // The handle the FIRST turn minted, reused verbatim by every later turn: a caller
-    // that continues with the id it was handed gets that same id back.
     const publicId = options.continuation?.publicId ?? handleOf(id, 0)
-    const config = configFor(agent)
+    const baseConfig = configFor(agent)
+    const basePolicy = effectiveAdvisorPolicy(currentConfig(), root.session)
+    const roleForSnapshot: AdvisorAgentRole = roleOf(agent)
+    const triggerKind = mode === 'manual' ? 'manual' as const : mode === 'escalation' ? 'escalation' as const : mode === 'completion' ? 'completion' as const : 'continuous' as const
+    const explicitProfileId = cleanProfileArg((args as unknown as Record<string, unknown>).advisor_profile)
+    let snapshot: ConsultationSnapshot
+    if (options.continuation) {
+      const pinned = options.continuation.snapshot
+      if (pinned.snapshotMissing) throw new AdvisorUnavailableError('This consultation started before model pinning; start a new consultation by omitting consultation_id.', 'configuration')
+      if (explicitProfileId && pinned.advisorProfile && explicitProfileId !== pinned.advisorProfile) throw new AdvisorUnavailableError('This consultation is pinned to profile "' + pinned.advisorProfile + '". Omit consultation_id to start a new conversation.', 'configuration')
+      if (explicitProfileId && !pinned.advisorProfile) throw new AdvisorUnavailableError('This consultation predates named profiles; omit consultation_id to start fresh.', 'configuration')
+      snapshot = pinned
+    } else {
+      const sessionSel = sessionProfileSelection(root.session)
+      const resolved = resolveSnapshotForNew({ config: baseConfig, policyAllowedTools: basePolicy.allowedTools, trigger: triggerKind, role: roleForSnapshot, ...(explicitProfileId ? { explicitProfileId } : {}), ...(sessionSel.defaultProfileId ? { sessionDefaultProfileId: sessionSel.defaultProfileId } : {}), ...(sessionSel.allowedProfileIds.length > 0 ? { sessionAllowedProfileIds: sessionSel.allowedProfileIds } : {}) })
+      snapshot = resolved.snapshot
+      if (explicitProfileId && !snapshot.advisorProfile) throw new AdvisorUnavailableError('Unknown advisor_profile.', 'configuration')
+    }
+    const effectiveAllowedTools = [...new Set(snapshot.toolCeiling.filter(tool => basePolicy.allowedTools.includes(tool)))]
+    const effectivePolicy = { ...basePolicy, allowedTools: effectiveAllowedTools }
+    const config = { ...baseConfig, provider: snapshot.provider || baseConfig.provider, model: snapshot.model || baseConfig.model, reasoningEffort: snapshot.reasoningEffort || '' }
     const sinceSeq = mode === 'continuous' ? reviewed.get(String(agent.id))?.seq : undefined
     const turns = options.continuation?.turns ?? 0
     const epochAtDispatch = epochOf(agent)
@@ -451,6 +588,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         version: 1, id, requesterId: String(agent.id), mode, turn: trigger.turn, ...(trigger.step === undefined ? {} : { step: trigger.step }), collectorId, turns: turns + 1,
         taskRevision: revision, taskAnchor: taskAnchorOf(agent), ...(trigger.decision ? { fingerprint: trigger.decision.problemFingerprint, score: trigger.decision.score } : {}),
         attempt, status: 'reserved', timestamp: new Date().toISOString(), question: redactSecrets(args.question),
+        provider: snapshot.provider, model: snapshot.model, reasoningEffort: snapshot.reasoningEffort,
+        ...(snapshot.advisorProfile ? { advisorProfile: snapshot.advisorProfile } : {}),
+        toolCeiling: [...snapshot.toolCeiling], toolSnapshotHash: snapshotHash(snapshot.toolCeiling), routingReason: snapshot.routingReason,
       }
       const record = (patch: Partial<AdvisorRunRecord>) => { Object.assign(runRecord, Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)), { timestamp: new Date().toISOString() }); recordRun(agent, root, runRecord) }
       // Every attempt is tracked from `reserved`: an attempt that never reached the
@@ -459,7 +599,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       try {
         const result = await limiter.run(String(root.id), { maxTotal: config.maxAdvisorConsultsPerTask, maxConcurrent: config.maxConcurrentAdvisorRuns, trackStart: true }, attemptSignal, async markStarted => {
           if (!fresh(agent, revision)) throw new AdvisorUnavailableError('Task changed before Advisor started.', 'stale')
-          const policy = effectiveAdvisorPolicy(currentConfig(), root.session)
+          const policy = effectivePolicy
           const surface = advisorToolSurface(ctx, agent, policy, config.capabilityAmplifierTools)
           const exclusive = surface.allowedTools.some(tool => toolEffect(tool, config.readOnlyTools, config.mutatingTools) !== 'read-only')
           const ancestors: string[] = []
@@ -495,7 +635,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
               onPublished: childSessionId => { if (continuation.kind === 'continue') continuation = { kind: 'continue', childSessionId, prompt: '' }; record({ childSessionId }) },
             })
 
-            return { answer, lastSeq: packet.lastSeq }
+            return { answer, lastSeq: packet.lastSeq, coveredFingerprints: packet.coveredFingerprints, coveredCallIds: packet.coveredCallIds }
           })
         })
         if (!result) { record({ status: 'skipped' }); return undefined }
@@ -509,13 +649,13 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
           // The route survives so the conversation can still be continued by
           // explicit id, but a stale run never DELIVERED: it must not move the
           // "last" pointer or the delivered LRU ordering.
-          rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode, taskAnchor: taskAnchorOf(agent), invocationId: result.answer.invocationId }, false)
+          rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode, taskAnchor: taskAnchorOf(agent), invocationId: result.answer.invocationId, snapshot }, false)
           return undefined
         }
         // Bound telemetry: the full verdict lives in the Advisor child transcript;
         // the requester/root log keeps a bounded digest, never an unbounded copy.
         {
-          const full = mode === 'manual' ? JSON.stringify(toolAnswer(result.answer, publicId)) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId, publicId).content)
+          const full = mode === 'manual' ? JSON.stringify(toolAnswer(result.answer, publicId, snapshot)) : textContent(adviceMessage(result.answer.verdict, mode, result.answer.childSessionId, publicId).content)
           const bounded = truncateUtf8(full, 4096)
           record({ status: 'delivered', childSessionId: result.answer.childSessionId, summary: truncateUtf8(result.answer.verdict.summary, 1024), severity: result.answer.verdict.severity, usage: result.answer.usage, verdictTool: ADVISOR_VERDICT_TOOL,
             responseText: bounded })
@@ -532,10 +672,21 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
           // Every covered fingerprint records THIS delivery's structural epoch:
           // a shared epoch would let a later review of problem B refresh problem
           // A's coverage across an intervening workspace change.
-          if (fp) entry.fingerprints.set(fp, { epoch, seq: result.lastSeq })
-          // A manual review carries no trigger decision, so it covers the live
-          // problems instead: without this it would suppress nothing at all.
-          for (const live of tracker.currentFingerprints(key)) entry.fingerprints.set(live, { epoch, seq: result.lastSeq })
+          // Only verifiably examined problems are marked covered: the trigger
+          // fingerprint is explicit host scope (the consultation was raised for it
+          // and its trigger section is delivered), everything else needs verdict
+          // attribution — a named delivered tool call or an explicitly claimed
+          // fingerprint verified against the packet candidates. A narrow manual
+          // question therefore never suppresses unrelated live problems.
+          const packetCovered: string[] = Array.isArray((result as unknown as Record<string, unknown>).coveredFingerprints) ? (result as unknown as { coveredFingerprints: string[] }).coveredFingerprints : (fp ? [fp] : [])
+          const packetCalls: string[] = Array.isArray((result as unknown as Record<string, unknown>).coveredCallIds) ? (result as unknown as { coveredCallIds: string[] }).coveredCallIds : []
+          const narrowed = narrowCoveredByVerdict({
+            candidates: packetCovered,
+            evidenceUsed: result.answer.verdict.evidenceUsed ?? [],
+            coveredCallIds: packetCalls,
+            callsForFingerprint: fingerprint => tracker.evidence(key).filter(ev => ev.fingerprint === fingerprint && ev.callId).map(ev => ev.callId as string),
+          })
+          for (const covered of [...(fp ? [fp] : []), ...narrowed]) entry.fingerprints.set(covered, { epoch, seq: result.lastSeq })
           // Bound the fingerprint map: the oldest coverage is the least useful.
           while (entry.fingerprints.size > 64) entry.fingerprints.delete(entry.fingerprints.keys().next().value!)
           entry.evidenceVersion = tracker.observationCount(key)
@@ -545,7 +696,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         }
         // The id stays stable for the whole conversation so a follow-up turn can
         // address the SAME child session instead of starting a new consultation.
-        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode, taskAnchor: taskAnchorOf(agent), invocationId: result.answer.invocationId })
+        rememberConsultation({ consultationId: id, childSessionId: result.answer.childSessionId, requesterId: String(agent.id), rootId: String(root.id), turns: turns + 1, mode, taskAnchor: taskAnchorOf(agent), invocationId: result.answer.invocationId, snapshot })
         return result.answer
 
       } catch (error) {
@@ -577,6 +728,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       // Continue an EXISTING consultation as a new turn of the SAME Advisor
       // conversation: earlier context, persona and tool policy stay intact.
       consultation_id: { type: 'string', description: 'Continue an earlier Advisor conversation instead of starting a new one: pass the consultation_id that earlier result returned. Reuse it when this question builds on that review — supplying the evidence it asked for, challenging its verdict, or refining the same decision — because the advisor keeps its earlier context, persona and tool policy. Omit it for an unrelated problem, and also when you want a deliberately independent reassessment of a related one: a fresh consultation does not inherit the earlier framing. An unknown or foreign id is refused rather than silently restarted as a new consultation. The literal value "last" means the most recent DELIVERED manual consultation YOU opened on this task — not simply whatever was discussed most recently, and automatic consultations and failed or still-running calls do not count. The reply reports the concrete consultation_id it resolved to, so you always learn which conversation you actually continued.' },
+      advisor_profile: { type: 'string', description: 'Named advisor profile for a NEW consultation (debugger, architect, security, reviewer). The model may only choose from human-approved profiles; arbitrary provider/model values are rejected. When continuing with consultation_id, the profile must match the pinned profile or be omitted — a different profile starts a new conversation.' },
 
     },
     output: {
@@ -591,7 +743,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         } } },
         status: { type: 'string', required: true, enum: ['ok', 'unavailable', 'error'] }, severity: { type: 'string', required: true, enum: ['none', 'nit', 'concern', 'blocker'] },
         summary: { type: 'string', required: true }, diagnosis: { type: 'string', required: true }, next_actions: { type: 'array', required: true, items: { type: 'string' } },
-        confidence: { type: 'number', required: true }, child_session_id: { type: 'string', required: true }, consultation_id: { type: 'string', required: true },
+        confidence: { type: 'number', required: true }, child_session_id: { type: 'string', required: true }, consultation_id: { type: 'string', required: true }, advisor_profile: { type: 'string' }, model: { type: 'string' }, capabilities: { type: 'array', items: { type: 'string' } },
       } },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
@@ -610,7 +762,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       // back verbatim: the handle a caller was handed always continues its own
       // conversation, and always comes back to it unchanged.
       const refundReservation = (): void => { manualReserved.set(key, Math.max(0, (manualReserved.get(key) ?? 1) - 1)) }
-      let continuation: { consultationId: string; publicId: string; childSessionId: string; turns: number } | undefined
+      let continuation: { consultationId: string; publicId: string; childSessionId: string; turns: number; snapshot: ConsultationSnapshot } | undefined
       if (typeof args.consultation_id === 'string' && args.consultation_id.trim()) {
         const requested = args.consultation_id.trim()
         const rootId = String(taskRootAgent(ctx, agent).id)
@@ -625,12 +777,14 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         if (requested.toLowerCase() === LATEST_ALIAS) {
           const latest = latestManualConsultation(key, rootId, taskAnchor)
           if (!latest) { refundReservation(); return unavailable('There is no earlier manual consultation to continue: "last" means the most recent DELIVERED manual consultation by this agent on this task, and there is none. A failed or still-running consultation does not count. Start a new consultation by omitting consultation_id.') }
-          continuation = { consultationId: latest.consultationId, publicId: handleOf(latest.consultationId, 0), childSessionId: latest.childSessionId, turns: latest.turns }
+          continuation = { consultationId: latest.consultationId, publicId: handleOf(latest.consultationId, 0), childSessionId: latest.childSessionId, turns: latest.turns, snapshot: latest.snapshot }
         } else {
           const found = consultations.get(handleBase(requested))
           if (!found) { refundReservation(); return unavailable('Unknown consultation id: this agent has no open consultation with that id. Start a new consultation by omitting consultation_id.') }
           if (found.requesterId !== key || found.rootId !== rootId || found.taskAnchor !== taskAnchor) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
-          continuation = { consultationId: found.consultationId, publicId: requested, childSessionId: found.childSessionId, turns: found.turns }
+          const requestedProfile = cleanProfileArg((args as unknown as Record<string, unknown>).advisor_profile)
+          if (requestedProfile && found.snapshot.advisorProfile && requestedProfile !== found.snapshot.advisorProfile) { refundReservation(); return unavailable('This consultation is pinned to profile "' + found.snapshot.advisorProfile + '". Omit consultation_id to start a new conversation with "' + requestedProfile + '".') }
+          continuation = { consultationId: found.consultationId, publicId: requested, childSessionId: found.childSessionId, turns: found.turns, snapshot: found.snapshot }
         }
       }
       try {
@@ -643,7 +797,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // follow-up turn addresses, and it stays stable for the whole conversation.
         // It is the PUBLIC id — never this turn's internal collector identity, which
         // no map accepts as a continuation id.
-        return answer ? toolAnswer(answer, answer.consultationId) : unavailable('Advisor result expired after the task changed.')
+        if (!answer) return unavailable('Advisor result expired after the task changed.')
+        const record = consultations.get(handleBase(answer.consultationId))
+        return toolAnswer(answer, answer.consultationId, record?.snapshot)
       } catch (error) { return unavailable(error instanceof Error ? error.message : String(error)) }
       finally { manualReserved.set(key, Math.max(0, (manualReserved.get(key) ?? 1) - 1)) }
     },
@@ -882,11 +1038,21 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     }
   })
 
+  const completionCycles = new Map<string, number>()
   const automatic = async (agent: Agent, turn: number, step: number | undefined, signal: AbortSignal, preStep: boolean): Promise<UserMessage | undefined> => {
     const config = configFor(agent), role = roleOf(agent), key = String(agent.id)
     if (!routeConfigured(config) || config.mode === 'manual' || inFlight.has(key)) return
     const mode: ConsultationMode = config.mode === 'continuous' ? 'continuous' : 'escalation'
-    if (mode === 'continuous' && preStep || !coverageEnabled(config, mode, role)) return
+    const triggerForMode = mode === 'continuous' ? 'continuous' as const : 'escalation' as const
+    try {
+      const rootForGate = taskRootAgent(ctx, agent)
+      const override = sessionPolicyOverride(rootForGate.session)
+      const roleKey = role === 'advisor' ? null : role === 'root' ? 'root' as const : 'local-subagent' as const
+      if (roleKey === null) return
+      if (!triggerEnabledForRole(config, override, triggerForMode, roleKey)) return
+      if (role === 'local-subagent' && !subagentInScope({ config, override, depth: subagentDepth(ctx, agent), label: subagentLabel(agent) })) return
+    } catch { if (mode === 'continuous' && preStep || !coverageEnabled(config, mode, role)) return }
+    if (mode === 'continuous' && preStep) return
     if (mode === 'continuous' && reviewed.get(key)?.turn === turn) return
     const decision = mode === 'escalation' ? tracker.decision(key, turn, config) : undefined
     if (decision && !decision.shouldConsult) return
@@ -992,9 +1158,68 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     const obligationNote = due.length ? obligationMessage(due, [], false) : undefined
     return advice || notes.length || obligationNote ? { ...nextStep, messages: [...nextStep.messages, ...notes, ...(obligationNote ? [obligationNote] : []), ...(advice ? [advice] : [])] } : nextStep
   })
+  const completionReview = async (agent: Agent, turn: number, signal: AbortSignal): Promise<void> => {
+    const config = configFor(agent), role = roleOf(agent), key = String(agent.id)
+    if (!routeConfigured(config)) return
+    try {
+      const rootForGate = taskRootAgent(ctx, agent)
+      const override = sessionPolicyOverride(rootForGate.session)
+      const roleKey = role === 'advisor' ? null : role === 'root' ? 'root' as const : 'local-subagent' as const
+      if (roleKey === null) return
+      if (!triggerEnabledForRole(config, override, 'completion', roleKey)) return
+      if (role === 'local-subagent' && !subagentInScope({ config, override, depth: subagentDepth(ctx, agent), label: subagentLabel(agent) })) return
+    } catch { if (!coverageEnabled(config, 'completion', role)) return }
+    if (inFlight.has(key)) return
+    const cfg = config as unknown as { completionMinSeverity?: string; maxCompletionCycles?: number; completionWait?: string }
+    const maxCycles = cfg.maxCompletionCycles ?? 1
+    const cycleKey = key + ':' + revisionOf(agent)
+    if ((completionCycles.get(cycleKey) ?? 0) >= maxCycles) return
+    const taskStart = taskStarts.get(key) ?? 0
+    const open = role === 'root' ? obligations.open(key, taskStart) : []
+    const mark = reviewWatermark.get(key)
+    const hasNewEvidence = tracker.observationCount(key) > (mark?.evidenceVersion ?? -1)
+    const hasConclusion = hasNewMaterialConclusion(agent.session.snapshotEvents(), mark?.seq ?? -1)
+    const hasWork = structuralOf(agent) > 0 || hasNewEvidence || hasConclusion || open.length > 0
+    if (!hasWork) return
+    const revision = revisionOf(agent)
+    const policy = effectiveAdvisorPolicy(currentConfig(), taskRootAgent(ctx, agent).session)
+    const wait = policy.completionWait
+    const runOnce = async (runSignal: AbortSignal): Promise<void> => {
+      inFlight.add(key)
+      try {
+        const answer = await consult(agent, 'completion', { turn }, {
+          question: 'This task is preparing its final delivery. Judge whether it is really ready: check the original goal, success criteria, changed files, latest validation, unrun checks, open obligations and unconfirmed prior advice. Reply none/nit to allow delivery, or concern/blocker to require fixes first.',
+        }, runSignal, revision)
+        if (!answer || !fresh(agent, revision)) return
+        completionCycles.set(cycleKey, (completionCycles.get(cycleKey) ?? 0) + 1)
+        const verdict = answer.verdict
+        const changed = (verdict.changesMade?.length ?? 0) > 0
+        if (verdict.severity === 'none' && !changed) return
+        const threshold = Math.max(severityRank('concern'), severityRank((cfg.completionMinSeverity as AdvisorConfig['continuousMinSeverity']) ?? 'concern'))
+        if (!changed && severityRank(verdict.severity) < threshold) {
+          if (config.injectNits && role === 'root') futureNotes.set(key, [...futureNotes.get(key) ?? [], adviceMessage(verdict, 'completion', answer.childSessionId, answer.consultationId)].slice(-4))
+          return
+        }
+        agent.steer(adviceMessage(verdict, 'completion', answer.childSessionId, answer.consultationId))
+      } catch (error) {
+        logger.warn('Advisor completion review unavailable: ' + redactSecrets(error instanceof Error ? error.message : String(error)))
+      } finally { inFlight.delete(key) }
+    }
+    if (wait === 'background') {
+      const controller = new AbortController()
+      let active = controllers.get(key)
+      if (!active) { active = new Set(); controllers.set(key, active) }
+      active.add(controller)
+      void runOnce(AbortSignal.any([controller.signal, disposed.signal])).finally(() => { active!.delete(controller); if (!active!.size) controllers.delete(key) })
+      return
+    }
+    await runOnce(AbortSignal.any([signal, disposed.signal]))
+  }
+
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     goalRoundActive.delete(String(agent.id))
     await automatic(agent, turn, undefined, signal, false)
+    await completionReview(agent, turn, signal)
     if (roleOf(agent) !== 'root') return
     const key = String(agent.id), taskStartSeq = taskStarts.get(key) ?? 0
     const open = obligations.open(key, taskStartSeq)

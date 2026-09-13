@@ -5,7 +5,7 @@ import type { EscalationDecision, TrackerEvidence } from './state.js'
 export interface BuildCasePacketInput {
   requester: Agent
   root: Agent
-  mode: 'manual' | 'escalation' | 'continuous'
+  mode: 'manual' | 'escalation' | 'continuous' | 'completion'
   question: string
   currentHypothesis?: string
   decisionNeeded?: string
@@ -25,6 +25,10 @@ export interface CasePacketResult {
   prompt: string
   lastSeq: number
   meaningful: boolean
+  /** Fingerprints this packet actually includes (trigger + retained evidence). Deliveries must only mark these covered. */
+  coveredFingerprints: string[]
+  /** Call ids retained in the packet's canonical activity. */
+  coveredCallIds: string[]
 }
 
 interface EventRecord {
@@ -605,16 +609,63 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
     || failures.length > 0
     || validation.length > 0
     || delta.some(event => event.type === 'assistant/message' && materialAssistantConclusion(messageText(event)))
-  const prompt = JSON.stringify(fitCasePacket(redactValue(packet) as Record<string, unknown>))
+  const fitted = fitCasePacket(redactValue(packet) as Record<string, unknown>)
+  const prompt = JSON.stringify(fitted)
+  // Coverage candidates come from the FINAL fitted packet: fitCasePacket can drop
+  // tool_activity and truncate failures/validation, so pre-fit arrays may name
+  // evidence the Advisor never receives. Only delivered call ids count.
+  const fittedCalls = (value: unknown): string[] => Array.isArray(value) ? value.flatMap(item => {
+    const id = record(item)?.call_id
+    return typeof id === 'string' ? [id] : []
+  }) : []
+  const fittedPacket = record(fitted) ?? {}
+  const coveredCallIds = unique([...fittedCalls(fittedPacket.tool_activity), ...fittedCalls(fittedPacket.failures), ...fittedCalls(fittedPacket.validation)])
+  // Coverage candidates are an upper bound, not proof of review: with a trigger,
+  // only the trigger fingerprint plus trigger-related evidence (same validation
+  // identity or fingerprint as the trigger signals) can count, so reviewing B
+  // never refreshes A's per-fingerprint epoch. Without a trigger every delivered
+  // failure evidence is a candidate; the verdict attribution below decides what
+  // was actually examined.
+  const retainedObserved = (input.observedEvidence ?? []).filter(item => item.fingerprint && item.callId && coveredCallIds.includes(item.callId))
+  const scopedObserved = input.trigger ? retainedObserved.filter(item => triggerRelated(item.callId as string)) : retainedObserved
+  const coveredFingerprints = unique([
+    ...(input.trigger ? [input.trigger.problemFingerprint] : []),
+    ...scopedObserved.map(item => item.fingerprint as string),
+  ])
   return {
     // DSH owns token accounting for the complete model request, including its
     // system prompt and tool schemas. Bytes are not a model token limit.
     prompt,
     lastSeq,
     meaningful: input.mode === 'continuous' ? meaningfulDelta : true,
+    coveredFingerprints,
+    coveredCallIds,
   }
 }
 
 export function textContent(blocks: readonly unknown[]): string {
   return blockTexts(blocks).join('\n')
+}
+
+/**
+ * Verdict attribution (the stricter audit variant): retention is an upper bound
+ * on coverage, never proof of review. A candidate fingerprint is marked covered
+ * only with verifiable attribution — the verdict names one of its delivered
+ * tool calls (`{kind:'tool'}`), or explicitly claims the fingerprint itself
+ * (`{kind:'fingerprint'}`, verified against the candidates). Anything else,
+ * including an empty verdict or references that match nothing delivered, marks
+ * nothing: the trigger fingerprint itself is always marked separately by the
+ * caller as explicit host scope, so raising a consultation still counts.
+ */
+export function narrowCoveredByVerdict(args: {
+  candidates: readonly string[]
+  evidenceUsed: readonly { kind: string; reference: string }[]
+  coveredCallIds: readonly string[]
+  callsForFingerprint: (fingerprint: string) => readonly string[]
+}): string[] {
+  const delivered = new Set(args.coveredCallIds)
+  const toolRefs = new Set(args.evidenceUsed.filter(item => item.kind === 'tool').map(item => item.reference).filter(ref => delivered.has(ref)))
+  const fingerprintRefs = new Set(args.evidenceUsed.filter(item => item.kind === 'fingerprint').map(item => item.reference).filter(ref => args.candidates.includes(ref)))
+  if (toolRefs.size === 0 && fingerprintRefs.size === 0) return []
+  return args.candidates.filter(fingerprint => fingerprintRefs.has(fingerprint) || args.callsForFingerprint(fingerprint).some(callId => toolRefs.has(callId)))
 }

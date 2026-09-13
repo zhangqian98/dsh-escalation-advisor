@@ -1,7 +1,7 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { AdvisorSeverity } from './config.js'
 
-export type ConsultationMode = 'manual' | 'escalation' | 'continuous'
+export type ConsultationMode = 'manual' | 'escalation' | 'continuous' | 'completion'
 export interface AdvisorRunRecord {
   version: 1
   id: string
@@ -28,7 +28,19 @@ export interface AdvisorRunRecord {
   /** Consultation turn index this attempt belongs to (1-based); lets a restore continue counting. */
   turns?: number
   /** The task root's latest user-message seq at dispatch: the durable task anchor a restored continuation is checked against. */
+  /** The task root's latest user-message seq at dispatch: the durable task anchor a restored continuation is checked against. */
   taskAnchor?: number
+  /** Pinned consultation snapshot: first-turn model route, profile and tool ceiling. */
+  provider?: string
+  model?: string
+  reasoningEffort?: string
+  advisorProfile?: string
+  /** Sorted pinned tool ceiling (first-turn allowedTools). */
+  toolCeiling?: string[]
+  /** Hash of the pinned tool ceiling for UI/audit comparison. */
+  toolSnapshotHash?: string
+  /** Why this profile/route was chosen (explicit, trigger route, default, legacy). */
+  routingReason?: string
 }
 
 declare module '@deepseek-ai/dsh-session/types' {

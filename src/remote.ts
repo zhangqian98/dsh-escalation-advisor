@@ -3,12 +3,13 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { Remote, TypertRemoteService, type InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-typert-registry'
 import type { Config } from './config.js'
-import { catalogFor, resetPolicy, updateModeOverride, updateTimeoutOverride, updateToolOverride, updateWaitOverride } from './policy.js'
+import { catalogFor, parseCoverageOverride, resetPolicy, updateCoverageOverride, updateModeOverride, updateSessionProfiles, updateTimeoutOverride, updateToolOverride, updateTriggerOverride, updateWaitOverride, type TriggerKind } from './policy.js'
 import { advisorRunHistory, advisorRunKey } from './telemetry.js'
 import type { AdvisorTaskLimiter } from './task-limiter.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { advisorModelConfig, configuredModel, parseModelSelection, sessionModelSelection, updateModelSelection } from './model-selection.js'
+import { advisorModelConfig, configuredModel, parseModelSelection, sessionModelSelection, sessionProfileSelection, updateModelSelection, updateProfileSelection } from './model-selection.js'
+import { parseAdvisorProfiles, parseProfileRoutes } from './profiles.js'
 import { truncateUtf8 } from './redact.js'
 import { MAX_AUTO_REMINDERS_PER_TASK, type Disposition, type ObligationKind, type ObligationState, type ObligationStore, type Resolution } from './obligations.js'
 import { textContent } from './context.js'
@@ -101,8 +102,16 @@ export class AdvisorRemoteService extends TypertRemoteService {
     const root = this.root(sessionId)
     const defaults = this.config.currentConfig()
     const obligations = this.config.obligations
+    const cfg = defaults as unknown as Record<string, unknown>
+    const sessionSel = sessionProfileSelection(root.session)
     return JSON.stringify({ ...catalogFor(defaults, root),
       model: configuredModel(advisorModelConfig(defaults, root.session)), modelDefault: configuredModel(defaults), modelOverridden: sessionModelSelection(root.session) !== null,
+      profiles: parseAdvisorProfiles(cfg.advisorProfiles),
+      profileRoutes: parseProfileRoutes(cfg.profileRoutes),
+      defaultProfileId: typeof cfg.defaultProfileId === 'string' ? cfg.defaultProfileId : '',
+      allowedProfileIds: Array.isArray(cfg.allowedProfileIds) ? cfg.allowedProfileIds : [],
+      sessionDefaultProfileId: sessionSel.defaultProfileId,
+      sessionAllowedProfileIds: sessionSel.allowedProfileIds,
       guidance: this.config.guidanceFor(root), runs: advisorRunHistory(root).map(run => ({ ...run, responseText: undefined, runKey: advisorRunKey(run) })), budget: this.config.limiter.snapshot(String(root.id)),
       obligations: advisorObligationSnapshot(obligations.store, String(root.id), obligations.taskStartSeq(root)) })
   }
@@ -134,7 +143,7 @@ export class AdvisorRemoteService extends TypertRemoteService {
         const event = events[index]!
         if (event.type !== 'user/message' || event.data.source.kind !== 'plugin' || event.data.source.plugin !== 'dsh-escalation-advisor') continue
         const text = textContent(event.data.content)
-        const child = text.match(/\[Strong advisor — (?:manual|escalation|continuous); severity=(?:none|nit|concern|blocker); child=([^\]\n]+)\]/)?.[1]
+        const child = text.match(/\[Strong advisor — (?:manual|escalation|continuous|completion); severity=(?:none|nit|concern|blocker); child=([^\]\n]+)\]/)?.[1]
         if (child !== run.childSessionId) continue
         if (prefix === '' || text.startsWith(prefix)) return JSON.stringify({ text, source: 'context', question: run.question })
       }
@@ -145,11 +154,31 @@ export class AdvisorRemoteService extends TypertRemoteService {
   @Remote
   async selectModel(sessionId: string, selection: string): Promise<string> {
     const root = this.root(sessionId)
-    if (selection.length > 2048) throw new Error('Advisor model selection is too large')
+    if (selection.length > 4096) throw new Error('Advisor model selection is too large')
     const value: unknown = JSON.parse(selection)
     const selected = value === null ? null : await this.validatedModel(value)
     if (this.root(sessionId) !== root) throw new Error('Advisor root session changed while selecting a model')
     updateModelSelection(root.session, selected)
+    try {
+      const raw = value as Record<string, unknown> | null
+      if (raw && typeof raw === 'object') {
+        const profileId = raw.defaultProfileId
+        const allowed = (raw as Record<string, unknown>).allowedProfileIds
+        if (profileId !== undefined || allowed !== undefined) {
+          const clean = (id: unknown): string | null | undefined => {
+            if (id === null || id === undefined) return id as null | undefined
+            if (typeof id === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(id.trim())) return id.trim()
+            throw new Error('Invalid profile id')
+          }
+          const nextDefault = profileId === undefined ? sessionProfileSelection(root.session).defaultProfileId : clean(profileId) ?? null
+          const nextAllowed = allowed === undefined ? sessionProfileSelection(root.session).allowedProfileIds : Array.isArray(allowed) ? allowed.map(entry => {
+            if (typeof entry !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(entry.trim())) throw new Error('Invalid profile id')
+            return entry.trim()
+          }) : (() => { throw new Error('Invalid profile id list') })()
+          updateProfileSelection(root.session, { defaultProfileId: nextDefault, allowedProfileIds: nextAllowed })
+        }
+      }
+    } catch (error) { if (error instanceof Error && /Invalid profile/.test(error.message)) throw error }
     return this.snapshot(sessionId)
   }
 
@@ -179,8 +208,14 @@ export class AdvisorRemoteService extends TypertRemoteService {
       if (!item) throw new Error('Tool is not visible in this root session')
       if (value === 'allow' && item.reserved) throw new Error('Advisor delegation tools are permanently disabled.')
       updateToolOverride(root.session, tool, value)
-    } else if (action === 'escalationWait' || action === 'continuousWait') updateWaitOverride(root.session, action, value)
-    else throw new Error('Unknown Advisor policy action')
+    } else if (action === 'escalationWait' || action === 'continuousWait' || action === 'completionWait') updateWaitOverride(root.session, action, value)
+    else if (action === 'trigger') {
+      const sep = tool.indexOf(':')
+      const trigger = (sep >= 0 ? tool.slice(0, sep) : tool) as TriggerKind
+      updateTriggerOverride(root.session, trigger, value)
+    } else if (action === 'coverage') updateCoverageOverride(root.session, (JSON.parse(value || '{}') as ReturnType<typeof parseCoverageOverride>) ?? {})
+    else if (action === 'defaultProfile') updateSessionProfiles(root.session, { defaultProfileId: value ? value : null })
+    else if (action === 'allowedProfiles') updateSessionProfiles(root.session, { allowedProfileIds: JSON.parse(value || '[]') as string[] })
     return this.snapshot(sessionId)
   }
 }

@@ -869,6 +869,15 @@ describe('P1: manual consultations suppress repeat automatic consultations', () 
     // first. The manual review must then cover that live fingerprint: the repeat
     // failure after it re-arms nothing (same problem, same workspace), while any
     // failure the review never saw still would.
+    // The manual verdict cites the failure it examined: coverage needs verifiable
+    // attribution (a delivered tool call id), not mere packet retention.
+    let hh: IntegrationHarness | undefined;
+    const bashCallId = (): string => {
+      const calls = hh?.root.session.snapshotEvents().filter(event => event.type === 'tool/call' && (event.data as { name?: unknown })?.name === 'bash') ?? [];
+      const id = (calls[calls.length - 1]?.data as { callId?: unknown })?.callId;
+      if (typeof id !== 'string') throw new Error('bash call id not yet observed');
+      return id;
+    };
     const h = await harness(
       {
         weak: [
@@ -879,12 +888,13 @@ describe('P1: manual consultations suppress repeat automatic consultations', () 
           textResponse('Turn two spare.'),
         ],
         advisor: advisorScript(
-          advisorVerdictResponse({ summary: 'manual-review' }),
+          () => advisorVerdictResponse({ summary: 'manual-review', evidence_used: [{ kind: 'tool', reference: bashCallId() }] }),
           advisorVerdictResponse({ summary: 'spare-never-used' }),
         ),
       },
       { mode: 'escalate', scoreThreshold: 4, maxAutoConsultsPerTurn: 10, maxAutoConsultsPerProblem: 10, cooldownTurns: 0 },
     )
+    hh = h;
     const outcomes = new Map<string, { exitCode: number; output: string }[]>()
     outcomes.set('npm test', [{ exitCode: 1, output: 'FAIL same' }, { exitCode: 1, output: 'FAIL same' }])
     h.ctx.tools.register(defineTool({

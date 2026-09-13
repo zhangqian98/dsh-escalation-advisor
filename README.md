@@ -32,6 +32,24 @@ Continuous review stays root-only by default so a task with many workers does no
 
 Advisor children themselves are always excluded from manual consultation, escalation scoring, and continuous review, so consultation cannot recurse.
 
+### Completion review
+
+A separate **completion review** trigger runs at `agent/turn-stopping` when the agent is preparing a final delivery. It asks whether the task is really ready (goal, success criteria, changed files, latest validation, unrun checks, open obligations) and steers the agent on `concern`/`blocker`. It is independent of the mode preset and off by default:
+
+| Capability | Main agent | Local DSH subagents |
+| --- | --- | --- |
+| Completion review | off | **off** |
+
+Enable it per role in global settings. Local-subagent completion review blocks worker settlement. At most `maxCompletionCycles` review cycles run per delivery (default 1). This is a bounded advisory review, not a hard delivery gate: an unavailable Advisor, an in-flight conflict, or an exhausted cycle budget lets delivery proceed, and only a delivered `concern`/`blocker` steers the agent.
+
+### Per-session overrides and triggers
+
+The header panel stores a versioned `advisor/policy` record for the task tree: mode preset, per-attempt timeout, tool allow/deny, wait policies (including completion), independent trigger switches (`manual`, `escalation`, `completion`, `continuous` as follow/on/off), and root/subagent coverage (follow/on/off per trigger, max depth, label include/exclude). Unset options keep following the global defaults. Useful commands: `/advisor catalog`, `/advisor-trigger <trigger> <on|off|inherit>`, `/advisor-tool <tool> <on|off|inherit>`.
+
+### Advisor profiles
+
+Instead of free-form provider/model input, configure named **advisor profiles** (id, label, model route, tool policy). Models and users pick one via the `advisor_profile` argument of `consult_advisor`; automatic triggers can route per trigger. A consultation pins its first-turn profile, model route and tool ceiling — continuing with a different profile is refused, and removing a tool permission revokes it immediately while adding one never widens an old child. The answer reports `advisor_profile`, `model` and `capabilities`.
+
 ## Install
 
 This release supports **DSH `0.1.2-rc.1`, `0.1.5-alpha.2`, and `0.1.5-rc.1`**. All three pass the integration suite; `0.1.2-rc.1` has also been checked in an installed DSH Web profile with real Codex models. Development and CI lock the complete runtime dependency tree to `0.1.5-alpha.2`; other prereleases are not claimed as compatible. CI checks Node 22.19 and 24. DSH `0.1.5-rc.1` migrates supported older session files to V3 while retaining their original files; back up histories before upgrading.
@@ -47,14 +65,14 @@ This local compatibility patch checks the exact DSH version and original file ch
 Install the exact npm release into the Web profile, then restart DSH:
 
 ```bash
-dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.27
+dsh plugin --profile web add dsh-escalation-advisor@0.1.0-alpha.28
 dsh web
 ```
 
 The immutable GitHub release tag remains available as a source install:
 
 ```bash
-dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.27
+dsh plugin --profile web add github:zhangqian98/dsh-escalation-advisor#v0.1.0-alpha.28
 ```
 
 For a local checkout, build and install the generated tarball rather than linking the source directory:
@@ -63,7 +81,7 @@ For a local checkout, build and install the generated tarball rather than linkin
 npm ci
 npm run check
 npm pack
-dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.27.tgz
+dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.28.tgz
 ```
 
 Configure the strong model in **Settings → Plugins → DSH Escalation Advisor**. The plugin stores only provider/model route IDs and reuses authentication already configured in DSH Models.
@@ -134,9 +152,8 @@ Advisor children present their small allow-list as native tool schemas even when
 
 ## Model input and output limits
 
-Advisor follows the selected model's DSH configuration and provider defaults. It has no separate input byte cap or output token cap. DSH/provider context limits apply to the full request, including system prompts and tools, and the child explicitly clears any inherited parent output cap before DSH resolves its own model defaults. Legacy `maxInputBytes` and `maxOutputTokens` settings are ignored.
-
-Case packets still select relevant task evidence, summarize individual records, and redact secrets. They are no longer pruned to an independent total byte budget, and generated plain-text output is no longer cut to an Advisor-specific size. Individual evidence sections are bounded by entry count instead: trigger-related evidence is matched by validation identity or failure fingerprint, validation retains at most three unrelated failures and one unrelated success, and the failure list retains four entries. Successful `run_code` wrappers are omitted when their concrete PTC sub-dispatches are present; failed or unfinished wrappers keep only a compact bridge summary. Tool results have one canonical copy in `tool_activity`, while `recent_tail` carries only conversational framing. `failures` and `validation` reference that canonical activity by `call_id` instead of repeating commands and output, and changed paths come only from retained activity. Truncation would hide how much evidence a task actually produced, so the packet also carries a `validation_summary` aggregate (total, retained, omitted, succeeded, failed, other, relevant) describing the pre-cap history. Escalation has no review cursor, so without those caps a long task would resend its whole transcript on every escalation.
+Advisor follows the selected model's DSH configuration and provider defaults for token/context limits. The child explicitly clears any inherited parent output cap before DSH resolves its own model defaults. Legacy `maxInputBytes` and `maxOutputTokens` settings are ignored. On top of model limits, the plugin enforces two structured byte budgets so costs stay predictable: case packets degrade structurally under a 48 KB total (low-priority sections dropped or shrunk first, never by cutting serialized JSON), and delivered verdicts fit a 16 KB total with per-field budgets.
+Case packets still select relevant task evidence, summarize individual records, and redact secrets. Individual evidence sections are bounded by entry count: trigger-related evidence is matched by validation identity or failure fingerprint, validation retains at most three unrelated failures and one unrelated success, and the failure list retains four entries. When the assembled packet still exceeds the 48 KB total budget it is degraded structurally (recent tail, tool activity and prior advice dropped first, then bounded lists and long text shrink, every removal recorded in `truncation`) so the emitted packet always parses. Successful `run_code` wrappers are omitted when their concrete PTC sub-dispatches are present; failed or unfinished wrappers keep only a compact bridge summary. Tool results have one canonical copy in `tool_activity`, while `recent_tail` carries only conversational framing. `failures` and `validation` reference that canonical activity by `call_id` instead of repeating commands and output, and changed paths come only from retained activity. The packet also carries a `validation_summary` aggregate (total, retained, omitted, succeeded, failed, other, relevant) describing the pre-cap history. Delivered verdicts are likewise field-budgeted under a 16 KB total; the full transcript stays in the Advisor child while requester/root telemetry keeps only a bounded digest. Escalation has no review cursor, so without those caps a long task would resend its whole transcript on every escalation.
 
 Separately, a definite validation failure opens a runtime-only verification obligation. No score reset, cooldown or consultation budget can close or hide it, and a disposition or a correction record does not close it either: only a later pass of the same command in the same scope, after the latest failure and with no related change since, does. Open items are shown as a reminder rather than a block, and the UI reports "no current-run record" after a restart instead of implying everything passed. See DESIGN.md for the closure rules and their limits.
 

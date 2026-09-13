@@ -97,7 +97,7 @@ window.__ModuleLoader__.load({
         if (!isAdvisorMessage(data)) return fallback(registered, 'steering', AdvisorMessageNode, props)
         const text = data.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
         const header = text.match(/^\[Strong advisor — (\w+); severity=(\w+); child=[^\]\n]+\]\n/)
-        const mode = { manual: '主动咨询', escalation: '自动升级', continuous: '持续审阅' }[header?.[1]] || '顾问消息'
+        const mode = { manual: '主动咨询', escalation: '自动升级', continuous: '持续审阅', completion: '完成前审阅' }[header?.[1]] || '顾问消息'
         return h('article', { 'aria-label': 'Advisor 消息', 'data-advisor-chat-message': true, style: { display: 'flex', justifyContent: 'flex-end', margin: '16px 0', width: '100%' } },
           h('div', { style: { maxWidth: 'min(88%, 748px)', minWidth: 0 } },
             h('div', { style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--dsw-alias-label-secondary, #667085)', marginBottom: 6 } }, h('span', { style: css.dot, 'aria-hidden': true }), 'Advisor · ' + mode),
@@ -167,12 +167,13 @@ window.__ModuleLoader__.load({
 
         h('div', { style: { marginTop: 18 } },
           h('strong', null, 'Agent 覆盖范围'),
-          h('p', { style: css.hint }, 'Manual 与自动 escalation 默认覆盖主 agent 和本地 DSH subagent；Continuous 默认只审主 agent，避免 N 个 worker 各自持续调用强模型。Advisor 自己永远不递归。'),
+          h('p', { style: css.hint }, 'Manual 与自动 escalation 默认覆盖主 agent 和本地 DSH subagent；Continuous 默认只审主 agent，避免 N 个 worker 各自持续调用强模型。完成前审阅默认关闭，开启后在交付前做一次最终检查。Advisor 自己永远不递归。'),
           h('div', { style: css.coverageGrid },
             h('strong', null, '模式'), h('strong', { style: { textAlign: 'center' } }, '主 agent'), h('strong', { style: { textAlign: 'center' } }, '本地 subagent'),
             h('span', null, 'Manual consultation'), check('manualMainAgent', '开'), check('manualLocalSubagents', '开'),
             h('span', null, 'Automatic escalation'), check('escalationMainAgent', '开'), check('escalationLocalSubagents', '开'),
-            h('span', null, 'Continuous review'), check('continuousMainAgent', '开'), check('continuousLocalSubagents', '开')),
+            h('span', null, 'Continuous review'), check('continuousMainAgent', '开'), check('continuousLocalSubagents', '开'),
+            h('span', null, 'Completion review'), check('completionMainAgent', '开'), check('completionLocalSubagents', '开')),
           h('p', { style: css.hint }, '本地 subagent 的自动 escalation / continuous 一旦启用会强制等待 Advisor 完成，避免 one-shot worker 先把旧结果交回父 agent。')),
 
         h('div', { style: { marginTop: 18 } },
@@ -193,7 +194,9 @@ window.__ModuleLoader__.load({
 
         h('div', { style: css.row },
           field('主 agent 自动 escalation', h('select', { style: css.control, value: value.escalationWait, disabled, onChange: e => edit('escalationWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
-          field('主 agent Continuous review', h('select', { style: css.control, value: value.continuousWait, disabled, onChange: e => edit('continuousWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label))))),
+          field('主 agent Continuous review', h('select', { style: css.control, value: value.continuousWait, disabled, onChange: e => edit('continuousWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
+          field('完成前审阅等待策略', h('select', { style: css.control, value: value.completionWait ?? 'block', disabled, onChange: e => edit('completionWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
+        ),
         h('details', { style: { marginTop: 18 } }, h('summary', { style: { cursor: 'pointer', fontWeight: 600 } }, '成本、预算与阈值'),
           h('div', { style: css.row },
             field('手动咨询 / agent（-1 = 无上限）', h('input', { type: 'number', min: -1, max: 100, style: css.control, value: value.maxManualConsultsPerSession, disabled, onChange: e => edit('maxManualConsultsPerSession', Number(e.target.value)) })),
@@ -461,6 +464,17 @@ window.__ModuleLoader__.load({
             h('p', { style: { ...css.hint, marginBottom: catalog.mode === 'manual' ? 0 : 12 } }, { manual: '由模型主动发起咨询并等待回复，无需设置自动等待策略。', escalate: '保留主动咨询，失败信号达到阈值时自动请顾问检查。', continuous: '保留主动咨询，在轮次结束时审阅新增工作。' }[catalog.mode], ' 适用于当前任务树，遵循各角色的覆盖范围。'),
             catalog.mode === 'escalate' && wait('自动升级的等待策略', 'escalationWait', catalog.escalationWaitDefault ?? catalog.escalationWait, catalog.escalationWaitOverride),
             catalog.mode === 'continuous' && wait('持续审阅的等待策略', 'continuousWait', catalog.continuousWaitDefault ?? catalog.continuousWait, catalog.continuousWaitOverride),
+            wait('完成前审阅的等待策略（独立于模式）', 'completionWait', catalog.completionWaitDefault ?? catalog.completionWait ?? 'block', catalog.completionWaitOverride),
+            h('div', { style: { marginTop: 10 } },
+              h('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 4 } }, '触发器覆盖（三态：跟随 / 开 / 关）'),
+              ...['manual', 'escalation', 'completion', 'continuous'].map(kind => h('label', { key: kind, style: { display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, marginTop: 4 } },
+                h('span', { style: { minWidth: 120 } }, { manual: '主动咨询', escalation: '自动升级', completion: '完成前审阅', continuous: '持续审阅' }[kind]),
+                h('select', { style: css.control, value: (catalog.triggers && catalog.triggers[kind]) || 'inherit', disabled: !!busy, onChange: event => mutate('trigger:' + kind, ['trigger', kind, event.target.value]) },
+                  h('option', { value: 'inherit' }, '跟随'), h('option', { value: 'on' }, '开'), h('option', { value: 'off' }, '关'))))),
+            (catalog.profiles && catalog.profiles.length > 0) && h('label', { style: { display: 'block', fontSize: 13, fontWeight: 600, marginTop: 10 } }, '会话默认顾问档案',
+              h('select', { style: css.control, value: catalog.sessionDefaultProfileId || '', disabled: !!busy, onChange: event => mutate('profile', ['defaultProfile', '', event.target.value]) },
+                h('option', { value: '' }, '跟随全局默认'),
+                ...catalog.profiles.map(profile => h('option', { key: profile.id, value: profile.id }, profile.label || profile.id)))),
             h(SessionTimeoutControl, { key: sessionId, catalog, disabled: !!busy, onSave: value => mutate('timeoutMs', ['timeoutMs', '', value]) })),
             h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 7 } },
               h('span', { style: { fontSize: 13, fontWeight: 600 } }, '顾问模型与思考等级'),

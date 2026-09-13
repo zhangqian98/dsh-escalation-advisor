@@ -7,10 +7,10 @@ import { resolve, dirname, relative, isAbsolute } from 'node:path'
 // These records contain no core Session sequence references; their data survives
 // adjacent format migrations verbatim. Other unknown historical types still fail.
 export const ADVISOR_HISTORY_FIELDS = {
-  'advisor/policy': { required: [], optional: ['version', 'mode', 'timeoutMs', 'inheritDefaultTools', 'allowTools', 'denyTools', 'escalationWait', 'continuousWait', 'toolPreset', 'tools'] },
-  'advisor/model': { required: ['version', 'selection'], optional: [] },
+  'advisor/policy': { required: [], optional: ['version', 'mode', 'timeoutMs', 'inheritDefaultTools', 'allowTools', 'denyTools', 'escalationWait', 'continuousWait', 'completionWait', 'triggers', 'coverage', 'defaultProfileId', 'allowedProfileIds', 'toolPreset', 'tools'] },
+  'advisor/model': { required: ['version', 'selection'], optional: ['defaultProfileId', 'allowedProfileIds'] },
   'advisor/identity': { required: ['version', 'invocationId', 'advisorId', 'requesterId', 'rootId', 'allowedTools'], optional: [] },
-  'advisor/run': { required: ['version', 'id', 'requesterId', 'mode', 'turn', 'taskRevision', 'attempt', 'status', 'timestamp'], optional: ['step', 'fingerprint', 'score', 'childSessionId', 'severity', 'summary', 'question', 'responseText', 'error', 'usage', 'verdictTool', 'structuredFallback', 'collectorId', 'turns', 'taskAnchor'] },
+  'advisor/run': { required: ['version', 'id', 'requesterId', 'mode', 'turn', 'taskRevision', 'attempt', 'status', 'timestamp'], optional: ['step', 'fingerprint', 'score', 'childSessionId', 'severity', 'summary', 'question', 'responseText', 'error', 'usage', 'verdictTool', 'structuredFallback', 'collectorId', 'turns', 'taskAnchor', 'provider', 'model', 'reasoningEffort', 'advisorProfile', 'toolCeiling', 'toolSnapshotHash', 'routingReason'] },
 }
 
 export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIELDS) {
@@ -26,21 +26,36 @@ export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIEL
   if (definition.required.some(key => !Object.hasOwn(data, key))) fail('missing required field')
   if (Object.keys(data).some(key => !definition.required.includes(key) && !definition.optional.includes(key))) fail('unknown field')
   if (event.type === 'advisor/policy') {
-    if (data.version !== undefined) oneOf(data.version, [2])
+    if (data.version !== undefined) oneOf(data.version, [2, 3])
     if (Array.isArray(data.allowTools) && Array.isArray(data.denyTools)) { strings(data.allowTools); strings(data.denyTools) }
     else {
       if (data.version !== undefined) fail('versioned policy requires allow/deny arrays')
       oneOf(data.toolPreset, ['inherit', 'none', 'inspect', 'research', 'edit', 'custom'])
       if (data.toolPreset === 'custom' || data.tools !== undefined) strings(data.tools)
     }
-    for (const key of ['escalationWait', 'continuousWait']) if (data[key] !== undefined) oneOf(data[key], ['inherit', 'block', 'background'])
+    for (const key of ['escalationWait', 'continuousWait', 'completionWait']) if (data[key] !== undefined) oneOf(data[key], ['inherit', 'block', 'background'])
     if (data.mode !== undefined) oneOf(data.mode, ['manual', 'escalate', 'continuous'])
     if (data.inheritDefaultTools !== undefined && typeof data.inheritDefaultTools !== 'boolean') fail('invalid tool inheritance')
     if (data.timeoutMs !== undefined) { count(data.timeoutMs); if (data.timeoutMs < 1000 || data.timeoutMs > 3600000) fail('invalid timeout') }
+    if (data.triggers !== undefined) { if (!object(data.triggers)) fail('invalid triggers'); for (const [k, v] of Object.entries(data.triggers)) { oneOf(k, ['manual', 'escalation', 'completion', 'continuous']); oneOf(v, ['inherit', 'on', 'off']) } }
+    if (data.coverage !== undefined) { if (!object(data.coverage)) fail('invalid coverage') }
+    if (data.defaultProfileId !== undefined && data.defaultProfileId !== null) string(data.defaultProfileId)
+    if (data.allowedProfileIds !== undefined) strings(data.allowedProfileIds)
     return
   }
-  oneOf(data.version, [1])
+  if (event.type !== 'advisor/model') oneOf(data.version, [1])
+  else oneOf(data.version, [1, 2])
   if (event.type === 'advisor/model') {
+    if (data.version === 2) {
+      if (data.selection !== null) {
+        if (!object(data.selection) || Object.keys(data.selection).some(key => !['provider', 'model', 'reasoningEffort'].includes(key))) fail('invalid selection')
+        for (const key of ['provider', 'model']) { string(data.selection[key]); if (!data.selection[key].trim()) fail('empty model route') }
+        if (data.selection.reasoningEffort !== undefined) string(data.selection.reasoningEffort)
+      }
+      if (data.defaultProfileId !== undefined && data.defaultProfileId !== null) string(data.defaultProfileId)
+      if (data.allowedProfileIds !== undefined) strings(data.allowedProfileIds)
+      return
+    }
     if (data.selection === null) return
     if (!object(data.selection) || Object.keys(data.selection).some(key => !['provider', 'model', 'reasoningEffort'].includes(key))) fail('invalid selection')
     for (const key of ['provider', 'model']) { string(data.selection[key]); if (!data.selection[key].trim()) fail('empty model route') }
@@ -56,10 +71,11 @@ export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIEL
   for (const key of ['turn', 'attempt']) count(data[key])
   if (data.attempt < 1) fail('invalid attempt')
   for (const key of ['step', 'score']) if (data[key] !== undefined) count(data[key])
-  oneOf(data.mode, ['manual', 'escalation', 'continuous'])
+  oneOf(data.mode, ['manual', 'escalation', 'continuous', 'completion'])
   oneOf(data.status, ['reserved', 'started', 'delivered', 'stale', 'failed-transient', 'failed-permanent', 'cancelled', 'skipped'])
   if (data.severity !== undefined) oneOf(data.severity, ['none', 'nit', 'concern', 'blocker'])
-  for (const key of ['fingerprint', 'childSessionId', 'summary', 'question', 'responseText', 'error', 'collectorId']) if (data[key] !== undefined) { string(data[key]); if (key === 'collectorId' && !data[key]) fail('empty collector') }
+  for (const key of ['fingerprint', 'childSessionId', 'summary', 'question', 'responseText', 'error', 'collectorId', 'provider', 'model', 'reasoningEffort', 'advisorProfile', 'toolSnapshotHash', 'routingReason']) if (data[key] !== undefined) { string(data[key]); if (key === 'collectorId' && !data[key]) fail('empty collector') }
+  if (data.toolCeiling !== undefined) strings(data.toolCeiling)
   if (data.turns !== undefined) { count(data.turns); if (data.turns < 1) fail('invalid turns') }
   if (data.taskAnchor !== undefined) count(data.taskAnchor)
   if (data.structuredFallback !== undefined && typeof data.structuredFallback !== 'boolean') fail('invalid fallback flag')
