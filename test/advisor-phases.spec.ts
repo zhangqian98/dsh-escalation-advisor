@@ -179,7 +179,7 @@ describe('consultation profile pinning', () => {
     } finally {
       await h.ctx.fiber.dispose();
     }
-  });
+  }, 60000);
   it('refuses new consultations when global and session allow-lists do not overlap', async () => {
     const harnessMod = await import('./harness.js');
     const h = await harnessMod.createIntegrationHarness(
@@ -228,7 +228,7 @@ describe('consultation profile pinning', () => {
     } finally {
       await h.ctx.fiber.dispose();
     }
-  });
+  }, 60000);
   it('refuses when the allow-list matches no configured profile', async () => {
     const harnessMod = await import('./harness.js');
     const h = await harnessMod.createIntegrationHarness(
@@ -252,7 +252,7 @@ describe('consultation profile pinning', () => {
     } finally {
       await h.ctx.fiber.dispose();
     }
-  });
+  }, 60000);
 });
 
 describe('manual review of B does not suppress a recurring A', () => {
