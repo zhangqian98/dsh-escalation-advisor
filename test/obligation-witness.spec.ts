@@ -100,7 +100,7 @@ function obligationNotices(agent: Agent): string[] {
     if (event.type !== 'user/message') continue
     if (event.data.source.kind !== 'plugin' || event.data.source.plugin !== 'dsh-escalation-advisor') continue
     const text = event.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-    if (text.includes('[Advisor obligations')) notices.push(text)
+    if (text.includes('[Advisor 验证项')) notices.push(text)
   }
   return notices
 }

@@ -21,14 +21,14 @@ describe('consult_advisor model-facing guidance', () => {
     const parameters = JSON.stringify(definition.parameters)
 
     // Fresh is the documented default, so a caller that forgets the id is not misled.
-    expect(description).toContain('NEW Advisor conversation')
+    expect(description).toContain('新的 Advisor 对话')
     // The parameter itself explains the rule, not just its name.
-    expect(parameters).toContain('Continue an earlier Advisor conversation')
+    expect(parameters).toContain('继续之前的某段 Advisor 对话')
     // The rule is usefulness of the earlier context, NOT relatedness: a related
     // question may still warrant a deliberately fresh and independent review.
-    expect(parameters).toContain('deliberately independent reassessment')
+    expect(parameters).toContain('完全独立的重新评估')
     // A wrong or foreign id is refused rather than silently restarted as fresh,
     // so a caller can never believe it continued when it did not.
-    expect(parameters).toContain('refused rather than silently restarted')
+    expect(parameters).toContain('不会静默重开')
   })
 })

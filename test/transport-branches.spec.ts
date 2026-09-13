@@ -83,7 +83,7 @@ describe('continuable transport failure branches', () => {
     expect(runs(h).at(-1)).toMatchObject({ status: 'failed-transient', error: expect.stringContaining('continuable subagents require session persistence') })
     expect(h.adapter.forModel('advisor')).toHaveLength(0)
     // The refusal is reported as its own branch; no verdict is invented for it.
-    expect(toolResultAnswer(h)).toMatchObject({ status: 'unavailable', summary: 'Advisor unavailable', diagnosis: expect.stringContaining('continuable subagents require session persistence') })
+    expect(toolResultAnswer(h)).toMatchObject({ status: 'unavailable', summary: 'Advisor 不可用', diagnosis: expect.stringContaining('continuable subagents require session persistence') })
   }, 15000)
 
 
@@ -98,7 +98,7 @@ describe('continuable transport failure branches', () => {
 
     await h.runRoot('Ask for a review.')
 
-    expect(advisorRunHistory(h.root).at(-1)?.error).toMatch(/closed with|never closed/)
+    expect(advisorRunHistory(h.root).at(-1)?.error).toMatch(/关闭/)
     expect(toolResultAnswer(h)).toMatchObject({ status: 'unavailable' })
     // The verdict text itself never reaches the requester.
     expect(toolResultText(h)).not.toContain('The repeated attempt preserves the failing assumption.')
@@ -113,8 +113,8 @@ describe('continuable transport failure branches', () => {
 
     await h.runRoot('Ask for a review.')
 
-    expect(JSON.stringify(runs(h))).toContain('closed with error')
-    expect(toolResultAnswer(h)).toMatchObject({ status: 'unavailable', diagnosis: expect.stringContaining('closed with error') })
+    expect(JSON.stringify(runs(h))).toContain('以 error 关闭')
+    expect(toolResultAnswer(h)).toMatchObject({ status: 'unavailable', diagnosis: expect.stringContaining('以 error 关闭') })
   }, 15000)
 
   it('returns the consultation id and refuses an unknown or foreign one without starting anything', async () => {
@@ -139,7 +139,7 @@ describe('continuable transport failure branches', () => {
 
     // The unknown id is refused outright and never silently restarted as a new one.
     const refused = toolResultAnswer(h, 2)
-    expect(refused).toMatchObject({ status: 'unavailable', consultation_id: '', diagnosis: expect.stringContaining('Unknown consultation id') })
+    expect(refused).toMatchObject({ status: 'unavailable', consultation_id: '', diagnosis: expect.stringContaining('未知的 consultation id') })
     // Exactly one Advisor child was ever created: the refusal started nothing.
     expect(h.adapter.forModel('advisor')).toHaveLength(2)
   }, 15000)

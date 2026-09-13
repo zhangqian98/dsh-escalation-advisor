@@ -357,12 +357,12 @@ function toolOverrideOf(policy: EffectiveAdvisorPolicy, name: string): AdvisorTo
 }
 function statusText(config: Config, session: Session): string {
   const effective = effectiveAdvisorPolicy(config, session)
-  const tools = effective.allowedTools.length ? effective.allowedTools.join(', ') : '(none)'
-  return [`Advisor enabled tools: ${tools}`, `Escalation: ${effective.escalationWait}`, `Continuous: ${effective.continuousWait}`, `Completion: ${effective.completionWait}`, 'Use the Advisor header control to toggle individual tools, or /advisor catalog for JSON.'].join('\n')
+  const tools = effective.allowedTools.length ? effective.allowedTools.join(', ') : '(无)'
+  return [`Advisor 已启用工具：${tools}`, `自动升级：${effective.escalationWait}`, `持续审阅：${effective.continuousWait}`, `完成前审阅：${effective.completionWait}`, '用标题栏 Advisor 开关逐个调整工具，或 /advisor catalog 看 JSON。'].join('\n')
 }
 
 function requireRoot(agent: Agent): { kind: 'error'; text: string } | undefined {
-  return agent.session.header.parentSession === undefined ? undefined : { kind: 'error', text: 'Advisor policy is configured on the root parent session, not inside a child session.' }
+  return agent.session.header.parentSession === undefined ? undefined : { kind: 'error', text: 'Advisor 策略配在 root 父会话上，不能在子会话里配。' }
 }
 
 export function catalogFor(config: Config, agent: Agent): AdvisorPolicyCatalog {
@@ -410,9 +410,9 @@ export function catalogFor(config: Config, agent: Agent): AdvisorPolicyCatalog {
 
 export function updateToolOverride(session: Session, name: string, value: AdvisorToolOverride): void {
   const tool = cleanToolName(name)
-  if (!tool) throw new Error('tool name is required')
-  if (tool === 'advisor_verdict') throw new Error('The Advisor verdict channel is not a configurable tool.')
-  if (value === 'allow' && isReservedTool(tool)) throw new Error('Advisor delegation tools are permanently disabled.')
+  if (!tool) throw new Error('需要工具名')
+  if (tool === 'advisor_verdict') throw new Error('Advisor 结论通道不是可配置的工具。')
+  if (value === 'allow' && isReservedTool(tool)) throw new Error('Advisor 委派类工具永久禁用。')
   const current = sessionPolicyOverride(session)
   const allow = new Set(normalizeToolList(current.allowTools))
   const deny = new Set(normalizeToolList(current.denyTools))
@@ -427,22 +427,22 @@ export function updateTimeoutOverride(session: Session, value: string): void {
   const { timeoutMs: _timeout, ...current } = sessionPolicyOverride(session)
   if (value === INHERIT) { append(session, current); return }
   const timeoutMs = Number(value)
-  if (!/^\d+$/.test(value) || !isAdvisorTimeout(timeoutMs)) throw new Error('Timeout must be 1000–3600000 milliseconds, or inherit.')
+  if (!/^\d+$/.test(value) || !isAdvisorTimeout(timeoutMs)) throw new Error('超时填 1000–3600000 毫秒，或 inherit。')
   append(session, { ...current, timeoutMs })
 }
 export function updateModeOverride(session: Session, value: string): void {
-  if (value !== INHERIT && !(ADVISOR_MODES as readonly string[]).includes(value)) throw new Error('Expected inherit, manual, escalate, or continuous.')
+  if (value !== INHERIT && !(ADVISOR_MODES as readonly string[]).includes(value)) throw new Error('只能填 inherit、manual、escalate 或 continuous。')
   const { mode: _mode, ...current } = sessionPolicyOverride(session)
   append(session, value === INHERIT ? current : { ...current, mode: value as AdvisorMode })
 }
 export function updateWaitOverride(session: Session, field: 'escalationWait' | 'continuousWait' | 'completionWait', value: string): void {
-  if (!isWaitMode(value)) throw new Error('Expected inherit, block, or background.')
+  if (!isWaitMode(value)) throw new Error('只能填 inherit、block 或 background。')
   append(session, { ...sessionPolicyOverride(session), [field]: value })
 }
 
 export function updateTriggerOverride(session: Session, trigger: TriggerKind, value: string): void {
-  if (!(TRIGGER_KINDS as readonly string[]).includes(trigger)) throw new Error('Expected manual, escalation, completion, or continuous.')
-  if (value !== INHERIT && value !== 'on' && value !== 'off') throw new Error('Expected inherit, on, or off.')
+  if (!(TRIGGER_KINDS as readonly string[]).includes(trigger)) throw new Error('触发器只能是 manual、escalation、completion 或 continuous。')
+  if (value !== INHERIT && value !== 'on' && value !== 'off') throw new Error('只能填 inherit、on 或 off。')
   const current = sessionPolicyOverride(session)
   const triggers = { ...(current.triggers ?? {}) } as TriggerOverrides
   if (value === INHERIT) delete triggers[trigger]
@@ -475,7 +475,7 @@ export function updateSessionProfiles(session: Session, selection: { defaultProf
 
 function registerPolicyCommands(commandCtx: Context, currentConfig: () => Config): void {
   commandCtx.commands.register({
-    name: 'advisor', description: 'Show or reset effective Advisor permissions and wait behavior for this session', input: { hint: '[catalog|reset]' },
+    name: 'advisor', description: '查看或重置本会话的 Advisor 权限与等待策略', input: { hint: '[catalog|reset]' },
     handler: ({ agent, rawInput }) => {
       const rejected = requireRoot(agent); if (rejected) return rejected
       const input = rawInput.trim()
@@ -484,18 +484,18 @@ function registerPolicyCommands(commandCtx: Context, currentConfig: () => Config
         return { kind: 'success' as const, text: JSON.stringify(catalogFor(currentConfig(), agent)) }
       }
       if (input === 'catalog') return { kind: 'success' as const, text: JSON.stringify(catalogFor(currentConfig(), agent)) }
-      if (input) return { kind: 'error' as const, text: 'Expected /advisor, /advisor catalog, or /advisor reset.' }
+      if (input) return { kind: 'error' as const, text: '用法：/advisor、/advisor catalog 或 /advisor reset。' }
       return { kind: 'success' as const, text: statusText(currentConfig(), agent.session) }
     },
   })
   commandCtx.commands.register({
-    name: 'advisor-tool', description: 'Override one Advisor tool for this session', input: { hint: '<tool-name> <on|off|inherit>' },
+    name: 'advisor-tool', description: '覆盖本会话中某个 Advisor 工具的开关', input: { hint: '<tool-name> <on|off|inherit>' },
     handler: ({ agent, rawInput }) => {
       const rejected = requireRoot(agent); if (rejected) return rejected
       const match = rawInput.trim().match(/^(\S+)\s+(on|off|inherit)$/)
-      if (!match) return { kind: 'error' as const, text: 'Expected: /advisor-tool <tool-name> <on|off|inherit>' }
+      if (!match) return { kind: 'error' as const, text: '用法：/advisor-tool <tool-name> <on|off|inherit>' }
       const [, tool, state] = match
-      if (state === 'on' && isCapabilityAmplifier(commandCtx, tool!, currentConfig().capabilityAmplifierTools)) return { kind: 'error' as const, text: 'Advisor delegation tools are permanently disabled.' }
+      if (state === 'on' && isCapabilityAmplifier(commandCtx, tool!, currentConfig().capabilityAmplifierTools)) return { kind: 'error' as const, text: 'Advisor 委派类工具永久禁用。' }
       updateToolOverride(agent.session, tool!, state === 'on' ? 'allow' : state === 'off' ? 'deny' : 'inherit')
       return { kind: 'success' as const, text: JSON.stringify(catalogFor(currentConfig(), agent)) }
     },
@@ -506,21 +506,21 @@ function registerPolicyCommands(commandCtx: Context, currentConfig: () => Config
       handler: ({ agent, rawInput }) => {
         const rejected = requireRoot(agent); if (rejected) return rejected
         const value = rawInput.trim()
-        if (!isWaitMode(value)) return { kind: 'error' as const, text: 'Expected inherit, block, or background.' }
+        if (!isWaitMode(value)) return { kind: 'error' as const, text: '只能填 inherit、block 或 background。' }
         append(agent.session, { ...sessionPolicyOverride(agent.session), [field]: value })
         return { kind: 'success' as const, text: JSON.stringify(catalogFor(currentConfig(), agent)) }
       },
     })
   }
-  waitCommand('advisor-escalation-wait', 'escalationWait', 'Choose whether automatic escalation pauses this session for Advisor review')
-  waitCommand('advisor-continuous-wait', 'continuousWait', 'Choose whether continuous review pauses this session for Advisor review')
-  waitCommand('advisor-completion-wait', 'completionWait', 'Choose whether completion review pauses this session for Advisor review')
+  waitCommand('advisor-escalation-wait', 'escalationWait', '选择自动升级是否让本会话停下等待 Advisor 审阅')
+  waitCommand('advisor-continuous-wait', 'continuousWait', '选择持续审阅是否让本会话停下等待 Advisor 审阅')
+  waitCommand('advisor-completion-wait', 'completionWait', '选择完成前审阅是否让本会话停下等待 Advisor 审阅')
   commandCtx.commands.register({
-    name: 'advisor-trigger', description: 'Override one Advisor trigger for this session', input: { hint: '<manual|escalation|completion|continuous> <on|off|inherit>' },
+    name: 'advisor-trigger', description: '覆盖本会话中某个 Advisor 触发器的开关', input: { hint: '<manual|escalation|completion|continuous> <on|off|inherit>' },
     handler: ({ agent, rawInput }) => {
       const rejected = requireRoot(agent); if (rejected) return rejected
       const match = rawInput.trim().match(/^(manual|escalation|completion|continuous)\s+(on|off|inherit)$/)
-      if (!match) return { kind: 'error' as const, text: 'Expected: /advisor-trigger <manual|escalation|completion|continuous> <on|off|inherit>' }
+      if (!match) return { kind: 'error' as const, text: '用法：/advisor-trigger <manual|escalation|completion|continuous> <on|off|inherit>' }
       try {
         updateTriggerOverride(agent.session, match[1] as TriggerKind, match[2]!)
       } catch (error) { return { kind: 'error' as const, text: error instanceof Error ? error.message : String(error) } }

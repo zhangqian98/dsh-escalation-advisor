@@ -40,7 +40,7 @@ describe('consultation_id: "last"', () => {
     const h = await harness({ weak: [textResponse('done')], advisor: verdicts(1) })
     const refused = await call(h, { question: 'Anything at all', consultation_id: 'last' })
     expect(refused.status).toBe('unavailable')
-    expect(refused.diagnosis).toContain('no earlier manual consultation')
+    expect(refused.diagnosis).toContain('没有可继续的手动咨询')
     // The critical property: it must NOT silently fall back to a fresh consultation.
     expect(h.adapter.forModel('advisor')).toHaveLength(0)
     expect(refused.child_session_id).toBe('')
@@ -63,7 +63,7 @@ describe('consultation_id: "last"', () => {
     // root-wide lookup would hand it to the worker. It must not.
     const refused = await call(h, { question: 'Worker question', consultation_id: 'last' }, workerAgent)
     expect(refused.status).toBe('unavailable')
-    expect(refused.diagnosis).toContain('no earlier manual consultation')
+    expect(refused.diagnosis).toContain('没有可继续的手动咨询')
     expect(refused.child_session_id).toBe('')
   })
 })

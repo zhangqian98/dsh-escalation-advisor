@@ -32,8 +32,8 @@ describe('Advisor Remote policy API', () => {
     harness = await createIntegrationHarness({ worker: [textResponse('done')] })
     const run = await harness.spawnWorker()
     await run.result
-    expect(() => harness!.ctx.advisor.snapshot(String(run.id))).toThrow('root session')
-    expect(() => harness!.ctx.advisor.mutate(String(run.id), 'reset', '', '')).toThrow('root session')
+    expect(() => harness!.ctx.advisor.snapshot(String(run.id))).toThrow('root 会话')
+    expect(() => harness!.ctx.advisor.mutate(String(run.id), 'reset', '', '')).toThrow('root 会话')
     await run.dispose()
   })
 
@@ -61,7 +61,7 @@ describe('Advisor Remote policy API', () => {
       expect(root.session.snapshotEvents().slice(before).map(e => e.type)).toEqual(['advisor/policy'])
     }
     const before = root.session.seq
-    expect(() => ctx.advisor.mutate(String(root.id), 'mode', '', 'invalid')).toThrow('Expected inherit')
+    expect(() => ctx.advisor.mutate(String(root.id), 'mode', '', 'invalid')).toThrow('只能填 inherit、manual、escalate 或 continuous')
     expect(root.session.seq).toBe(before)
   })
 
@@ -74,7 +74,7 @@ describe('Advisor Remote policy API', () => {
     expect(JSON.parse(String(result))).toMatchObject({ timeoutMs: 180000, timeoutDefaultMs: 600000, timeoutOverride: 180000 })
     expect(JSON.parse(ctx.advisor.mutate(String(root.id), 'mode', '', 'continuous')).timeoutMs).toBe(180000)
     const before = root.session.seq
-    for (const invalid of ['0', '999', '3600001', 'NaN', '', '-1000', '1.5']) expect(() => ctx.advisor.mutate(String(root.id), 'timeoutMs', '', invalid)).toThrow('Timeout must')
+    for (const invalid of ['0', '999', '3600001', 'NaN', '', '-1000', '1.5']) expect(() => ctx.advisor.mutate(String(root.id), 'timeoutMs', '', invalid)).toThrow('超时填')
     expect(root.session.seq).toBe(before)
     expect(JSON.parse(ctx.advisor.mutate(String(root.id), 'timeoutMs', '', 'inherit'))).toMatchObject({ timeoutMs: 600000, timeoutOverride: 'inherit' })
     ctx.advisor.mutate(String(root.id), 'timeoutMs', '', '300000')
@@ -93,7 +93,7 @@ describe('Advisor Remote policy API', () => {
     const result = await ctx.typertGateway.invoke({ namespace: 'advisor', method: 'review', args: { sessionId: String(root.id), runId: 'legacy-review' } })
     expect(JSON.parse(String(result))).toMatchObject({ source: 'context', text })
     expect(root.session.seq).toBe(before)
-    expect(() => ctx.advisor.review(String(root.id), 'another-task-review')).toThrow('does not belong')
+    expect(() => ctx.advisor.review(String(root.id), 'another-task-review')).toThrow('不属于本次任务')
   })
 
   it('keeps a complete manual reply available without inflating the snapshot', async () => {

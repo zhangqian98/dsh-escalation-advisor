@@ -47,7 +47,7 @@
  *   `src/index.ts:359` looks a follow-up up by
  *   `consultations.get(args.consultation_id)`. The string the tool reported is
  *   therefore in no map, and every follow-up that uses it takes the
- *   `src/index.ts:360` branch: `Unknown consultation id`.
+ *   `src/index.ts:360` branch: `未知的 consultation id`.
  *
  * DEFECT 2 — a resumed turn's verdict submission is refused as unauthorized.
  *   The verdict channel correlates by CHILD SESSION, not by turn:
@@ -486,10 +486,10 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
     // resumed turn, and no fresh verdict is published for turn 2.
     expect(submissions.map(record => record.toolCallId)).toEqual(['advisor-verdict', 'advisor-verdict'])
     expect(submissions[0]!.isError).toBe(false)
-    expect(submissions[0]!.text).toContain('Verdict recorded as a candidate')
+    expect(submissions[0]!.text).toContain('结论已记为候选')
     expect(submissions[1]!.isError).toBe(false)
-    expect(submissions[1]!.text).toContain('Verdict recorded as a candidate')
-    expect(submissions[1]!.text).not.toContain('Verdict does not match')
+    expect(submissions[1]!.text).toContain('结论已记为候选')
+    expect(submissions[1]!.text).not.toContain('结论与当前咨询身份对不上')
 
     expect(answerTwo).toMatchObject({
       status: 'ok',
@@ -550,7 +550,7 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
       status: 'unavailable',
       child_session_id: '',
       consultation_id: '',
-      diagnosis: expect.stringContaining('Unknown consultation id'),
+      diagnosis: expect.stringContaining('未知的 consultation id'),
     })
     expect(unknown.text).not.toContain('ONLY-CONSULTATION-SUMMARY')
 
@@ -564,7 +564,7 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
       status: 'unavailable',
       child_session_id: '',
       consultation_id: '',
-      diagnosis: expect.stringContaining('belongs to another agent or task'),
+      diagnosis: expect.stringContaining('属于别的 agent 或任务'),
     })
     expect(foreign.text).not.toContain('ONLY-CONSULTATION-SUMMARY')
 
@@ -578,7 +578,7 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
       status: 'unavailable',
       child_session_id: '',
       consultation_id: '',
-      diagnosis: expect.stringContaining('belongs to another agent or task'),
+      diagnosis: expect.stringContaining('属于别的 agent 或任务'),
     })
 
     // Neither refusal delivered anything: no new model request, no new child
@@ -622,7 +622,7 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
       status: 'unavailable',
       child_session_id: '',
       consultation_id: '',
-      diagnosis: expect.stringContaining('timed out'),
+      diagnosis: expect.stringContaining('超时'),
     })
     expect(outcome.text).not.toContain('UNPUBLISHED-VERDICT-SUMMARY')
     expect(outcome.text).not.toContain('UNPUBLISHED-VERDICT-DIAGNOSIS')
@@ -788,7 +788,7 @@ describe.skipIf(!GATED)('DEPLOYED runtime: consult_advisor follow-up is a distin
     expect(refused.isError, refused.text).toBe(false)
     expect(asAnswer(refused.value)).toMatchObject({
       status: 'unavailable', child_session_id: '', consultation_id: '',
-      diagnosis: expect.stringContaining('belongs to another agent or task'),
+      diagnosis: expect.stringContaining('属于别的 agent 或任务'),
     })
 
     evidence('--- restart restore: same child, preserved turn count, task-scoped ---',

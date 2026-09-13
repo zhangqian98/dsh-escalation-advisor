@@ -68,17 +68,17 @@ function taskRootAgent(ctx: Context, agent: Agent): Agent {
 }
 
 function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child: string, consultationId?: string): UserMessage {
-  const blocker = verdict.severity === 'blocker' ? '\nDo not continue the original approach until this finding has been checked and resolved.' : ''
+  const blocker = verdict.severity === 'blocker' ? '\n在核查并解决这个发现之前，不要继续原来的做法。' : ''
   const actions = verdict.nextActions.map((item, index) => (index + 1) + '. ' + item).join('\n')
   const evidence = verdict.evidenceUsed?.map(item => item.kind + ': ' + item.reference).join('\n') ?? ''
   const validation = verdict.validationPlan?.join('\n') ?? ''
-  const changes = verdict.changesMade?.map(item => item.paths.join(', ') + ': ' + item.reason + '\nValidation: ' + (item.validation.join('; ') || 'not reported')).join('\n') ?? ''
+  const changes = verdict.changesMade?.map(item => item.paths.join(', ') + ': ' + item.reason + '\n验证：' + (item.validation.join('; ') || '未报告')).join('\n') ?? ''
   // The consultation id is the only way to continue this same Advisor
   // conversation. It is durable identity, not a label, so it travels with the
   // advice the requesting agent sees.
-  const follow = consultationId === undefined ? '' : '\n\nConsultation id: ' + consultationId + '\nTo continue this SAME Advisor conversation with its earlier context, call consult_advisor again with consultation_id="' + consultationId + '".'
+  const follow = consultationId === undefined ? '' : '\n\nConsultation id: ' + consultationId + '\n要用同一段 Advisor 对话的上下文继续同一轮审查，以 consultation_id="' + consultationId + '" 再次调用 consult_advisor。'
   return createUserMessage({
-    content: [{ type: 'text', text: '[Strong advisor — ' + origin + '; severity=' + verdict.severity + '; child=' + child + ']\n' + verdict.summary + '\n\n' + verdict.diagnosis + '\n' + actions + blocker + '\nEvidence used:\n' + (evidence || 'not reported') + '\nValidation plan:\n' + (validation || 'not reported') + '\nChanges made by Advisor:\n' + (changes || 'none reported') + follow + '\n\nVerify this independent review against repository evidence and validation results.' }],
+    content: [{ type: 'text', text: '[Strong advisor —— ' + origin + '；severity=' + verdict.severity + '；child=' + child + ']\n' + verdict.summary + '\n\n' + verdict.diagnosis + '\n' + actions + blocker + '\n引用证据：\n' + (evidence || '未报告') + '\n验证计划：\n' + (validation || '未报告') + '\nAdvisor 的修改：\n' + (changes || '无') + follow + '\n\n请对照仓库证据和验证结果核查这份独立审阅。' }],
     source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor · ' + verdict.summary },
   })
 }
@@ -87,23 +87,23 @@ function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child:
 function obligationMessage(detail: readonly Obligation[], unchanged: readonly Obligation[], final: boolean): UserMessage {
   const lines = detail.map(item => {
     const closure = item.validationKey
-      ? 'a later pass of the same command in this scope with no related change since'
-      : 'this failure carries no validation identity, so it cannot be closed automatically'
+      ? '之后在同一范围内、无相关变更的一次同命令通过'
+      : '这次失败没有验证身份，无法自动关闭'
     const options = item.kind === 'claim-contradicted'
-      ? 'A) ask the Advisor with the claim and the counterexample; B) back it with a verification witness; C) record a correction naming document, claim and change.'
-      : 'A) ask the Advisor with the evidence; B) fix it and re-run the same command; C) record not-applicable or accept-risk with a checkable basis.'
-    return '- ' + item.id + ' [' + item.kind + ', seen ' + item.repeatCount + 'x' + dispositionNote(item) + '] ' + item.summary + '\n  Closes only through: ' + closure + '.\n  ' + options
+      ? 'A）带着 claim 和反例问 Advisor；B）补一次验证见证；C）登记勘误，写明 document、claim 和 change。'
+      : 'A）带着证据问 Advisor；B）修好后重跑同一命令；C）登记 not-applicable 或 accept-risk，并给出可核查的依据。'
+    return '- ' + item.id + ' [' + item.kind + ', 已出现 ' + item.repeatCount + ' 次' + dispositionNote(item) + '] ' + item.summary + '\n  只能这样关闭：' + closure + '。\n  ' + options
   })
   // Everything already stated in full collapses to one line: repeating the block
   // would add nothing the earlier statement did not already carry.
   const brief = unchanged.map(item =>
-    '- ' + item.id + ' [' + item.kind + ', still open' + dispositionNote(item) + '] ' + item.summary)
+    '- ' + item.id + ' [' + item.kind + '，仍未完成' + dispositionNote(item) + '] ' + item.summary)
   const tail = final
-    ? '\n\nThis is the LAST automatic reminder for this task. Report every item above as STILL UNRESOLVED in your final answer: none has been verified, and a recorded disposition is a record, not verification.'
-    : '\n\nThis is a reminder, not a block. An explanation of why a failure happened is not a verification witness and does not close an item.'
+    ? '\n\n这是本任务最后一次自动提醒。请在最终答复里把上面每一项都报告为仍未解决（STILL UNRESOLVED）：没有一项得到验证，记录下来的处置只是记录，不是验证。'
+    : '\n\n这只是提醒，不是阻断。对失败原因的解释不是验证见证，不能关闭验证项。'
   return createUserMessage({
-    content: [{ type: 'text', text: '[Advisor obligations - open verification items. No score reset, cooldown or consultation budget clears these.]\n' + lines.concat(brief).join('\n') + tail }],
-    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + (detail.length + unchanged.length) + ' open obligation(s)' },
+    content: [{ type: 'text', text: '[Advisor 验证项 - 未完成验证。分数重置、冷却或咨询预算都不会清除它们。]\n' + lines.concat(brief).join('\n') + tail }],
+    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + (detail.length + unchanged.length) + ' 个未完成验证项' }
   })
 }
 
@@ -114,12 +114,12 @@ function obligationMessage(detail: readonly Obligation[], unchanged: readonly Ob
  */
 function dispositionNote(item: Obligation): string {
   if (item.disposition === undefined) return ''
-  const recorded = ', disposition=' + item.disposition.kind
+  const recorded = '，disposition=' + item.disposition.kind
   return item.dispositionRevision === item.revision
-    ? recorded + ', not verified'
-    : recorded + ' (outrun by later evidence), not verified'
+    ? recorded + '，未验证'
+    : recorded + '（已被之后的证据超过），未验证'
 }
-function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor unavailable', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', consultation_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
+function unavailable(message: string) { return { status: 'unavailable' as const, severity: 'none' as const, summary: 'Advisor 不可用', diagnosis: redactSecrets(message), next_actions: [], confidence: 0, child_session_id: '', consultation_id: '', disposition: 'unavailable', evidence_used: [], assumptions: [], recommended_next_action: '', validation_plan: [], needs_more_evidence: true, changes_made: [] } }
 function toolAnswer(answer: AdvisorRunResult, consultationId: string, snapshot?: ConsultationSnapshot) {
   const verdict = answer.verdict
   return { status: 'ok' as const, severity: verdict.severity, summary: verdict.summary, diagnosis: verdict.diagnosis, next_actions: verdict.nextActions, confidence: verdict.confidence ?? 0, child_session_id: answer.childSessionId,
@@ -311,16 +311,16 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   // This monotonic guard cannot be overridden by another pre-execute listener.
   ctx.tools.guard(exec => {
     if (!exec.agent) return undefined
-    if (exec.name === ADVISOR_TOOL_NAME && !manualEnabled(exec.agent)) return 'Advisor consultation is disabled for this agent.'
+    if (exec.name === ADVISOR_TOOL_NAME && !manualEnabled(exec.agent)) return '此 agent 没有开手动咨询。'
     const identity = registry.identity(exec.agent)
     if (!identity) return undefined
     if (INTERNAL_TOOLS.has(exec.name)) return undefined
-    if (isCapabilityAmplifier(ctx, exec.name, currentConfig().capabilityAmplifierTools)) return 'Advisor delegation tools are permanently disabled.'
+    if (isCapabilityAmplifier(ctx, exec.name, currentConfig().capabilityAmplifierTools)) return 'Advisor 委派类工具永久禁用。'
     const parent = registry.requester(exec.agent)
-    if (!parent) return 'Advisor requester is no longer live; external tools are disabled.'
+    if (!parent) return 'Advisor 请求方已不在；外部工具已禁用。'
     const policy = effectiveAdvisorPolicy(currentConfig(), taskRootAgent(ctx, parent).session)
     if (identity.allowedTools.includes(exec.name) && policy.allowedTools.includes(exec.name) && ctx.tools.get(exec.name, parent) !== undefined) return undefined
-    return 'Advisor tool "' + exec.name + '" exceeds the original requester and current root policy.'
+    return 'Advisor 工具“' + exec.name + '”超出了原始请求方和当前 root 策略的范围。'
   })
   ctx.on('tools/execute', async (exec, next) => {
     if (!exec.agent || registry.identity(exec.agent) || isCapabilityAmplifier(ctx, exec.name, currentConfig().capabilityAmplifierTools) || INTERNAL_TOOLS.has(exec.name)) return next()
@@ -398,7 +398,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     const defaultProfileId = args.sessionDefaultProfileId ?? globalDefault
     const routes = parseProfileRoutes(cfg.profileRoutes)
     if (profiles.length > 0) {
-      if (constrained && effectiveAllowed.length === 0) throw new AdvisorUnavailableError('No advisor profile is allowed for this task: the global and session allow-lists do not overlap.', 'configuration')
+      if (constrained && effectiveAllowed.length === 0) throw new AdvisorUnavailableError('本任务没有可用顾问档案：全局和会话的 allow-list 没有交集。', 'configuration')
       const resolved = resolveProfileForNewConsultation({
         profiles,
         allowedProfileIds: effectiveAllowed,
@@ -407,7 +407,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         ...(args.explicitProfileId ? { explicitProfileId: args.explicitProfileId } : {}),
         trigger: args.trigger,
       })
-      if (args.explicitProfileId && !resolved) throw new AdvisorUnavailableError('Unknown advisor_profile "' + args.explicitProfileId + '" for this task. Omit consultation_id to list allowed profiles.', 'configuration')
+      if (args.explicitProfileId && !resolved) throw new AdvisorUnavailableError('本任务没有名为"' + args.explicitProfileId + '"的 advisor_profile。省略 consultation_id 可查看允许的档案。', 'configuration')
       if (resolved) {
         const ceiling = intersectToolCeiling(args.policyAllowedTools, resolved)
         return {
@@ -422,7 +422,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
           },
         }
       }
-      throw new AdvisorUnavailableError('No configured advisor profile is available for this task: the allow-list matches no known profile. Legacy routing is disabled while profiles are configured.', 'configuration')
+      throw new AdvisorUnavailableError('本任务没有可用的已配置顾问档案：allow-list 对不上任何已知档案。已配置档案时禁用 legacy 路由。', 'configuration')
     }
     const base = args.config
     return {
@@ -556,9 +556,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     let snapshot: ConsultationSnapshot
     if (options.continuation) {
       const pinned = options.continuation.snapshot
-      if (pinned.snapshotMissing) throw new AdvisorUnavailableError('This consultation started before model pinning; start a new consultation by omitting consultation_id.', 'configuration')
-      if (explicitProfileId && pinned.advisorProfile && explicitProfileId !== pinned.advisorProfile) throw new AdvisorUnavailableError('This consultation is pinned to profile "' + pinned.advisorProfile + '". Omit consultation_id to start a new conversation.', 'configuration')
-      if (explicitProfileId && !pinned.advisorProfile) throw new AdvisorUnavailableError('This consultation predates named profiles; omit consultation_id to start fresh.', 'configuration')
+      if (pinned.snapshotMissing) throw new AdvisorUnavailableError('这次咨询建于模型锁定之前；省略 consultation_id 开始新咨询。', 'configuration')
+      if (explicitProfileId && pinned.advisorProfile && explicitProfileId !== pinned.advisorProfile) throw new AdvisorUnavailableError('这次咨询已锁定档案“' + pinned.advisorProfile + '”。省略 consultation_id 开始新对话。', 'configuration')
+      if (explicitProfileId && !pinned.advisorProfile) throw new AdvisorUnavailableError('这次咨询建于命名档案之前；省略 consultation_id 重新开始。', 'configuration')
       snapshot = pinned
     } else {
       const sessionSel = sessionProfileSelection(root.session)
@@ -721,14 +721,14 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   registerAdvisorVerdictTool(ctx, { registry, collector: verdicts })
   ctx.tools.register(defineTool({
     name: ADVISOR_TOOL_NAME,
-    description: 'Ask a stronger model for an independent engineering review in a visible child session. Supply the question, hypothesis, evidence and failed attempts; the harness supplies the task. By default this starts a NEW Advisor conversation; pass consultation_id to continue an earlier one.',
+    description: '请更强的模型在可见的子会话里做一次独立的工程审阅。给出问题、假设、证据和失败过的尝试；任务背景由 harness 提供。默认开启一段新的 Advisor 对话；传 consultation_id 可以继续之前的对话。',
     parameters: {
       question: { type: 'string', required: true }, goal: { type: 'string' }, current_hypothesis: { type: 'string' }, decision_needed: { type: 'string' },
       evidence: { type: 'array', items: { type: 'string' } }, failed_attempts: { type: 'array', items: { type: 'string' } }, attempts: { type: 'string' }, context: { type: 'string' },
       // Continue an EXISTING consultation as a new turn of the SAME Advisor
       // conversation: earlier context, persona and tool policy stay intact.
-      consultation_id: { type: 'string', description: 'Continue an earlier Advisor conversation instead of starting a new one: pass the consultation_id that earlier result returned. Reuse it when this question builds on that review — supplying the evidence it asked for, challenging its verdict, or refining the same decision — because the advisor keeps its earlier context, persona and tool policy. Omit it for an unrelated problem, and also when you want a deliberately independent reassessment of a related one: a fresh consultation does not inherit the earlier framing. An unknown or foreign id is refused rather than silently restarted as a new consultation. The literal value "last" means the most recent DELIVERED manual consultation YOU opened on this task — not simply whatever was discussed most recently, and automatic consultations and failed or still-running calls do not count. The reply reports the concrete consultation_id it resolved to, so you always learn which conversation you actually continued.' },
-      advisor_profile: { type: 'string', description: 'Named advisor profile for a NEW consultation (debugger, architect, security, reviewer). The model may only choose from human-approved profiles; arbitrary provider/model values are rejected. When continuing with consultation_id, the profile must match the pinned profile or be omitted — a different profile starts a new conversation.' },
+      consultation_id: { type: 'string', description: '继续之前的某段 Advisor 对话，而不是新开一段：传之前结果里返回的 consultation_id。当新问题基于那次审阅（补充它要的证据、质疑它的结论、细化同一个决策）时复用；无关的新问题、或想要一次完全独立的重新评估时不要传——新咨询不会继承之前的上下文。未知或不属于本次任务的 id 会被直接拒绝，不会静默重开。字面值 "last" 表示你在这次任务里发起的、最近一次已交付的手动咨询——不包括自动咨询、失败或还在跑的调用。返回里会报告实际接续到的 consultation_id。' },
+      advisor_profile: { type: 'string', description: '新咨询用的命名顾问档案（debugger、architect、security、reviewer）。只能从人工批准的档案里选；任意的 provider/model 值会被拒绝。带 consultation_id 续接时，档案必须与锁定的一致或省略——换档案会开启新对话。' }
 
     },
     output: {
@@ -749,9 +749,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     },
     isConcurrencySafe: () => false,
     async execute(raw: unknown, exec: ToolRunContext) {
-      if (!exec.agent || !manualEnabled(exec.agent)) return unavailable('Advisor is not configured or enabled for this agent.')
+      if (!exec.agent || !manualEnabled(exec.agent)) return unavailable('Advisor 未给此 agent 配置或启用。')
       const agent = exec.agent, key = String(agent.id), config = currentConfig()
-      if (config.maxManualConsultsPerSession >= 0 && (manualCalls.get(key) ?? 0) + (manualReserved.get(key) ?? 0) >= config.maxManualConsultsPerSession) return unavailable('Manual Advisor consultation budget reached.')
+      if (config.maxManualConsultsPerSession >= 0 && (manualCalls.get(key) ?? 0) + (manualReserved.get(key) ?? 0) >= config.maxManualConsultsPerSession) return unavailable('手动咨询预算已用完。')
       manualReserved.set(key, (manualReserved.get(key) ?? 0) + 1)
       let started = false
       const args = raw as AskAdvisorArgs
@@ -776,14 +776,14 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // consultation would let a caller believe it continued one when it did not.
         if (requested.toLowerCase() === LATEST_ALIAS) {
           const latest = latestManualConsultation(key, rootId, taskAnchor)
-          if (!latest) { refundReservation(); return unavailable('There is no earlier manual consultation to continue: "last" means the most recent DELIVERED manual consultation by this agent on this task, and there is none. A failed or still-running consultation does not count. Start a new consultation by omitting consultation_id.') }
+          if (!latest) { refundReservation(); return unavailable('没有可继续的手动咨询：“last”指本 agent 在本次任务里最近一次已交付的手动咨询，而现在没有。失败或还在跑的不算。不传 consultation_id 即可开始新咨询。') }
           continuation = { consultationId: latest.consultationId, publicId: handleOf(latest.consultationId, 0), childSessionId: latest.childSessionId, turns: latest.turns, snapshot: latest.snapshot }
         } else {
           const found = consultations.get(handleBase(requested))
-          if (!found) { refundReservation(); return unavailable('Unknown consultation id: this agent has no open consultation with that id. Start a new consultation by omitting consultation_id.') }
-          if (found.requesterId !== key || found.rootId !== rootId || found.taskAnchor !== taskAnchor) { refundReservation(); return unavailable('Consultation id belongs to another agent or task; it cannot be continued from here.') }
+          if (!found) { refundReservation(); return unavailable('未知的 consultation id：此 agent 没有使用该 id 的未完成咨询。不传 consultation_id 即可开始新咨询。') }
+          if (found.requesterId !== key || found.rootId !== rootId || found.taskAnchor !== taskAnchor) { refundReservation(); return unavailable('该 consultation id 属于别的 agent 或任务，不能在这里继续。') }
           const requestedProfile = cleanProfileArg((args as unknown as Record<string, unknown>).advisor_profile)
-          if (requestedProfile && found.snapshot.advisorProfile && requestedProfile !== found.snapshot.advisorProfile) { refundReservation(); return unavailable('This consultation is pinned to profile "' + found.snapshot.advisorProfile + '". Omit consultation_id to start a new conversation with "' + requestedProfile + '".') }
+          if (requestedProfile && found.snapshot.advisorProfile && requestedProfile !== found.snapshot.advisorProfile) { refundReservation(); return unavailable('这次咨询已锁定档案“' + found.snapshot.advisorProfile + '”。省略 consultation_id 即可用“' + requestedProfile + '”开始新对话。') }
           continuation = { consultationId: found.consultationId, publicId: requested, childSessionId: found.childSessionId, turns: found.turns, snapshot: found.snapshot }
         }
       }
@@ -797,7 +797,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // follow-up turn addresses, and it stays stable for the whole conversation.
         // It is the PUBLIC id — never this turn's internal collector identity, which
         // no map accepts as a continuation id.
-        if (!answer) return unavailable('Advisor result expired after the task changed.')
+        if (!answer) return unavailable('任务发生变化后，Advisor 的结果已过期。')
         const record = consultations.get(handleBase(answer.consultationId))
         return toolAnswer(answer, answer.consultationId, record?.snapshot)
       } catch (error) { return unavailable(error instanceof Error ? error.message : String(error)) }
@@ -807,7 +807,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
 
   ctx.tools.register(defineTool({
     name: 'advisor_obligation',
-    description: 'Inspect and disposition open Advisor verification obligations. A disposition or a correction never closes an obligation: only a verification witness later than the latest failure, in the same scope and with no related change since, closes one. Use this to register a counterexample against a published claim, which no automatic classification can detect.',
+    description: '查看并处置未完成的 Advisor 验证项。处置（disposition）或勘误（correction）都不会关闭验证项：只有在上次失败之后、同一范围内、无相关变更的一次验证见证才能关闭。用来登记反例，指出已发布结论的问题，这是自动分类发现不了的。',
     parameters: {
       action: { type: 'string', required: true },
       id: { type: 'string' }, claim_id: { type: 'string' }, summary: { type: 'string' },
@@ -828,38 +828,38 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
       const args = (raw ?? {}) as Record<string, unknown>
       const text = (name: string) => typeof args[name] === 'string' ? String(args[name]).trim() : ''
       const action = text('action') || 'list'
-      if (!exec.agent || roleOf(exec.agent) !== 'root') return { action, message: 'Advisor obligations are tracked for root tasks only.', obligations: [] }
+      if (!exec.agent || roleOf(exec.agent) !== 'root') return { action, message: '验证项只跟踪 root 任务。', obligations: [] }
       const key = String(exec.agent.id), taskStartSeq = taskStarts.get(key) ?? 0
       const scope = 'task:' + key + ':' + taskStartSeq
-      const describe = (item: Obligation) => item.id + ' [' + item.kind + '/' + item.state + ', seen ' + item.repeatCount + 'x' + (item.disposition ? ', disposition=' + item.disposition.kind : '') + (item.resolution ? ', resolved=' + item.resolution.kind : '') + '] ' + item.summary
+      const describe = (item: Obligation) => item.id + ' [' + item.kind + '/' + item.state + '，已出现 ' + item.repeatCount + ' 次' + (item.disposition ? '，disposition=' + item.disposition.kind : '') + (item.resolution ? '，resolved=' + item.resolution.kind : '') + '] ' + item.summary
       const listed = () => obligations.list(key, taskStartSeq).map(describe)
       const id = text('id'), seq = exec.agent.session.seq
-      if (action === 'list') return { action, message: listed().length ? 'Current-run obligations (runtime only: a restart keeps no record).' : 'No current-run obligation record.', obligations: listed() }
+      if (action === 'list') return { action, message: listed().length ? '本轮验证项（仅运行时有效：重启后不保留）。' : '本轮没有验证项记录。', obligations: listed() }
       if (action === 'register') {
         const claimId = text('claim_id'), summary = text('summary'), validationCallId = text('validation_call_id')
-        if (!claimId || !summary) return { action, message: 'register requires claim_id and summary.', obligations: listed() }
-        if (!validationCallId) return { action, message: 'register requires validation_call_id: the tool call id of an observed validation command in this task whose pass/fail identity this claim can be re-verified against. Run the check first, then register with its call id.', obligations: listed() }
+        if (!claimId || !summary) return { action, message: 'register 需要 claim_id 和 summary。', obligations: listed() }
+        if (!validationCallId) return { action, message: 'register 需要 validation_call_id：本次任务里一次已观测验证命令的 tool call id，这条结论以后就靠它的通过/失败身份来复验。先跑检查，再拿它的 call id 来登记。', obligations: listed() }
         const evidence = tracker.evidence(key).find(item => item.callId === validationCallId)
-        if (!evidence) return { action, message: 'Unknown validation_call_id for this task: no observed tool evidence carries that call id. Run the verification command first, then register with its call id.', obligations: listed() }
-        if (!evidence.validationKey) return { action, message: 'That call carries no validation identity (it is not a recognized test/typecheck/lint/build invocation), so it cannot be closed automatically. Re-run a recognized validation command and register with its call id.', obligations: listed() }
+        if (!evidence) return { action, message: '本次任务里没有这个 validation_call_id：没有任何已观测的工具证据携带该 call id。先跑验证命令，再拿它的 call id 来登记。', obligations: listed() }
+        if (!evidence.validationKey) return { action, message: '这次调用没有验证身份（不是可识别的 test/typecheck/lint/build 调用），无法自动关闭。用可识别的验证命令重跑，再拿它的 call id 来登记。', obligations: listed() }
         // A claim keeps the FIRST verified identity it was bound to: silently
         // swapping it would let a later pass of validation A close a contradiction
         // the caller just attributed to validation B.
         const clash = obligations.list(key, taskStartSeq).find(item => item.kind === 'claim-contradicted' && item.claimId === claimId && item.validationKey !== undefined && item.validationKey !== evidence.validationKey)
-        if (clash?.validationKey) return { action, message: 'Claim ' + claimId + ' is already bound to validation ' + clash.validationKey.slice(0, 12) + ' on ' + clash.id + '; it cannot be re-registered against ' + evidence.validationKey.slice(0, 12) + '. Use a new claim_id for a different check, or disposition the existing item.', obligations: listed() }
+        if (clash?.validationKey) return { action, message: 'Claim ' + claimId + ' 已绑定到 ' + clash.id + ' 上的验证 ' + clash.validationKey.slice(0, 12) + '，不能再对 ' + evidence.validationKey.slice(0, 12) + ' 重新登记。换个 claim_id 对应别的检查，或处置现有项。', obligations: listed() }
         const item = obligations.recordClaimContradiction({ sessionId: key, taskStartSeq, scope, seq, at: Date.now(), claimId, summary: redactSecrets(summary).slice(0, 300), validationKey: evidence.validationKey })
-        return { action, message: 'Registered ' + item.id + ' against validation ' + (item.validationKey ?? evidence.validationKey).slice(0, 12) + '. It stays open until a correction record AND a later pass of the same validation (no related change since) both exist.', obligations: listed() }
+        return { action, message: '已登记 ' + item.id + '，对应验证 ' + (item.validationKey ?? evidence.validationKey).slice(0, 12) + '。它保持未完成，直到勘误记录和之后一次同验证的通过（且其间无相关变更）都齐备。', obligations: listed() }
       }
       if (action === 'disposition') {
         const kind = text('disposition'), basis = text('basis')
-        if (kind !== 'not-applicable' && kind !== 'accept-risk') return { action, message: 'disposition must be not-applicable or accept-risk.', obligations: listed() }
-        if (!basis) return { action, message: 'A disposition requires a checkable basis.', obligations: listed() }
+        if (kind !== 'not-applicable' && kind !== 'accept-risk') return { action, message: 'disposition 只能是 not-applicable 或 accept-risk。', obligations: listed() }
+        if (!basis) return { action, message: '处置需要一个可核查的依据（basis）。', obligations: listed() }
         const item = obligations.recordDisposition(key, taskStartSeq, id, { kind, basis: redactSecrets(basis).slice(0, 300), at: Date.now(), seq })
-        return { action, message: item ? 'Recorded ' + kind + ' on ' + item.id + '. It remains open and is listed at the end of the turn.' : 'No such obligation.', obligations: listed() }
+        return { action, message: item ? '已在 ' + item.id + ' 上记录 ' + kind + '。它保持未完成，会在轮次结束时列出。' : '没有这个验证项。', obligations: listed() }
       }
       if (action === 'correct') {
         const claimId = text('claim_id'), document = text('document'), change = text('change'), evidence = text('evidence')
-        if (!claimId || !document || !change || !evidence) return { action, message: 'correct requires claim_id, document, change and evidence.', obligations: listed() }
+        if (!claimId || !document || !change || !evidence) return { action, message: 'correct 需要 claim_id、document、change 和 evidence。', obligations: listed() }
         const correction = { claimId, document: redactSecrets(document).slice(0, 200), change: redactSecrets(change).slice(0, 300), evidence: redactSecrets(evidence).slice(0, 300), at: Date.now(), seq }
         let item = id ? obligations.recordCorrection(key, taskStartSeq, id, correction) : undefined
         // Models fumble ids the way callers fumble consultation handles: when no
@@ -867,12 +867,12 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
         // than refusing. An explicit id keeps the strict behavior above.
         if (!item && !id) {
           const candidates = obligations.list(key, taskStartSeq).filter(candidate => candidate.kind === 'claim-contradicted' && candidate.state === 'open' && candidate.claimId === claimId)
-          if (candidates.length > 1) return { action, message: 'Several open obligations share claim_id ' + claimId + '; pass the id shown by list.', obligations: listed() }
+          if (candidates.length > 1) return { action, message: '多个未完成验证项共用 claim_id ' + claimId + '；请传 list 里显示的 id。', obligations: listed() }
           if (candidates.length === 1) item = obligations.recordCorrection(key, taskStartSeq, candidates[0]!.id, correction)
         }
-        return { action, message: item ? 'Recorded the correction on ' + item.id + '. A correction alone does not close it; a verification witness must still follow the failure.' : 'No such obligation, or the claim id does not match.', obligations: listed() }
+        return { action, message: item ? '已在 ' + item.id + ' 上记录勘误。仅勘误不会关闭它；失败之后还需要一次验证见证。' : '没有这个验证项，或 claim id 对不上。', obligations: listed() }
       }
-      return { action, message: 'Unknown action. Use list, register, disposition or correct.', obligations: listed() }
+      return { action, message: '未知的 action。用 list、register、disposition 或 correct。', obligations: listed() }
     },
   }))
 

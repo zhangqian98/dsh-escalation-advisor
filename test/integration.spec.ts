@@ -57,7 +57,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
     const h = await harness({ weak: [toolCallResponse('short-timeout', 'consult_advisor', { question: 'Review' }), textResponse('done')], worker: [toolCallResponse('inherited-timeout', 'consult_advisor', { question: 'Review with inherited timeout' }), textResponse('worker done')], advisor: [request => slowReply(request, advisorVerdictResponse()), request => slowReply(request, advisorVerdictResponse()), textResponse('Verdict submitted.')] }, { timeoutMs: 600000 })
     h.ctx.advisor.mutate(String(h.root.id), 'timeoutMs', '', '1000')
     await h.runRoot('Review with a short deadline')
-    expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).runs[0]).toMatchObject({ status: 'failed-transient', error: expect.stringContaining('configured per-attempt limit: 1 seconds') })
+    expect(JSON.parse(h.ctx.advisor.snapshot(String(h.root.id))).runs[0]).toMatchObject({ status: 'failed-transient', error: expect.stringContaining('单次尝试时限') })
     expect(aborted).toEqual(['advisor'])
     h.ctx.advisor.mutate(String(h.root.id), 'timeoutMs', '', 'inherit')
     const worker = await h.spawnWorker()
@@ -347,7 +347,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
     expect(advertised).not.toContain('subagent')
     expect(recursiveExecutions).toBe(0)
     const advisor = advisorChildren(h)[0]!.agent
-    expect(JSON.stringify(advisor.session.snapshotEvents())).toContain('Advisor delegation tools are permanently disabled')
+    expect(JSON.stringify(advisor.session.snapshotEvents())).toContain('Advisor 委派类工具永久禁用')
     await run.dispose()
   })
 
@@ -495,7 +495,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
     expect(h.adapter.forModel('advisor')).toHaveLength(1)
     expect(advisorRunHistory(h.root).at(-1)).toMatchObject({
       status: 'failed-permanent',
-      error: expect.stringContaining('no usable verdict'),
+      error: expect.stringContaining('没有返回可用结论'),
     })
     // Nothing the plugin authors carries the prose. The only place it can appear is
     // the runtime's own `subagent-settled` notice, which quotes the child's closing
@@ -527,8 +527,8 @@ describe('real DSH AgentLoop and spawn integration', () => {
       : ''
     expect(JSON.parse(resultText)).toMatchObject({
       status: 'unavailable',
-      summary: 'Advisor unavailable',
-      diagnosis: expect.stringContaining('no usable verdict'),
+      summary: 'Advisor 不可用',
+      diagnosis: expect.stringContaining('没有返回可用结论'),
     })
     expect(resultText).not.toContain('preserve the lock until the write is durable')
     expect(advisorChildren(h)).toHaveLength(1)

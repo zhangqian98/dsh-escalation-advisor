@@ -123,7 +123,7 @@ function obligationNotices(agent: Agent): string[] {
     if (event.type !== 'user/message') continue
     if (event.data.source.kind !== 'plugin' || event.data.source.plugin !== 'dsh-escalation-advisor') continue
     const text = event.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-    if (text.includes('[Advisor obligations')) notices.push(text)
+    if (text.includes('[Advisor 验证项')) notices.push(text)
   }
   return notices
 }
@@ -173,13 +173,13 @@ describe('verification obligations through the real plugin chain', () => {
     // The failure is dispatched in step 1; the notice therefore arrives with the
     // next pre-step, which is the request carrying the inspection call.
     const noticeText = requestText(requests[1]!.request)
-    expect(noticeText).toContain('[Advisor obligations')
+    expect(noticeText).toContain('[Advisor 验证项')
     expect(noticeText).toContain(FAILURE_OUTPUT)
     // The item carries a validation identity, so the failing command was recognised
     // as a validation family rather than merely having failed.
-    expect(noticeText).toContain('a later pass of the same command in this scope with no related change since')
+    expect(noticeText).toContain('无相关变更的一次同命令通过')
     expect(classified('npm test', 1)).toMatchObject({ class: 'validation-failure', exitCode: 1 })
-    const match = /- (R[0-9a-f]{6}) \[validation-failure, seen 1x\]/.exec(noticeText)
+    const match = /- (R[0-9a-f]{6}) \[validation-failure, 已出现 1 次/.exec(noticeText)
     expect(match).not.toBeNull()
     const id = match![1]!
 
@@ -236,7 +236,7 @@ describe('verification obligations through the real plugin chain', () => {
     expect(executed).toEqual(['npm test', 'npm test'])
     const requests = h.adapter.forModel('weak')
     const noticeText = requestText(requests[1]!.request)
-    expect(noticeText).toContain('[Advisor obligations')
+    expect(noticeText).toContain('[Advisor 验证项')
     const match = /- (R[0-9a-f]{6}) \[validation-failure/.exec(noticeText)
     expect(match).not.toBeNull()
     const id = match![1]!
@@ -247,7 +247,7 @@ describe('verification obligations through the real plugin chain', () => {
     expect(snapshot.items[0]).toMatchObject({ state: 'resolved', resolution: 'reverified' })
     // The witness step itself still carried the open item: nothing had closed it
     // before that run, and the whole chain stayed inside one user turn.
-    expect(requestText(requests[2]!.request)).toContain('[Advisor obligations')
+    expect(requestText(requests[2]!.request)).toContain('[Advisor 验证项')
     expect(requestText(requests[2]!.request)).toContain(id)
     expect(h.root.session.snapshotEvents().filter(event => event.type === 'turn/start')).toHaveLength(1)
     // Both notices predate the witness: the item was never pushed again once resolved.
@@ -284,7 +284,7 @@ describe('verification obligations through the real plugin chain', () => {
     expect(second.taskStartSeq).toBeGreaterThan(first.taskStartSeq)
     expect(second.items).toEqual([])
     expect(second.openCount).toBe(0)
-    expect(toolResultText(h.root, 'task-two-list')).toContain('No current-run obligation record.')
+    expect(toolResultText(h.root, 'task-two-list')).toContain('本轮没有验证项记录。')
 
     // The earlier task's obligation is untouched: still open, still unresolved.
     const earlier = reachedObligations(h).open(String(h.root.id), first.taskStartSeq)
@@ -352,7 +352,7 @@ describe('verification obligations through the real plugin chain', () => {
     const goalText = requestText(goalRequests[0]!.request)
     // The item is restated for the round, under the SAME id: a new task would have
     // scoped it away instead, since injection is filtered by task boundary.
-    expect(goalText).toContain('[Advisor obligations')
+    expect(goalText).toContain('[Advisor 验证项')
     expect(goalText).toContain(id)
 
     // Nothing else moved. The record is still the one open item of the same task,
@@ -387,7 +387,7 @@ describe('verification obligations through the real plugin chain', () => {
     // having its whole block read out again. Before this, every notice repeated the
     // full text of every open item, which is what made a dispositioned item cost
     // attention on every single turn.
-    const reminders = notices.filter(text => text.includes('still open'))
+    const reminders = notices.filter(text => text.includes('仍未完成'))
     expect(reminders.length).toBeGreaterThan(0)
 
     // The last reminder the fixed budget allows is the handoff checklist, and it
@@ -434,8 +434,8 @@ describe('verification obligations through the real plugin chain', () => {
     // Three requests: nothing was injected and no reminder continued the turn.
     const requests = h.adapter.forModel('weak')
     expect(requests).toHaveLength(3)
-    expect(requests.some(entry => requestText(entry.request).includes('[Advisor obligations'))).toBe(false)
-    expect(toolResultText(h.root, 'expected-negative-list')).toContain('No current-run obligation record.')
+    expect(requests.some(entry => requestText(entry.request).includes('[Advisor 验证项'))).toBe(false)
+    expect(toolResultText(h.root, 'expected-negative-list')).toContain('本轮没有验证项记录。')
   })
   it('does not let a command that merely MENTIONS a check clear the obligation', async () => {
     // The sharpest form of the defect: the mentioning command FAILS. If it carried

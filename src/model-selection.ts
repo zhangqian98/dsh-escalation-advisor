@@ -16,12 +16,12 @@ declare module '@deepseek-ai/dsh-session/types' {
 const selections = new WeakMap<Session, { offset: number; selection: AdvisorModelSelection | null }>()
 
 export function parseModelSelection(value: unknown): AdvisorModelSelection {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Advisor model selection')
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Advisor 模型选择无效')
   const input = value as Record<string, unknown>
-  if (Object.keys(input).some(key => !['provider', 'model', 'reasoningEffort'].includes(key))) throw new Error('Unknown Advisor model field')
+  if (Object.keys(input).some(key => !['provider', 'model', 'reasoningEffort'].includes(key))) throw new Error('未知的 Advisor 模型字段')
   const text = (key: string) => {
     const value = input[key]
-    if (typeof value !== 'string' || !value.trim() || value.length > 256) throw new Error(`Invalid Advisor ${key}`)
+    if (typeof value !== 'string' || !value.trim() || value.length > 256) throw new Error(`Advisor ${key} 无效`)
     return value.trim()
   }
   return { provider: text('provider'), model: text('model'), ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: text('reasoningEffort') }) }

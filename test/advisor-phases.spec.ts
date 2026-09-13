@@ -172,7 +172,7 @@ describe('consultation profile pinning', () => {
       expect(Array.isArray((runs[0] as { toolCeiling: unknown }).toolCeiling)).toBe(true);
       const switched = await ask({ question: 'Follow-up', consultation_id: first.consultation_id as string, advisor_profile: 'architect' });
       expect(switched.status).toBe('unavailable');
-      expect(String(switched.diagnosis)).toMatch('pinned to profile');
+      expect(String(switched.diagnosis)).toMatch('已锁定档案');
       // A live continuation without cold-resume needs session query in this harness,
       // so the pinned-profile follow-up path is proven by the stored snapshot above
       // and by the rejection of a mismatched profile here.
@@ -200,10 +200,10 @@ describe('consultation profile pinning', () => {
       };
       const refused = await ask({ question: 'Anything?' });
       expect(refused.status).toBe('unavailable');
-      expect(String(refused.diagnosis)).toMatch('do not overlap');
+      expect(String(refused.diagnosis)).toMatch('没有交集');
       const explicit = await ask({ question: 'Anything?', advisor_profile: 'debugger' });
       expect(explicit.status).toBe('unavailable');
-      expect(String(explicit.diagnosis)).toMatch('do not overlap');
+      expect(String(explicit.diagnosis)).toMatch('没有交集');
       expect(harnessMod && h.adapter.forModel('advisor')).toHaveLength(0);
     } finally {
       await h.ctx.fiber.dispose();
@@ -255,7 +255,7 @@ describe('consultation profile pinning', () => {
       };
       const auto = await ask({ question: 'Anything?' });
       expect(auto.status).toBe('unavailable');
-      expect(String(auto.diagnosis)).toMatch('No configured advisor profile');
+      expect(String(auto.diagnosis)).toMatch('对不上任何已知档案');
       const explicit = await ask({ question: 'Anything?', advisor_profile: 'debugger' });
       expect(explicit.status).toBe('unavailable');
       expect(h.adapter.forModel('advisor')).toHaveLength(0);

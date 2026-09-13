@@ -554,7 +554,7 @@ describe('P0: claim registration conflicts and recovery through the public tool'
     expect(done).toContain('reverified-and-corrected')
     // Re-binding the closed claim to a different validation is refused outright.
     const clash = JSON.parse((await runTool(h, 'advisor_obligation', { action: 'register', claim_id: 'C1', summary: 're-bind attempt', validation_call_id: 'val-lint' })).text) as { message: string }
-    expect(clash.message).toContain('already bound')
+    expect(clash.message).toContain('已绑定到')
   }, 20000)
 
   it('issues distinct channel identities across consultations', async () => {
@@ -746,7 +746,7 @@ describe('P1: masked exits, stale tasks, recurrence, and worker mirrors', () => 
     const tools2 = h.ctx.get('tools') as { execute(input: unknown): Promise<{ content: readonly unknown[] }> }
     const attempt = await tools2.execute({ callId: ToolCallId('audit-reg'), name: 'advisor_obligation', arguments: { action: 'register', claim_id: 'CX', summary: 'stale claim', validation_call_id: 'stale-1' }, agent: h.root, signal: new AbortController().signal })
     const text = (attempt.content as readonly { type?: string; text?: string }[]).flatMap(block => block.type === 'text' ? [String(block.text ?? '')] : []).join('')
-    expect(JSON.parse(text) as { message: string }).toMatchObject({ message: expect.stringContaining('Unknown validation_call_id') })
+    expect(JSON.parse(text) as { message: string }).toMatchObject({ message: expect.stringContaining('没有这个 validation_call_id') })
     expect(h.adapter.forModel('advisor')).toHaveLength(0)
   }, 25000)
 

@@ -80,6 +80,12 @@ describe('Advisor Web companion', () => {
       const manualBubble = renderToString(React.createElement(nodeRenders.get('steering')!, { node: { data: manualState } }))
       expect(manualBubble).toContain('Advisor · 主动咨询')
       expect(manualBubble).toContain('Compare designs before editing')
+      const rich = { ...manual, data: { ...manual.data, id: 'manual-rich', collectorId: 'manual-rich#0.1', responseText: JSON.stringify({ severity: 'concern', summary: 'S', diagnosis: 'D', next_actions: [], validation_plan: ['Rerun the check'], changes_made: [{ paths: ['a.ts'], reason: 'R', validation: ['V'] }] }) } }
+      const richBubble = renderToString(React.createElement(nodeRenders.get('steering')!, { node: { data: messageDefinition.start({}, { event: rich }) } }))
+      expect(richBubble).toContain('验证计划：')
+      expect(richBubble).toContain('已做修改：')
+      expect(richBubble).not.toContain('Validation plan:')
+      expect(richBubble).not.toContain('Changes made:')
     } finally { await ctx.fiber.dispose() }
   })
 })

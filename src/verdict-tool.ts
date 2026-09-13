@@ -249,7 +249,7 @@ export interface VerdictToolDeps {
 export function registerAdvisorVerdictTool(ctx: Context, deps: VerdictToolDeps): void {
   ctx.tools.register(defineTool({
     name: ADVISOR_VERDICT_TOOL,
-    description: 'Submit the Advisor verdict for the active consultation. Call this exactly once per turn, after the review is complete. Arguments are validated before this handler runs; an accepted submission is a candidate verdict and is published only once the turn closes successfully.',
+    description: '提交当前咨询的 Advisor 结论。每轮只调一次，在审阅完成后调用。参数会先被校验；通过的提交只是候选结论，只有当轮成功结束才会发布。',
     parameters: VERDICT_TOOL_PARAMETERS,
     output: {
       schema: {
@@ -262,22 +262,22 @@ export function registerAdvisorVerdictTool(ctx: Context, deps: VerdictToolDeps):
     isConcurrencySafe: () => false,
     async execute(raw: unknown, exec: ToolRunContext) {
       const agent = exec.agent
-      if (!agent) return { accepted: false, message: 'The Advisor verdict channel is not available outside an agent scope.' }
+      if (!agent) return { accepted: false, message: 'Advisor 结论通道在 agent 作用域之外不可用。' }
       const identity = deps.registry.identity(agent)
-      if (!identity) return { accepted: false, message: 'The Advisor verdict channel is available to Advisor sessions only.' }
+      if (!identity) return { accepted: false, message: 'Advisor 结论通道只对 Advisor 会话开放。' }
       const verdict = verdictFromStructured(raw, JSON.stringify(raw ?? {}))
       const outcome = deps.collector.submit(agent, identity, verdict)
       const message = outcome === 'accepted'
-        ? 'Verdict recorded as a candidate; it is published only if this turn closes successfully.'
+        ? '结论已记为候选；只有当轮成功结束才会发布。'
         : outcome === 'duplicate'
-          ? 'Verdict already recorded for this consultation; the first submission stands.'
+          ? '这次咨询已经记过结论；以第一次提交为准。'
           : outcome === 'conflicting'
-            ? 'A verdict was already recorded for this consultation; a conflicting second submission is refused.'
+            ? '这次咨询已经记过结论；冲突的第二次提交被拒绝。'
             : outcome === 'closed'
-              ? 'The consultation is closed; the verdict was not recorded.'
+              ? '咨询已关闭；结论没有记入。'
               : outcome === 'unauthorized'
-                ? 'The verdict does not match the active consultation identity.'
-                : 'No active consultation is bound to this session.'
+                ? '结论与当前咨询身份对不上。'
+                : '这个会话没有绑定有效的咨询。'
       return { accepted: outcome === 'accepted' || outcome === 'duplicate', message: redactSecrets(message) }
     },
   }))

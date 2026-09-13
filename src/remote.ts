@@ -91,9 +91,9 @@ export class AdvisorRemoteService extends TypertRemoteService {
   }
 
   private root(sessionId: string) {
-    if (!sessionId || sessionId.length > 256) throw new Error('Invalid session ID')
+    if (!sessionId || sessionId.length > 256) throw new Error('会话 ID 无效')
     const agent = this.ctx.agents.get(SessionId(sessionId))
-    if (!agent || agent.session.header.parentSession !== undefined) throw new Error('Advisor settings require a live root session.')
+    if (!agent || agent.session.header.parentSession !== undefined) throw new Error('Advisor 设置需要一个活跃的 root 会话。')
     return agent
   }
 
@@ -120,14 +120,14 @@ export class AdvisorRemoteService extends TypertRemoteService {
   @Remote
   review(sessionId: string, runId: string): string {
     const root = this.root(sessionId)
-    if (!runId || runId.length > 256) throw new Error('Invalid Advisor consultation ID')
+    if (!runId || runId.length > 256) throw new Error('Advisor 咨询 ID 无效')
     const history = advisorRunHistory(root)
     // `runId` is the per-turn row key (`runKey` in the snapshot): the collector
     // identity for records that carry one, the compatibility key otherwise. A
     // bare consultation id still resolves, to the LAST turn of that
     // conversation — the fallback every pre-runKey caller needs.
     const run = history.find(item => advisorRunKey(item) === runId) ?? history.findLast(item => item.id === runId)
-    if (!run) throw new Error('Advisor consultation does not belong to this task')
+    if (!run) throw new Error('这个 Advisor 咨询不属于本次任务')
     const requester = run.requesterId === String(root.id) ? root : this.ctx.agents.get(SessionId(run.requesterId))
     if (run.childSessionId && requester) {
       const events = requester.session.snapshotEvents()
@@ -154,10 +154,10 @@ export class AdvisorRemoteService extends TypertRemoteService {
   @Remote
   async selectModel(sessionId: string, selection: string): Promise<string> {
     const root = this.root(sessionId)
-    if (selection.length > 4096) throw new Error('Advisor model selection is too large')
+    if (selection.length > 4096) throw new Error('Advisor 模型选择过大')
     const value: unknown = JSON.parse(selection)
     const selected = value === null ? null : await this.validatedModel(value)
-    if (this.root(sessionId) !== root) throw new Error('Advisor root session changed while selecting a model')
+    if (this.root(sessionId) !== root) throw new Error('选择模型时 Advisor root 会话发生变化')
     updateModelSelection(root.session, selected)
     try {
       const raw = value as Record<string, unknown> | null
@@ -168,17 +168,17 @@ export class AdvisorRemoteService extends TypertRemoteService {
           const clean = (id: unknown): string | null | undefined => {
             if (id === null || id === undefined) return id as null | undefined
             if (typeof id === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(id.trim())) return id.trim()
-            throw new Error('Invalid profile id')
+            throw new Error('档案 id 无效')
           }
           const nextDefault = profileId === undefined ? sessionProfileSelection(root.session).defaultProfileId : clean(profileId) ?? null
           const nextAllowed = allowed === undefined ? sessionProfileSelection(root.session).allowedProfileIds : Array.isArray(allowed) ? allowed.map(entry => {
-            if (typeof entry !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(entry.trim())) throw new Error('Invalid profile id')
+            if (typeof entry !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(entry.trim())) throw new Error('档案 id 无效')
             return entry.trim()
-          }) : (() => { throw new Error('Invalid profile id list') })()
+          }) : (() => { throw new Error('档案 id 列表无效') })()
           updateProfileSelection(root.session, { defaultProfileId: nextDefault, allowedProfileIds: nextAllowed })
         }
       }
-    } catch (error) { if (error instanceof Error && /Invalid profile/.test(error.message)) throw error }
+    } catch (error) { if (error instanceof Error && /档案/.test(error.message)) throw error }
     return this.snapshot(sessionId)
   }
 
@@ -192,7 +192,7 @@ export class AdvisorRemoteService extends TypertRemoteService {
 
   @Remote
   async validateModel(selection: string): Promise<string> {
-    if (selection.length > 2048) throw new Error('Advisor model selection is too large')
+    if (selection.length > 2048) throw new Error('Advisor 模型选择过大')
     return JSON.stringify(await this.validatedModel(JSON.parse(selection)))
   }
 
@@ -203,10 +203,10 @@ export class AdvisorRemoteService extends TypertRemoteService {
     else if (action === 'mode') updateModeOverride(root.session, value)
     else if (action === 'timeoutMs') updateTimeoutOverride(root.session, value)
     else if (action === 'tool') {
-      if (value !== 'allow' && value !== 'deny' && value !== 'inherit') throw new Error('Invalid tool override')
+      if (value !== 'allow' && value !== 'deny' && value !== 'inherit') throw new Error('工具覆盖值无效')
       const item = catalogFor(this.config.currentConfig(), root).tools.find(item => item.name === tool)
-      if (!item) throw new Error('Tool is not visible in this root session')
-      if (value === 'allow' && item.reserved) throw new Error('Advisor delegation tools are permanently disabled.')
+      if (!item) throw new Error('这个工具在此 root 会话中不可见')
+      if (value === 'allow' && item.reserved) throw new Error('Advisor 委派类工具永久禁用。')
       updateToolOverride(root.session, tool, value)
     } else if (action === 'escalationWait' || action === 'continuousWait' || action === 'completionWait') updateWaitOverride(root.session, action, value)
     else if (action === 'trigger') {

@@ -407,7 +407,7 @@ export async function callAdvisor(
   // not part of the configurable tool policy.
   const advisorTools = [...allowedTools, ADVISOR_VERDICT_TOOL]
   const prefix = advisorPolicyNote(advisorTools, unavailableTools)
-  const timeoutMessage = 'Advisor consultation timed out (configured per-attempt limit: ' + config.timeoutMs / 1000 + ' seconds).'
+  const timeoutMessage = 'Advisor 咨询超时（单次尝试时限：' + config.timeoutMs / 1000 + ' 秒）。'
   const deadline = deadlineSignal(signal, config.timeoutMs)
   const callSignal = deadline.signal
   const identity = lifecycle.registry.reserve(parent, lifecycle.root, advisorTools)
@@ -565,11 +565,11 @@ export async function callAdvisor(
       const turnEnd = closed.turnEnd
       if (turnEnd === undefined) {
         // A timeout means CLOSURE WAS NOT ESTABLISHED, never "the child stopped".
-        if (closureCancelled) throw new AdvisorUnavailableError('Advisor request cancelled before the delivered turn closed.', 'cancelled')
+        if (closureCancelled) throw new AdvisorUnavailableError('已交付的轮次关闭前咨询被取消。', 'cancelled')
         // A claim is what separates a delivery that was never picked up from a turn
         // that ran and never closed; only the measured claim decides which.
-        if (closed.claimedTurn === undefined) throw new AdvisorUnavailableError('The Advisor accepted the consultation but no turn of that child session ever claimed it, so closure was never established.', ACCEPTED_NOT_CLAIMED)
-        throw new AdvisorUnavailableError(timeoutMessage + ' The delivered turn was claimed but never closed, so the consultation was not completed.', CLOSURE_TIMEOUT, true)
+        if (closed.claimedTurn === undefined) throw new AdvisorUnavailableError('Advisor 接受了咨询，但子会话没有一轮认领它，所以闭合从未建立。', ACCEPTED_NOT_CLAIMED)
+        throw new AdvisorUnavailableError(timeoutMessage + ' 已交付的轮次已被认领但一直没有关闭，咨询没有完成。', CLOSURE_TIMEOUT, true)
       }
 
       const turn = Number(turnEnd.data?.turn)
@@ -586,9 +586,9 @@ export async function callAdvisor(
       if (!reconciled.published) {
         if (kind !== 'completed') {
           const facts = reasonFacts(turnEnd)
-          throw new AdvisorUnavailableError('Advisor turn ' + closure.turn + ' closed with ' + kind + ' (' + facts + '); it published no verdict.', TURN_NOT_COMPLETED, kind !== 'aborted' && TRANSIENT_PATTERN.test(facts))
+          throw new AdvisorUnavailableError('Advisor 第 ' + closure.turn + ' 轮以 ' + kind + ' 关闭（' + facts + '），没有发布结论。', TURN_NOT_COMPLETED, kind !== 'aborted' && TRANSIENT_PATTERN.test(facts))
         }
-        throw new AdvisorUnavailableError('Advisor returned no usable verdict: ' + reconciled.reason, NO_VERDICT)
+        throw new AdvisorUnavailableError('Advisor 没有返回可用结论：' + reconciled.reason, NO_VERDICT)
       }
       published = true
       return { verdict: reconciled.verdict, childSessionId: conversationId, consultationId, collectorId, invocationId: identity.invocationId, lastSeq: requesterSeq(parent), ...usageOfTurn(ctx, conversationId, closure.turn) }
@@ -603,10 +603,10 @@ export async function callAdvisor(
     // refusals own no delivery and interrupt nothing (see ownDelivery above).
     if (ownDelivery && conversationId !== '') interrupt(subagents, conversationId, parent)
     if (error instanceof AdvisorUnavailableError) throw error
-    if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor request cancelled.', 'cancelled')
+    if (signal.aborted) throw new AdvisorUnavailableError(signal.reason?.name === 'TimeoutError' ? timeoutMessage : 'Advisor 请求被取消。', 'cancelled')
     if (callSignal.aborted) throw new AdvisorUnavailableError(timeoutMessage, 'timeout', true)
     const message = error instanceof Error ? error.message : String(error)
-    throw new AdvisorUnavailableError('Unable to run Advisor: ' + message, START_REJECTED, TRANSIENT_PATTERN.test(message))
+    throw new AdvisorUnavailableError('无法运行 Advisor：' + message, START_REJECTED, TRANSIENT_PATTERN.test(message))
   } finally {
     // Per-turn cleanup on EVERY exit path, including throws: the listeners, the
     // deadline and the abort hook all belong to this turn alone. The child itself
@@ -626,7 +626,7 @@ export async function callAdvisor(
     // THIS turn's own collector identity, so releasing it can only drop this
     // turn's child index — never the index of a turn that is still live. A turn
     // that never reached its own `bind` has no index of its own to drop.
-    if (!published) lifecycle.collector.invalidate(collectorId, 'Advisor turn ended without publishing a verdict.')
+    if (!published) lifecycle.collector.invalidate(collectorId, 'Advisor 轮次结束时没有发布结论。')
     if (boundChild) lifecycle.collector.release(collectorId)
   }
 }

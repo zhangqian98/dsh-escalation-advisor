@@ -21,12 +21,12 @@ window.__ModuleLoader__.load({
       badge: { fontSize: 10, opacity: .72, whiteSpace: 'nowrap' },
       mini: { cursor: 'pointer', border: 0, background: 'transparent', color: 'inherit', opacity: .72, fontSize: 11, padding: 2 },
     }
-    const WAIT = [['block', 'Block main session'], ['background', 'Run in background']]
+    const WAIT = [['block', '等待顾问完成'], ['background', '后台运行']]
     const MODE_LABELS = { manual: '仅主动咨询', escalate: '自动升级', continuous: '持续审阅' }
     const COMMON_TOOLS = [
-      ['read', 'Read files'], ['read_image', 'Read images'], ['glob', 'List matching paths'], ['grep', 'Search file contents'],
-      ['web_search', 'Web search'], ['web_fetch', 'Web fetch'],
-      ['edit', 'Edit files'], ['write', 'Write/replace files'], ['bash', 'Shell (bash)'], ['pwsh', 'Shell (PowerShell)'],
+      ['read', '读取文件'], ['read_image', '读取图片'], ['glob', '按模式列文件'], ['grep', '搜索文件内容'],
+      ['web_search', '联网搜索'], ['web_fetch', '抓取网页'],
+      ['edit', '编辑文件'], ['write', '写入/替换文件'], ['bash', '终端（bash）'], ['pwsh', '终端（PowerShell）'],
     ]
     const SAFE_DEFAULTS = ['read', 'read_image', 'glob', 'grep']
     // Same strict string envelope as the Host's src/remote.ts contract.
@@ -57,11 +57,11 @@ window.__ModuleLoader__.load({
         const reply = JSON.parse(run.responseText)
         const lines = [reply.summary, reply.disposition && '判断：' + reply.disposition, reply.diagnosis,
           ...(reply.next_actions ?? []).map((action, index) => (index + 1) + '. ' + action),
-          reply.recommended_next_action && 'Recommended next action:\n' + reply.recommended_next_action,
-          reply.evidence_used?.length && 'Evidence used:\n' + reply.evidence_used.map(item => item.kind + ': ' + item.reference).join('\n'),
-          reply.assumptions?.length && 'Assumptions:\n' + reply.assumptions.join('\n'),
-          reply.validation_plan?.length && 'Validation plan:\n' + reply.validation_plan.join('\n'),
-          reply.changes_made?.length && 'Changes made:\n' + reply.changes_made.map(item => item.paths.join(', ') + ': ' + item.reason + '\n' + item.validation.join('\n')).join('\n'),
+          reply.recommended_next_action && '建议的下一步：\n' + reply.recommended_next_action,
+          reply.evidence_used?.length && '引用证据：\n' + reply.evidence_used.map(item => item.kind + ': ' + item.reference).join('\n'),
+          reply.assumptions?.length && '假设：\n' + reply.assumptions.join('\n'),
+          reply.validation_plan?.length && '验证计划：\n' + reply.validation_plan.join('\n'),
+          reply.changes_made?.length && '已做修改：\n' + reply.changes_made.map(item => item.paths.join(', ') + ': ' + item.reason + '\n' + item.validation.join('\n')).join('\n'),
           typeof reply.needs_more_evidence === 'boolean' && '仍需补充证据：' + (reply.needs_more_evidence ? '是' : '否'),
           typeof reply.confidence === 'number' && '顾问信心：' + reply.confidence]
         return '[Strong advisor — manual; severity=' + reply.severity + '; child=' + run.childSessionId + ']\n' + lines.filter(Boolean).join('\n\n')
@@ -152,7 +152,7 @@ window.__ModuleLoader__.load({
         h('p', { style: { margin: '6px 0', lineHeight: 1.6 } }, 'Advisor 以可查看的 DSH 子会话运行。这里配置模型、覆盖范围、全局默认工具开关和等待策略。'),
         h('p', { style: css.hint }, '工具权限是“默认开/默认关”。当前 root 会话可在标题栏 Advisor 面板逐个覆盖；本地 subagent 只能在 root 允许范围与自身实际可见工具的交集中使用 Advisor 工具。'),
         h('label', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 14 } }, h('input', { type: 'checkbox', checked: value.enabled, disabled, onChange: e => edit('enabled', e.target.checked) }), '启用 Advisor'),
-        field('模式', h('select', { style: css.control, value: value.mode, disabled, onChange: e => edit('mode', e.target.value) }, h('option', { value: 'manual' }, 'manual'), h('option', { value: 'escalate' }, 'escalate（推荐）'), h('option', { value: 'continuous' }, 'continuous'))),
+        field('模式', h('select', { style: css.control, value: value.mode, disabled, onChange: e => edit('mode', e.target.value) }, h('option', { value: 'manual' }, '仅主动咨询'), h('option', { value: 'escalate' }, '自动升级（推荐）'), h('option', { value: 'continuous' }, '持续审阅'))),
         h('div', { style: { margin: '14px 0' } },
           h('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 7 } }, '全局默认顾问模型与思考等级'),
           h(AdvisorModelPicker, { ctx, sessionId: 'advisor-global-default', selection: selectedModel, disabled, onSelect: selectDefaultModel, onBusy: setModelBusy }),
@@ -170,10 +170,10 @@ window.__ModuleLoader__.load({
           h('p', { style: css.hint }, 'Manual 与自动 escalation 默认覆盖主 agent 和本地 DSH subagent；Continuous 默认只审主 agent，避免 N 个 worker 各自持续调用强模型。完成前审阅默认关闭，开启后在交付前做一次最终检查。Advisor 自己永远不递归。'),
           h('div', { style: css.coverageGrid },
             h('strong', null, '模式'), h('strong', { style: { textAlign: 'center' } }, '主 agent'), h('strong', { style: { textAlign: 'center' } }, '本地 subagent'),
-            h('span', null, 'Manual consultation'), check('manualMainAgent', '开'), check('manualLocalSubagents', '开'),
-            h('span', null, 'Automatic escalation'), check('escalationMainAgent', '开'), check('escalationLocalSubagents', '开'),
-            h('span', null, 'Continuous review'), check('continuousMainAgent', '开'), check('continuousLocalSubagents', '开'),
-            h('span', null, 'Completion review'), check('completionMainAgent', '开'), check('completionLocalSubagents', '开')),
+            h('span', null, '主动咨询'), check('manualMainAgent', '开'), check('manualLocalSubagents', '开'),
+            h('span', null, '自动升级'), check('escalationMainAgent', '开'), check('escalationLocalSubagents', '开'),
+            h('span', null, '持续审阅'), check('continuousMainAgent', '开'), check('continuousLocalSubagents', '开'),
+            h('span', null, '完成前审阅'), check('completionMainAgent', '开'), check('completionLocalSubagents', '开')),
           h('p', { style: css.hint }, '本地 subagent 的自动 escalation / continuous 一旦启用会强制等待 Advisor 完成，避免 one-shot worker 先把旧结果交回父 agent。')),
 
         h('div', { style: { marginTop: 18 } },
@@ -193,8 +193,8 @@ window.__ModuleLoader__.load({
           field('额外委派工具（Advisor 禁用）', h('input', { type: 'text', style: css.control, value: (value.capabilityAmplifierTools ?? []).join(', '), disabled, onChange: e => edit('capabilityAmplifierTools', uniqueTools(e.target.value.split(/[\s,]+/))) }), 'DSH 内置委派工具的别名自动识别；在这里补充可创建远端 agent 或工作流的自定义/MCP 工具。')),
 
         h('div', { style: css.row },
-          field('主 agent 自动 escalation', h('select', { style: css.control, value: value.escalationWait, disabled, onChange: e => edit('escalationWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
-          field('主 agent Continuous review', h('select', { style: css.control, value: value.continuousWait, disabled, onChange: e => edit('continuousWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
+          field('主 agent 自动升级等待策略', h('select', { style: css.control, value: value.escalationWait, disabled, onChange: e => edit('escalationWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
+          field('主 agent 持续审阅等待策略', h('select', { style: css.control, value: value.continuousWait, disabled, onChange: e => edit('continuousWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
           field('完成前审阅等待策略', h('select', { style: css.control, value: value.completionWait ?? 'block', disabled, onChange: e => edit('completionWait', e.target.value) }, ...WAIT.map(([id, label]) => h('option', { key: id, value: id }, label)))),
         ),
         h('details', { style: { marginTop: 18 } }, h('summary', { style: { cursor: 'pointer', fontWeight: 600 } }, '成本、预算与阈值'),
@@ -216,7 +216,7 @@ window.__ModuleLoader__.load({
     }
     function parseCatalog(text) {
       const value = JSON.parse(text)
-      if (!value || !Array.isArray(value.tools)) throw new Error('Invalid Advisor tool catalog')
+      if (!value || !Array.isArray(value.tools)) throw new Error('顾问工具目录无效，请刷新重试')
       return value
     }
 
@@ -521,14 +521,14 @@ window.__ModuleLoader__.load({
           options: () => Promise.resolve(options.map(([id, label]) => ({ id, label }))),
           onSelect: async (option, session) => {
             const live = sessionFor(session)
-            if (!live) throw new Error('session is not materialized')
+            if (!live) throw new Error('会话尚未就绪，请稍后重试')
             const result = await live.command(`/${name} ${option.id}`)
             if (!result.ok || !result.value.matched) throw new Error(`/${name} failed`)
           },
         },
       }), `escalation-advisor: /${name} picker`)
-      decorate('advisor-escalation-wait', [['inherit', 'Inherit'], ['block', 'Block main session'], ['background', 'Run in background']])
-      decorate('advisor-continuous-wait', [['inherit', 'Inherit'], ['block', 'Block main session'], ['background', 'Run in background']])
+      decorate('advisor-escalation-wait', [['inherit', '跟随全局'], ['block', '等待顾问完成'], ['background', '后台运行']])
+      decorate('advisor-continuous-wait', [['inherit', '跟随全局'], ['block', '等待顾问完成'], ['background', '后台运行']])
     }
 
     return {
