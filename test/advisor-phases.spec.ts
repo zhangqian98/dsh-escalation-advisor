@@ -211,24 +211,26 @@ describe('consultation profile pinning', () => {
   });
   it('caps a profiled consultation at the policy-profile tool intersection', async () => {
     const harnessMod = await import('./harness.js');
+    const { ToolCallId } = await import('@deepseek-ai/dsh-llm');
+    const { advisorRunHistory } = await import('../src/telemetry.js');
     const h = await harnessMod.createIntegrationHarness(
-      { weak: [harnessMod.textResponse('done')], advisor: harnessMod.advisorScript(harnessMod.advisorVerdictResponse({ summary: 'inspect-only' })) },
+      { weak: [harnessMod.textResponse('done')], advisor: harnessMod.advisorScript(harnessMod.advisorVerdictResponse({ summary: 'x' })) },
       { defaultEnabledTools: ['write'], advisorProfiles: [{ id: 'debugger', label: 'Debugger', provider: 'mock', model: 'advisor', toolPolicy: 'inspect' }] } as unknown as Partial<import('../src/config.js').Config>,
     );
     try {
+      const t1 = Date.now();
       const tools = h.ctx.get('tools') as { execute(input: unknown): Promise<{ content: readonly unknown[] }> };
-      const { ToolCallId } = await import('@deepseek-ai/dsh-llm');
       const out = await tools.execute({ callId: ToolCallId('ceiling-1'), name: 'consult_advisor', arguments: { question: 'Look only?', advisor_profile: 'debugger' }, agent: h.root, signal: new AbortController().signal });
+      console.log('PHASE-INT ask done');
       const text = (out.content as readonly { type?: string; text?: string }[]).flatMap(b => (b.type === 'text' ? [String(b.text ?? '')] : [])).join('');
       const answer = JSON.parse(text) as Record<string, unknown>;
       expect(answer.status, text).toBe('ok');
       expect(answer.capabilities).toEqual([]);
-      const { advisorRunHistory } = await import('../src/telemetry.js');
       expect(advisorRunHistory(h.root)[0]).toMatchObject({ toolCeiling: [] });
     } finally {
       await h.ctx.fiber.dispose();
     }
-  }, 60000);
+  }, 30000);
   it('refuses when the allow-list matches no configured profile', async () => {
     const harnessMod = await import('./harness.js');
     const h = await harnessMod.createIntegrationHarness(
