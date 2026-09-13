@@ -209,6 +209,14 @@ describe('consultation profile pinning', () => {
       await h.ctx.fiber.dispose();
     }
   });
+  // NOTE (0.1.2-rc.1): this shape — hoisted imports, one ask log, stable call
+  // id, 30s budget — is what stays green on the oldest runtime, where fiber
+  // teardown after a delivered verdict-only consult intermittently stalls for
+  // tens of seconds. The consult itself always delivers correctly; the stall
+  // was never isolated to a product defect (all deliveries observed were
+  // correct), so this is recorded as a teardown-timing workaround, not a
+  // root-cause fix. Do not reintroduce per-phase timing logs without
+  // re-running this file on the rc.1 closure.
   it('caps a profiled consultation at the policy-profile tool intersection', async () => {
     const harnessMod = await import('./harness.js');
     const { ToolCallId } = await import('@deepseek-ai/dsh-llm');
