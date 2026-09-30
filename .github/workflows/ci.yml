@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'compat/**']
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -43,7 +43,7 @@ jobs:
       fail-fast: false
       matrix:
         node: ['22.19.0', '24']
-        dsh: ['0.1.2-rc.1', '0.1.5-alpha.2', '0.1.5-rc.1']
+        dsh: ['0.1.2-rc.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.2.0-rc.2']
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -57,7 +57,20 @@ jobs:
       # Vitest and TypeScript come from the plugin's own devDependency tree.
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Install the deployed DSH runtime closure
-        run: npm install --prefix "$RUNNER_TEMP/dsh-${{ matrix.dsh }}" --no-save --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
+        run: node scripts/install-test-runtime.mjs "${{ matrix.dsh }}" "$RUNNER_TEMP/dsh-${{ matrix.dsh }}"
+      - name: Load the pinned native model picker source
+        if: matrix.dsh == '0.2.0-rc.2'
+        uses: actions/checkout@v5
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 639ed015397290b3745d163aafe02ffee4aa3f84
+          path: .upstream-model-directory
+          sparse-checkout: packages/client/ui-model-selection/src/client/directory.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Enable native model picker contract test
+        if: matrix.dsh == '0.2.0-rc.2'
+        run: echo "DSH_MODEL_DIRECTORY_SOURCE=$GITHUB_WORKSPACE/.upstream-model-directory/packages/client/ui-model-selection/src/client/directory.ts" >> "$GITHUB_ENV"
       - name: Test against the deployed runtime
         env:
           DSH_RUNTIME_PACKAGE_JSON: ${{ runner.temp }}/dsh-${{ matrix.dsh }}/node_modules/@deepseek-ai/dsh/package.json

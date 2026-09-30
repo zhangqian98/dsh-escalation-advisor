@@ -5,6 +5,7 @@ import { bindScopeParent, createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { isAdvisorSource } from '../src/runtime-compat.js'
 import { advisorRunHistory } from '../src/telemetry.js'
 import {
   advisorChildren,
@@ -18,6 +19,7 @@ import {
   systemPromptOf,
   textResponse,
   toolCallResponse,
+  toolResultRecords,
   waitUntil,
   type IntegrationHarness,
 } from './harness.js'
@@ -471,7 +473,7 @@ describe('real DSH AgentLoop and spawn integration', () => {
     expect(h.adapter.forModel('weak')).toHaveLength(4)
     expect(requestText(h.adapter.forModel('weak')[2]!.request)).not.toContain('Advice for the obsolete first task.')
     const deliveredPluginMessages = h.root.session.snapshotEvents()
-      .filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
+      .filter(event => event.type === 'user/message' && isAdvisorSource(event.data.source))
     expect(JSON.stringify(deliveredPluginMessages)).not.toContain('Advice for the obsolete first task.')
   })
 
@@ -518,13 +520,9 @@ describe('real DSH AgentLoop and spawn integration', () => {
       expect(inserted.length).toBeGreaterThan(0)
       for (const message of inserted) expect(message.source?.kind).toBe('subagent-settled')
     }
-    const toolResults = h.adapter.forModel('weak')[1]!.request.messages
-      .flatMap(message => message.content)
-      .filter(block => block.type === 'tool-result')
+    const toolResults = toolResultRecords(h.adapter.forModel('weak')[1]!.request.messages)
     expect(toolResults).toHaveLength(1)
-    const resultText = toolResults[0]!.type === 'tool-result'
-      ? toolResults[0]!.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('')
-      : ''
+    const resultText = toolResults[0]!.text
     expect(JSON.parse(resultText)).toMatchObject({
       status: 'unavailable',
       summary: 'Advisor 不可用',

@@ -415,3 +415,25 @@ describe('buildCasePacket', () => {
     expect(packet.failures.every((entry: { call_id: string }) => entry.call_id.startsWith('related-'))).toBe(true)
   })
 })
+
+
+describe('V4 case packet evidence', () => {
+  it('retains flat tool text and top-level failure flags without copying runtime guidance', () => {
+    const events: FakeEvent[] = [
+      user(0, 'Fix the failing check'),
+      { type: 'user/message', seq: 1, data: { source: { kind: 'runtime-context' }, content: [{ type: 'text', text: 'DO_NOT_COPY_RUNTIME' }] } },
+      { type: 'user/message', seq: 2, data: { source: { kind: 'plugin:dsh-escalation-advisor' }, content: [{ type: 'text', text: 'DO_NOT_COPY_ADVISOR' }] } },
+      call(3, 'read-1', 'custom_status', { path: 'src/main.ts' }),
+      { type: 'tool/result', seq: 4, data: { message: { source: { kind: 'tool', callId: 'read-1' }, content: [{ type: 'text', text: 'const inspected = 42' }] } } },
+      call(5, 'check-1', 'bash', { command: 'npm test' }),
+      { type: 'tool/result', seq: 6, data: { message: { source: { kind: 'tool', callId: 'check-1' }, isError: true, content: [{ type: 'text', text: 'V4_ASSERTION_FAILURE' }] } } },
+    ]
+    const agent = fakeAgent('root', events)
+    const packet = buildCasePacket(baseInput(agent, agent))
+    expect(packet.prompt).toContain('const inspected = 42')
+    expect(packet.prompt).toContain('V4_ASSERTION_FAILURE')
+    expect(packet.prompt).not.toContain('DO_NOT_COPY_')
+    const payload = JSON.parse(packet.prompt)
+    expect(payload.tool_activity.find((item: { call_id: string }) => item.call_id === 'check-1').outcome).toBe('failed')
+  })
+})

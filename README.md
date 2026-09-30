@@ -52,7 +52,17 @@ Instead of free-form provider/model input, configure named **advisor profiles** 
 
 ## Install
 
-This release supports **DSH `0.1.2-rc.1`, `0.1.5-alpha.2`, and `0.1.5-rc.1`**. All three pass the integration suite; `0.1.2-rc.1` has also been checked in an installed DSH Web profile with real Codex models. Development and CI lock the complete runtime dependency tree to `0.1.5-alpha.2`; other prereleases are not claimed as compatible. CI checks Node 22.19 and 24. DSH `0.1.5-rc.1` migrates supported older session files to V3 while retaining their original files; back up histories before upgrading.
+This release supports **DSH `0.1.2-rc.1`, `0.1.5-alpha.2`, `0.1.5-rc.1`, and `0.2.0-rc.2`**. `0.1.2-rc.1` has also been checked in an installed DSH Web profile with real Codex models. Development locks the runtime dependency tree to `0.2.0-rc.2`; other prereleases are not claimed as compatible. CI checks Node 22.19 and 24. DSH `0.1.5-rc.1` migrates supported older session files to V3 while retaining their original files; back up histories before upgrading.
+
+**DSH `0.2.0-rc.2`:** uses live Config forms (`configForms`), producer-owned message sources, lazy Remote codecs, and flat tool-result messages. The plugin adapts these interfaces while retaining the tested legacy paths. Settings remain under the `escalation-advisor` profile entry. New-format V4 sessions are tested with scripted models; this does not claim real provider authentication, model quality, or production browser validation.
+
+Before reopening Advisor V4 histories, stop DSH, back up the profile and sessions, and run the maintenance command below against the exact `0.2.0-rc.2` installation. Its separate persistence worker cannot see the plugin's in-process event registration. For this release the script patches **only current-V4 worker verification**, preserves history bytes, validates the four owned payloads, and checks both pristine and patched bundle hashes. It does not enable old Advisor history migration. Reinstalling DSH replaces the worker patch.
+
+```bash
+node scripts/patch-dsh-history.mjs /absolute/path/to/@deepseek-ai/dsh/package.json /absolute/path/to/new-backup-directory
+```
+
+**Upgrade warning:** do not open V0–V3 histories containing Advisor records in `0.2.0-rc.2`. Its released migration inventory rejects these required extension events; bypassing that check could invalidate cross-session sequence references in old consultation records. Keep a backup and use the original compatible runtime for those histories. Ordinary histories without Advisor events follow DSH's own migration behavior.
 
 **Existing Advisor histories on DSH `0.1.5-rc.1`:** the released core's frozen migration inventory does not include plugin events. Before opening an older history containing Advisor records, stop DSH, back up the profile and sessions, and run the included maintenance script:
 
@@ -60,7 +70,7 @@ This release supports **DSH `0.1.2-rc.1`, `0.1.5-alpha.2`, and `0.1.5-rc.1`**. A
 node scripts/patch-dsh-history.mjs /absolute/path/to/@deepseek-ai/dsh/package.json /absolute/path/to/new-backup-directory
 ```
 
-This local compatibility patch checks the exact DSH version and original file checksums, backs up two core files, and adds schemas for only `advisor/policy`, `advisor/model`, `advisor/identity`, and `advisor/run`. Their payloads are retained through V0 → V3 migration; other unknown historical types still fail. It also updates the persistence worker's event vocabulary for these four types. Keep Advisor enabled when opening these histories. Reinstalling DSH replaces the local core patch; rerun it for this exact release, and revalidate compatibility before using a different DSH release. The plugin supports both the earlier `tool/code-dispatch*` records and V3's `tool/ptc-dispatch*` records for continuous-review evidence.
+For `0.1.5-rc.1`, this local compatibility patch checks the exact DSH version and original file checksums, backs up two core files, and adds schemas for only `advisor/policy`, `advisor/model`, `advisor/identity`, and `advisor/run`. Their payloads are retained through V0 → V3 migration; other unknown historical types still fail. It also updates the persistence worker's event vocabulary for these four types. Keep Advisor enabled when opening these histories. Reinstalling DSH replaces the local core patch; rerun it for this exact release, and revalidate compatibility before using a different DSH release. The plugin supports both the earlier `tool/code-dispatch*` records and V3's `tool/ptc-dispatch*` records for continuous-review evidence.
 
 Install the exact npm release into the Web profile, then restart DSH:
 
@@ -290,14 +300,26 @@ npm run pack:check
 
 Tests include real DSH AgentLoop, tool runtime, session invariants, spawn children, and strict Remote Gateway dispatch. Only the model adapter is scripted. These verify lifecycle behavior without requiring provider credentials; live model quality/authentication and a complete production Web deployment remain separate deployment checks.
 
-To run the suite against an existing local installation without changing it (PowerShell):
+To run the suite against an existing local installation without changing it (Linux):
+
+```bash
+DSH_RUNTIME_PACKAGE_JSON=/absolute/path/to/@deepseek-ai/dsh/package.json npx vitest run --config vitest.runtime.config.ts
+```
+
+The optional native model-picker test executes the exact upstream `ModelDirectory` source (no provider calls):
+
+```bash
+DSH_MODEL_DIRECTORY_SOURCE=/absolute/path/to/deepseek-harness/packages/client/ui-model-selection/src/client/directory.ts npx vitest run test/client.spec.ts
+```
+
+For PowerShell:
 
 ```powershell
 $env:DSH_RUNTIME_PACKAGE_JSON = "$env:APPDATA/npm/node_modules/@deepseek-ai/dsh/package.json"
 npx vitest run --config vitest.runtime.config.ts
 ```
 
-The installed-runtime configuration resolves all DSH imports from that installation. Persistence regressions use each version's actual cold-read validation and check that restored policy, identity, and verdict records survive, while unrelated unknown events still fail.
+The installed-runtime configuration resolves all DSH imports from that installation. CI uses `scripts/install-test-runtime.mjs` to pin and verify every DSH sibling, because older top-level prerelease packages otherwise allow dependency drift. Persistence regressions use each version's actual cold-read validation and check that restored policy, identity, and verdict records survive, while unrelated unknown events still fail.
 
 Release tags use `v<package-version>`. The release workflow checks the tag, runs the suite, builds an npm tarball, attaches it to the GitHub release, and publishes the prerelease under npm's `alpha` dist-tag through npm Trusted Publishing (OIDC). The workflow stores no long-lived npm publishing token.
 

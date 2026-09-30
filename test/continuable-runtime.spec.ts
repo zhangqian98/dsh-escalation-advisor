@@ -154,7 +154,7 @@ class Trace {
   private order = 0
 
   constructor(ctx: Context) {
-    ctx.on('agent/created', ({ agent }) => { this.push('agent/created', { agent: String(agent.id) }) })
+    ctx.on('agent/created', ({ agent }) => { this.push('agent/created', { agent: String(agent.id) }); return undefined })
     ctx.on('agent/disposed', ({ agent }) => { this.push('agent/disposed', { agent: String(agent.id) }) })
     ctx.on('agent/status', ({ agent, status }) => { this.push('agent/status', { agent: String(agent.id), status: String(status) }) })
     ctx.on('agent/inbox/inserted', ({ agent, message }) => { this.push('agent/inbox/inserted', { agent: String(agent.id), message: String(message.id), source: String(message.source?.kind ?? '') }) })

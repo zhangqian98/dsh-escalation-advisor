@@ -544,5 +544,5 @@ export function installAdvisorPolicyCommand(ctx: Context, currentConfig: () => C
     agent.ctx.inject(['commands'], commandCtx => { registerPolicyCommands(commandCtx, currentConfig) })
   }
   for (const agent of ctx.agents.list()) mountAgent(agent)
-  ctx.on('agent/created', ({ agent }) => { mountAgent(agent) })
+  ctx.on('agent/created', ({ agent }) => { mountAgent(agent); return undefined })
 }

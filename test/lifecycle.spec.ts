@@ -27,7 +27,7 @@ describe('Advisor lifecycle accounting and delivery', () => {
       const child = await h.spawnWorker()
       const result = await child.result
       await child.dispose()
-      return result.output
+      return [...result.output]
     } }))
     await h.runRoot('Run the wrapper')
     expect(h.adapter.forModel('advisor')).toHaveLength(0)
@@ -42,7 +42,7 @@ describe('Advisor lifecycle accounting and delivery', () => {
       const child = await h.ctx.subagents.start('spawn', { parent: exec.agent!, signal: exec.signal, prompt: [{ type: 'text', text: 'Try the shell' }], agentOptions: { model: 'escape' } })
       const result = await child.result
       await child.dispose()
-      return result.output
+      return [...result.output]
     } }))
     await h.runRoot('Inspect within the permitted boundary')
     expect(shellCalls).toBe(0)

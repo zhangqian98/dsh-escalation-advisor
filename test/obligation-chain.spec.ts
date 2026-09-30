@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { isAdvisorSource } from '../src/runtime-compat.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { brandString, type Branded } from '@deepseek-ai/dsh-brand'
@@ -9,6 +10,7 @@ import {
   requestText,
   textResponse,
   toolCallResponse,
+  toolResultRecords,
   type IntegrationHarness,
 } from './harness.js'
 
@@ -121,7 +123,7 @@ function obligationNotices(agent: Agent): string[] {
   const notices: string[] = []
   for (const event of agent.session.snapshotEvents()) {
     if (event.type !== 'user/message') continue
-    if (event.data.source.kind !== 'plugin' || event.data.source.plugin !== 'dsh-escalation-advisor') continue
+    if (!isAdvisorSource(event.data.source)) continue
     const text = event.data.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
     if (text.includes('[Advisor 验证项')) notices.push(text)
   }
@@ -132,9 +134,8 @@ function obligationNotices(agent: Agent): string[] {
 function toolResultText(agent: Agent, callId: string): string {
   for (const event of agent.session.snapshotEvents()) {
     if (event.type !== 'tool/result') continue
-    const block = event.data.message.content[0]
-    if (String(block.toolCallId) !== callId) continue
-    return block.content.flatMap(inner => inner.type === 'text' ? [inner.text] : []).join('\n')
+    const result = toolResultRecords([event.data.message]).find(result => result.toolCallId === callId)
+    if (result) return result.text
   }
   return ''
 }

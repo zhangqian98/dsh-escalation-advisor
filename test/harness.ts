@@ -56,6 +56,13 @@ import { ADVISOR_VERDICT_TOOL } from '../src/verdict-tool.js'
 import { ADVISOR_SESSION_EVENT_TYPES } from '../src/session-events.js'
 import * as Advisor from '../src/index.js'
 import type { Config } from '../src/config.js'
+import { modernRuntime } from '../src/runtime-compat.js'
+
+declare module '@deepseek-ai/dsh-llm/message' {
+  interface MessageSourceMap {
+    'plugin:test-harness': { kind: 'plugin:test-harness' }
+  }
+}
 
 export type { GenerateOptions }
 
@@ -97,15 +104,27 @@ export class ScriptedAdapter extends LlmAdapter {
   }
 }
 
-class MemorySettings extends SettingsProvider {
+// DSH <= 0.1.5 uses a separately persisted SettingsProvider; 0.2 projects live
+// Loader Config forms through SettingsForms instead. A lightweight harness has
+// no Loader/configEditor/profileContext, so only mount the legacy provider when
+// its register API is actually present. Extending its structural Service base
+// keeps this fixture type-checkable against both generations of declarations.
+const LEGACY_SETTINGS_API = typeof (SettingsProvider.prototype as unknown as { register?: unknown }).register === 'function'
+const LegacySettingsProvider = SettingsProvider as unknown as typeof Service
+
+class MemorySettings extends LegacySettingsProvider {
   readonly writable = true
   private stored: Record<string, unknown> = {}
 
-  protected override load(): Promise<Record<string, unknown>> {
+  constructor(ctx: Context) {
+    super(ctx, 'settings')
+  }
+
+  protected load(): Promise<Record<string, unknown>> {
     return Promise.resolve(structuredClone(this.stored))
   }
 
-  protected override persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
+  protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
     this.stored = { ...this.stored, [ns]: structuredClone(section) }
     return Promise.resolve()
   }
@@ -406,13 +425,22 @@ export interface ContinuableStartOptions {
   readonly signal?: AbortSignal
 }
 
+// Goal is a producer-owned source in DSH 0.2. These tests do not mount the goal
+// plugin, but deliberately exercise Advisor's handling of its unchanged DTO.
+type RootMessageSource = Parameters<typeof createUserMessage>[0]['source'] | {
+  kind: 'goal'
+  goalId: string
+  revision: number
+  round: number
+}
+
 export interface IntegrationHarness {
   readonly ctx: Context
   readonly root: Agent
   readonly adapter: ScriptedAdapter
   readonly created: CreatedAgentRecord[]
   /** `source` defaults to an ordinary human turn; a goal round passes its own attribution. */
-  runRoot(prompt: string, source?: Parameters<typeof createUserMessage>[0]['source']): Promise<void>
+  runRoot(prompt: string, source?: RootMessageSource): Promise<void>
   spawnWorker(options?: {
     model?: string
     label?: string
@@ -463,7 +491,7 @@ export async function createIntegrationHarness(
   await ctx.plugin(ToolRuntime, {})
   await ctx.plugin(AgentRegistry)
   await mountInvariants(ctx)
-  await ctx.plugin(MemorySettings)
+  if (LEGACY_SETTINGS_API) await ctx.plugin(MemorySettings)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
@@ -475,6 +503,7 @@ export async function createIntegrationHarness(
 
   ctx.on('agent/created', ({ agent }) => {
     created.push({ agent })
+    return undefined
   })
   ctx.on('agent/disposed', ({ agent }) => {
     const record = created.find(candidate => candidate.agent === agent)
@@ -492,10 +521,10 @@ export async function createIntegrationHarness(
     root,
     adapter,
     created,
-    async runRoot(prompt: string, source: Parameters<typeof createUserMessage>[0]['source'] = { kind: 'user' }): Promise<void> {
+    async runRoot(prompt: string, source: RootMessageSource = { kind: 'user' }): Promise<void> {
       root.followup(createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source,
+        source: source as Parameters<typeof createUserMessage>[0]['source'],
       }))
       await root.whenIdle()
     },
@@ -538,7 +567,7 @@ export async function createIntegrationHarness(
         root,
         SessionId(childId),
         [{ type: 'text', text }],
-        { kind: 'plugin', plugin: 'test-harness' },
+        modernRuntime ? { kind: 'plugin:test-harness' } : { kind: 'plugin', plugin: 'test-harness' },
         signal ?? new AbortController().signal,
       )
     },
@@ -612,6 +641,23 @@ export function requestText(request: GenerateOptions): string {
     .join('\n')
 }
 
+/** Owned observations of V3 nested results and V4 first-class tool messages. */
+export function toolResultRecords(messages: readonly unknown[]): { toolCallId: string; text: string; isError: boolean }[] {
+  type Content = { type?: string; text?: string; toolCallId?: string; isError?: boolean; content?: readonly Content[] }
+  type ResultMessage = { role?: string; toolCallId?: string; isError?: boolean; content?: readonly Content[] }
+  const textOf = (content: readonly Content[]): string => content
+    .flatMap(block => block.type === 'text' ? [String(block.text ?? '')] : []).join('\n')
+  return messages.flatMap(value => {
+    const message = value as ResultMessage
+    if (message.role === 'tool' && message.toolCallId !== undefined) {
+      return [{ toolCallId: String(message.toolCallId), text: textOf(message.content ?? []), isError: message.isError === true }]
+    }
+    return (message.content ?? []).flatMap(block => block.type === 'tool-result'
+      ? [{ toolCallId: String(block.toolCallId ?? ''), text: textOf(block.content ?? []), isError: block.isError === true }]
+      : [])
+  })
+}
+
 export function systemPromptOf(request: GenerateOptions): string {
   // The runtime delivers the composed system prompt on `GenerateOptions.system`
   // in some versions and as a leading system message in others. Read both so an
@@ -626,7 +672,11 @@ export function systemPromptOf(request: GenerateOptions): string {
 
 export function runtimeContextOf(request: GenerateOptions): string {
   const snapshots = request.messages
-    .filter(message => message.source.kind === 'plugin' && message.source.plugin === '@deepseek-ai/dsh-system-prompt')
+    .filter(message => {
+      const source = message.source as { kind?: string; plugin?: string } | undefined
+      return source?.kind === 'runtime-context' ||
+        (source?.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
+    })
     .map(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n'))
   return snapshots[snapshots.length - 1] ?? ''
 }
@@ -738,8 +788,9 @@ export class ContinuationTrace {
     this.push(name, detail)
   }
 
-  private push(name: string, detail: Record<string, string | number | boolean>): void {
+  private push(name: string, detail: Record<string, string | number | boolean>): undefined {
     this.entries.push({ order: ++this.order, name, detail })
+    return undefined
   }
 
   /** Every recorded boundary in arrival order, for one session id when given. */
@@ -914,10 +965,13 @@ export async function createDeployedRuntimeHarness(
   // the deployment configures them (`openAt: never`).
   await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-session-persistence-jsonl')), { root: sessionRoot })
   await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-session-query-sqlite')), { path: ':memory:', openAt: 'never' })
-  // The plugin declares `settings` as a hard dependency, so a missing provider
-  // would leave `apply` unrun and register nothing. The deployment's own
-  // provider, pointed at this test's temp directory (no watcher).
-  await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-settings-file')), { path: join(sessionRoot, 'settings.json'), watch: false })
+  // Older runtimes keep settings in a separate document. DSH 0.2 removed that
+  // provider and derives forms from live Loader Config instead; the Advisor
+  // must also mount without the optional settings UI in this minimal host.
+  const Settings = pluginOf(await loadDeployed('@deepseek-ai/dsh-settings'))
+  if (typeof Settings.prototype?.register === 'function') {
+    await ctx.plugin(pluginOf(await loadDeployed('@deepseek-ai/dsh-settings-file')), { path: join(sessionRoot, 'settings.json'), watch: false })
+  }
 
   const llm = ctx.get('llm') as any
   llm.registerAdapter(['mock'], adapter)
@@ -944,7 +998,7 @@ export async function createDeployedRuntimeHarness(
     if (toolRegistry.get(required) === undefined) throw new Error(`the Advisor plugin did not register ${required}`)
   }
 
-  ctx.on('agent/created', ({ agent }) => { agentsCreated.push(String(agent.id)) })
+  ctx.on('agent/created', ({ agent }) => { agentsCreated.push(String(agent.id)); return undefined })
 
   const createRoot = async (id: string): Promise<Agent> => ctx.agentLoop.create(SessionId(id), { provider: 'mock', model: 'weak' })
   // A "restart" re-materializes the persisted root through the same durable

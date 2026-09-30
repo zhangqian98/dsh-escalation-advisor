@@ -64,8 +64,27 @@ dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.29.tgz
 - `0.1.2-rc.1`
 - `0.1.5-alpha.2`
 - `0.1.5-rc.1`
+- `0.2.0-rc.2`
 
-开发依赖完整锁定在 `0.1.5-alpha.2`，CI 使用 Node.js `22.19` 和 `24`。本机安装运行时测试还会把所有 DSH import 指向指定的真实安装版本，验证会话、工具、子 Agent 和 Remote 契约。
+CI 的 `scripts/install-test-runtime.mjs` 会固定并逐一核对 DSH sibling 版本，防止旧版 prerelease 的依赖范围自动漂移。开发依赖完整锁定在 `0.2.0-rc.2`，CI 使用 Node.js `22.19` 和 `24`。本机安装运行时测试还会把所有 DSH import 指向指定的真实安装版本，验证会话、工具、子 Agent 和 Remote 契约。
+
+### DSH 0.2.0-rc.2 接口与历史限制
+
+已适配实时 Config 表单（`configForms`）、producer-owned 消息来源、Remote codec 的延迟 `create()`、扁平工具结果，以及新版模型选择器；旧版接口路径保留。设置仍绑定 `escalation-advisor` profile entry。V4 新会话使用脚本模型验证，不代表已验证真实提供商登录、模型质量或完整生产 Web 部署。
+
+重新打开 V4 Advisor 历史前，先停止 DSH、备份 profile 和 sessions，再对精确 `0.2.0-rc.2` 安装运行以下维护命令。独立持久化 worker 看不到插件进程内的事件注册。此版本补丁只修复当前 V4 worker 校验，校验原始/已修复文件哈希、验证四种 Advisor payload，保持历史字节不变；不会开放旧 Advisor 历史迁移。重新安装 DSH 后须重新应用。
+
+```bash
+node scripts/patch-dsh-history.mjs /absolute/path/to/@deepseek-ai/dsh/package.json /absolute/path/to/new-backup-directory
+```
+
+不要用 `0.2.0-rc.2` 打开包含 Advisor 记录的 V0–V3 历史。上游冻结迁移清单会拒绝这些必需扩展事件；绕过校验可能破坏旧咨询记录的跨会话序号引用。请保留备份并用原兼容运行时打开这些历史。不含 Advisor 事件的普通历史仍遵循 DSH 自身的迁移行为。
+
+Linux 运行已安装版本测试：
+
+```bash
+DSH_RUNTIME_PACKAGE_JSON=/absolute/path/to/@deepseek-ai/dsh/package.json npx vitest run --config vitest.runtime.config.ts
+```
 
 ### DSH 0.1.5-rc.1 的旧会话迁移
 
@@ -75,7 +94,7 @@ dsh plugin --profile web add ./dsh-escalation-advisor-0.1.0-alpha.29.tgz
 node scripts/patch-dsh-history.mjs /absolute/path/to/@deepseek-ai/dsh/package.json /absolute/path/to/new-backup-directory
 ```
 
-脚本只支持精确的 DSH `0.1.5-rc.1`，会校验原文件哈希并备份两个 DSH 核心文件，只加入以下四种事件：
+对精确的 DSH `0.1.5-rc.1`，脚本会校验原文件哈希并备份两个 DSH 核心文件，只加入以下四种事件：
 
 - `advisor/policy`
 - `advisor/model`

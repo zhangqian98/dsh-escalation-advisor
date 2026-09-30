@@ -30,7 +30,8 @@ window.__ModuleLoader__.load({
     ]
     const SAFE_DEFAULTS = ['read', 'read_image', 'glob', 'grep']
     // Same strict string envelope as the Host's src/remote.ts contract.
-    const stringCodec = { mode: 'strict', typeSymbol: 'string', schema: { parse(value) { if (typeof value !== 'string') throw new TypeError('Expected string'); return value } } }
+    const stringSchema = { parse(value) { if (typeof value !== 'string') throw new TypeError('Expected string'); return value } }
+    const stringCodec = { mode: 'strict', typeSymbol: 'string', schema: stringSchema, create: () => stringSchema }
     const advisorRemote = { package: 'dsh-escalation-advisor', descriptors: [
       { method: 'snapshot', args: ['sessionId'] }, { method: 'mutate', args: ['sessionId', 'action', 'tool', 'value'] },
       { method: 'selectModel', args: ['sessionId', 'selection'] },
@@ -42,7 +43,7 @@ window.__ModuleLoader__.load({
     function uniqueTools(items) { return [...new Set((items ?? []).map(x => String(x).trim()).filter(Boolean))] }
     function validTimeout(value) { return Number.isSafeInteger(value) && value >= 1000 && value <= 3600000 }
 
-    function isAdvisorMessage(data) { return data?.source?.kind === 'plugin' && data.source.plugin === 'dsh-escalation-advisor' }
+    function isAdvisorMessage(data) { return data?.source?.kind === 'plugin:dsh-escalation-advisor' || (data?.source?.kind === 'plugin' && data.source.plugin === 'dsh-escalation-advisor') }
 
     // The same row key the Host computes (`advisorRunKey`): the per-turn
     // collector identity when the record carries one, else a best-effort key
@@ -77,7 +78,7 @@ window.__ModuleLoader__.load({
           : event.type === 'advisor/run' && event.data.mode === 'manual' && event.data.status === 'delivered' && typeof event.data.responseText === 'string' ? { id: 'manual:' + runKeyOf(event.data), role: 'start' } : null,
         start: (_context, { event }) => ({ kind: 'steering', messageId: event.data.id, seq: event.seq, time: event.time,
           content: event.type === 'advisor/run' ? [{ type: 'text', text: manualAdviceText(event.data) }] : event.data.content,
-          source: event.type === 'advisor/run' ? { kind: 'plugin', plugin: 'dsh-escalation-advisor' } : event.data.source }),
+          source: event.type === 'advisor/run' ? { kind: 'plugin:dsh-escalation-advisor' } : event.data.source }),
         update: context => context.state,
         buildViewNode: context => context.state === undefined ? null : { key: context.key, id: context.id, target: 'chat', kind: 'steering', anchorSeq: context.state.seq, location: context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' }, visibility: 'visible', data: context.state },
       })
@@ -109,7 +110,7 @@ window.__ModuleLoader__.load({
       })
     }
 
-    function SettingsCard({ scope, remote, ctx }) {
+    function SettingsCard({ scope, remote, ctx, container = 'li' }) {
       const snapshot = React.useSyncExternalStore(React.useCallback(fn => scope.subscribe(fn), [scope]), React.useCallback(() => scope.getSnapshot(), [scope]))
       const [draft, setDraft] = React.useState(null)
       const [notice, setNotice] = React.useState('')
@@ -117,7 +118,7 @@ window.__ModuleLoader__.load({
       const [modelBusy, setModelBusy] = React.useState(false)
 
       const value = draft?.value ?? snapshot.value
-      if (!value) return h('li', { style: css.card }, '正在读取 Escalation Advisor 设置…')
+      if (!value) return h(container, { style: css.card }, '正在读取 Escalation Advisor 设置…')
       const edit = (field, next) => { setNotice(''); setDraft(previous => ({ revision: previous?.revision ?? snapshot.revision, value: { ...(previous?.value ?? snapshot.value), [field]: next } })) }
       const selectedModel = { provider: value.provider, model: value.model, ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort } : {}) }
       const selectDefaultModel = selected => { setNotice(''); setDraft(previous => ({ revision: previous?.revision ?? snapshot.revision, value: { ...(previous?.value ?? snapshot.value), ...selected, reasoningEffort: selected.reasoningEffort || '' } })) }
@@ -141,13 +142,14 @@ window.__ModuleLoader__.load({
             const validation = await remote.advisor.validateModel(JSON.stringify(selectedModel))
             if (!validation.ok) throw new Error(validation.error.message)
           }
-          await scope.mutate(Object.entries(desired).map(([field, entry]) => ({ op: 'set', path: [field], value: entry })), draft.revision)
+          const accepted = await scope.mutate(Object.entries(desired).map(([field, entry]) => ({ op: 'set', path: [field], value: entry })), draft.revision)
+          if (accepted === false) throw new Error('设置未被接受，请重新读取后重试。')
           setDraft(null); setNotice('已保存全局默认。会话中显式设置的模型和工具继续使用各自的覆盖值。')
         } catch (error) { setNotice('保存失败：' + (error instanceof Error ? error.message : String(error))) }
         finally { setSaving(false) }
       }
 
-      return h('li', { style: css.card, 'data-escalation-advisor-settings': true },
+      return h(container, { style: css.card, 'data-escalation-advisor-settings': true },
         h('h3', { style: { margin: '2px 0 8px' } }, 'DSH Escalation Advisor'),
         h('p', { style: { margin: '6px 0', lineHeight: 1.6 } }, 'Advisor 以可查看的 DSH 子会话运行。这里配置模型、覆盖范围、全局默认工具开关和等待策略。'),
         h('p', { style: css.hint }, '工具权限是“默认开/默认关”。当前 root 会话可在标题栏 Advisor 面板逐个覆盖；本地 subagent 只能在 root 允许范围与自身实际可见工具的交集中使用 Advisor 工具。'),
@@ -225,15 +227,24 @@ window.__ModuleLoader__.load({
       const cached = modelCatalogs.get(ctx.remote)
       if (cached) return cached
       const store = createSnapshotStore({ value: null, status: 'idle', error: null })
+      // Native directories retain effort labels when a model leaves the catalog.
+      const reasoning = new Map()
       let inflight, disposed = false
-      const catalog = { store, load() {
+      const catalog = { store, reasoningFor(selection) {
+        return reasoning.get(JSON.stringify([selection.provider, selection.model]))
+      }, load() {
         const current = store.getSnapshot()
         if (current.status === 'ready') return Promise.resolve(current.value)
         if (inflight) return inflight
         store.update(state => { state.status = 'loading'; state.error = null })
         inflight = ctx.remote.session.modelCatalog().then(result => {
           if (!result.ok) throw new Error(result.error.message)
-          if (!disposed) store.set({ value: result.value, status: 'ready', error: null })
+          if (!disposed) {
+            for (const group of result.value.groups) for (const model of group.models) {
+              reasoning.set(JSON.stringify([group.id, model.id]), model.reasoning)
+            }
+            store.set({ value: result.value, status: 'ready', error: null })
+          }
           return result.value
         }).catch(error => {
           if (!disposed) store.update(state => { state.status = 'error'; state.error = error.message })
@@ -288,7 +299,7 @@ window.__ModuleLoader__.load({
               return { ok: false, error: { code: 'advisor/model-selection', message: error instanceof Error ? error.message : String(error) } }
             } finally { if (live) callbacks.current.onBusy(false) }
           },
-        }, sessionId, () => live, nativeModelCatalog(ctx, createSnapshotStore), projected)
+        }, sessionId, () => live, nativeModelCatalog(ctx, createSnapshotStore), projected, () => false)
         setController({ directory, projected })
         directory.load().catch(() => {})
         return () => { live = false; directory.dispose() }
@@ -301,7 +312,8 @@ window.__ModuleLoader__.load({
         h(native.component, {
           locked: disabled, available: true, directory: controller.directory.store,
           load: () => { controller.directory.load().catch(() => {}) },
-          select: next => controller.directory.select(next).then(() => true, () => false),
+          // DSH 0.2 returns RemoteResult; 0.1 resolves void or rejects.
+          select: next => controller.directory.select(next).then(result => result ?? true, () => false),
           t: ctx.locale.bind(native.locale || 'model'),
         }))
     }
@@ -533,14 +545,25 @@ window.__ModuleLoader__.load({
 
     return {
       name: 'dsh-escalation-advisor-client',
-      inject: ['slots', 'settingsScope', 'remote', 'remote.session', 'remote.llm', 'remote.commands', 'commandUi', 'sessions', 'locale', 'uiConversation'],
+      inject: ['slots', 'remote', 'remote.session', 'remote.llm', 'remote.commands', 'commandUi', 'sessions', 'locale', 'uiConversation'],
       async apply(ctx) {
         const unmountRemote = await ctx.remote.$mount(advisorRemote)
         ctx.effect(() => unmountRemote, 'advisor: Remote endpoints')
-        const scope = ctx.settingsScope.bind({ namespace: 'escalation-advisor' })
         ctx.inject(['remote.advisor'], advisorCtx => {
-          advisorCtx.slots.inject('settings.plugin.item', () => advisorCtx.slots.register({ name: 'settings.plugin.item', key: 'escalation-advisor' }, () => h(SettingsCard, { scope, remote: advisorCtx.remote, ctx: advisorCtx })))
           advisorCtx.slots.inject('conversation.session.header.actions', () => advisorCtx.slots.register({ name: 'conversation.session.header.actions', id: 'advisor-permissions', order: 35 }, props => h(AdvisorSessionAction, { ...props, ctx: advisorCtx })))
+        })
+        ctx.inject(['settingsScope', 'remote.advisor'], advisorCtx => {
+          const scope = advisorCtx.settingsScope.bind({ namespace: 'escalation-advisor' })
+          advisorCtx.slots.inject('settings.plugin.item', () => advisorCtx.slots.register({ name: 'settings.plugin.item', key: 'escalation-advisor' }, () => h(SettingsCard, { scope, remote: advisorCtx.remote, ctx: advisorCtx })))
+        })
+        ctx.inject(['configForms', 'remote.advisor'], advisorCtx => {
+          // This is the Host entry id in cordis.patch.yml, not the npm package name.
+          const scope = advisorCtx.configForms.get('escalation-advisor')
+          advisorCtx.effect(() => advisorCtx.configForms.whileServed(['escalation-advisor'], () => advisorCtx.slots.inject('plugins.item', () => advisorCtx.slots.register({
+            name: 'plugins.item', id: 'escalation-advisor', order: 35, label: 'DSH Escalation Advisor',
+          }, props => props.view === 'summary'
+            ? '配置顾问模型、覆盖范围、工具权限和咨询预算。'
+            : h(SettingsCard, { scope, remote: advisorCtx.remote, ctx: advisorCtx, container: 'div' })))), 'advisor: configuration page')
         })
         installWaitPickers(ctx)
         installChatMessages(ctx)

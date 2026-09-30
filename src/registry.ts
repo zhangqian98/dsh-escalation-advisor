@@ -39,7 +39,7 @@ export class AdvisorRegistry {
 
   constructor(private readonly ctx: Context) {
     for (const agent of ctx.agents.list()) this.attach(agent)
-    ctx.on('agent/created', ({ agent }) => this.attach(agent))
+    ctx.on('agent/created', ({ agent }) => { this.attach(agent); return undefined })
     ctx.on('agent/disposed', ({ agent }) => {
       const id = String(agent.id)
       if (this.identities.get(id) !== undefined) this.identities.delete(id)

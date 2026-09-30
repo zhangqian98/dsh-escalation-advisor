@@ -1,3 +1,4 @@
+import { isAdvisorSource } from './runtime-compat.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { Remote, TypertRemoteService, type InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol'
@@ -17,7 +18,7 @@ import { textContent } from './context.js'
 declare module '@deepseek-ai/cordis' { interface Context { advisor: AdvisorRemoteService } }
 
 /** A small strict string envelope avoids depending on the application's generated types. */
-const stringCodec = { mode: 'strict' as const, typeSymbol: 'string', schema: { parse(value: unknown): string {
+const stringCodec = { mode: 'strict' as const, typeSymbol: 'string', create: () => stringCodec.schema, schema: { parse(value: unknown): string {
   if (typeof value !== 'string') throw new TypeError('Expected string')
   return value
 } } }
@@ -141,7 +142,7 @@ export class AdvisorRemoteService extends TypertRemoteService {
         : ''
       for (let index = events.length - 1; index >= 0; index--) {
         const event = events[index]!
-        if (event.type !== 'user/message' || event.data.source.kind !== 'plugin' || event.data.source.plugin !== 'dsh-escalation-advisor') continue
+        if (event.type !== 'user/message' || !isAdvisorSource(event.data.source)) continue
         const text = textContent(event.data.content)
         const child = text.match(/\[Strong advisor — (?:manual|escalation|continuous|completion); severity=(?:none|nit|concern|blocker); child=([^\]\n]+)\]/)?.[1]
         if (child !== run.childSessionId) continue

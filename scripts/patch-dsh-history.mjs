@@ -3,9 +3,17 @@ import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { resolve, dirname, relative, isAbsolute } from 'node:path'
 
-// A narrowly versioned maintenance patch for the released migration inventory.
-// These records contain no core Session sequence references; their data survives
-// adjacent format migrations verbatim. Other unknown historical types still fail.
+// Narrow, opt-in compatibility for two exact released bundles, not a general
+// Session migration. The 0.1.5-rc.1 V0→V1 migration keeps event coordinates.
+// advisor/run.taskAnchor is a ROOT-session user-message sequence, and
+// taskRevision embeds historical root/requester coordinates. V1→V4 can remove
+// or insert events; copying these fields verbatim across that chain is unsafe.
+// 0.2.0-rc.2 therefore patches ONLY current-V4 worker verification. Its released
+// historical inventories stay untouched: required Advisor V0–V3 records refuse.
+export const HISTORY_PATCH_SUPPORT = Object.freeze({
+  '0.1.5-rc.1': 'released V0→V1 inventory and persistence worker',
+  '0.2.0-rc.2': 'current V4 persistence worker only; Advisor V0–V3 migration is unsupported',
+})
 export const ADVISOR_HISTORY_FIELDS = {
   'advisor/policy': { required: [], optional: ['version', 'mode', 'timeoutMs', 'inheritDefaultTools', 'allowTools', 'denyTools', 'escalationWait', 'continuousWait', 'completionWait', 'triggers', 'coverage', 'defaultProfileId', 'allowedProfileIds', 'toolPreset', 'tools'] },
   'advisor/model': { required: ['version', 'selection'], optional: ['defaultProfileId', 'allowedProfileIds'] },
@@ -86,12 +94,13 @@ export function assertAdvisorHistoryPayload(event, fields = ADVISOR_HISTORY_FIEL
 }
 
 const marker = '// dsh-escalation-advisor: explicit 0.1.5-rc.1 history compatibility'
+const currentWorkerMarker = '// dsh-escalation-advisor: exact 0.2.0-rc.2 current-V4 worker compatibility'
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
+const replaceOnce = (text, from, to) => {
+  if (text.split(from).length !== 2) throw new Error('Unexpected DSH migration implementation; refusing to patch')
+  return text.replace(from, to)
+}
 export function patchHistoryBundle(source, worker = false) {
-  const replaceOnce = (text, from, to) => {
-    if (text.split(from).length !== 2) throw new Error('Unexpected DSH migration implementation; refusing to patch')
-    return text.replace(from, to)
-  }
   if (source.includes(marker)) return source
   const inventory = 'const RELEASED_V0_EVENT_DISPOSITIONS = Object.freeze({'
   const validator = assertAdvisorHistoryPayload.toString()
@@ -101,14 +110,29 @@ export function patchHistoryBundle(source, worker = false) {
   return patched
 }
 
+// Do not add these names to any released V0–V3 migration disposition. The
+// worker has its own bundled registry, isolated from the mounted plugin. It
+// needs the four current types plus payload validation, without rewriting data.
+export function patchCurrentV4WorkerBundle(source) {
+  if (source.includes(currentWorkerMarker)) return source
+  let patched = replaceOnce(source, 'function validateStoredEvents(meta, events, location) {',
+    currentWorkerMarker + '\nconst ADVISOR_HISTORY_FIELDS = ' + JSON.stringify(ADVISOR_HISTORY_FIELDS) + ';\n' + assertAdvisorHistoryPayload.toString().replace(/\r\n/g, '\n') + '\n' +
+    'function validateStoredEvents(meta, events, location) {\nfor (const event of events) if (Object.hasOwn(ADVISOR_HISTORY_FIELDS, event.type)) assertAdvisorHistoryPayload(event);')
+  patched = replaceOnce(patched, 'const request = parseRequest(node_worker_threads.workerData);',
+    'const request = parseRequest(node_worker_threads.workerData);\nfor (const type of Object.keys(ADVISOR_HISTORY_FIELDS)) KNOWN_SESSION_EVENT_TYPES.add(type);')
+  return patched
+}
+
 export async function patchDshHistory(dshPackagePath, backupDirectory) {
   const packagePath = await realpath(resolve(dshPackagePath))
   const manifest = JSON.parse(await readFile(packagePath, 'utf8'))
-  if (manifest.name !== '@deepseek-ai/dsh' || manifest.version !== '0.1.5-rc.1') throw new Error('This compatibility patch supports exactly DSH 0.1.5-rc.1')
+  if (manifest.name !== '@deepseek-ai/dsh' || !Object.hasOwn(HISTORY_PATCH_SUPPORT, manifest.version)) throw new Error('This compatibility patch supports exactly DSH 0.1.5-rc.1 or 0.2.0-rc.2')
   const runtime = createRequire(packagePath)
-  const targets = [
+  const targets = manifest.version === '0.1.5-rc.1' ? [
     { package: '@deepseek-ai/dsh-session-format-v0-to-v1', file: 'lib/index.js', expected: '15ae26b90310d83b1b90a5e7cad9e2f34282fddaba2f19f2fd2232382065603d', worker: false, backup: 'format-v0.index.js' },
     { package: '@deepseek-ai/dsh-session-persistence-jsonl', file: 'lib/worker.cjs', expected: 'b067a35a421d5a5313b1e197a00bcc829d8d6921d2829503d4604c13e226fd64', worker: true, backup: 'persistence.worker.cjs' },
+  ] : [
+    { package: '@deepseek-ai/dsh-session-persistence-jsonl', file: 'lib/worker.cjs', expected: 'cadd901598e2bb8a847409a980f59deea639eeadf21e30da324fb674a4ed8038', patchedChecksum: '2a0c0f1fcc56481df5d402f27cdad3da313807f74d952521b03e40040e46b9cd', backup: 'persistence.worker.cjs', currentV4: true },
   ]
   const changes = []
   for (const target of targets) {
@@ -117,8 +141,13 @@ export async function patchDshHistory(dshPackagePath, backupDirectory) {
     const rel = relative(owner, path)
     if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('Patch target leaves its package')
     const bytes = await readFile(path), source = bytes.toString('utf8')
-    const patched = patchHistoryBundle(source, target.worker)
-    if (patched === source) { changes.push({ path, alreadyPatched: true, after: hash(bytes) }); continue }
+    // Current-worker idempotence is byte-verified, not granted by a marker that
+    // a partial patch or local edit could retain. All targets are checked before
+    // backups or writes; a mismatch must leave the installation untouched.
+    if (target.currentV4 && hash(bytes) !== target.expected && hash(bytes) !== target.patchedChecksum) throw new Error('Unexpected package checksum; refusing to overwrite local edits: ' + path)
+    const patched = target.currentV4 ? patchCurrentV4WorkerBundle(source) : patchHistoryBundle(source, target.worker)
+    if (target.currentV4 && hash(patched) !== target.patchedChecksum) throw new Error('Unexpected compatibility patch output; refusing to overwrite: ' + path)
+    if (patched === source) { changes.push({ ...target, path, alreadyPatched: true, after: hash(bytes) }); continue }
     if (hash(bytes) !== target.expected) throw new Error('Unexpected package checksum; refusing to overwrite local edits: ' + path)
     changes.push({ ...target, path, bytes, patched })
   }
@@ -131,7 +160,7 @@ export async function patchDshHistory(dshPackagePath, backupDirectory) {
     for (const change of applied) await writeFile(change.path, change.bytes)
     throw error
   }
-  const result = changes.map(change => ({ path: change.path, alreadyPatched: !!change.alreadyPatched, before: change.expected, after: change.alreadyPatched ? change.after : hash(change.patched) }))
+  const result = changes.map(change => ({ support: HISTORY_PATCH_SUPPORT[manifest.version], path: change.path, alreadyPatched: !!change.alreadyPatched, before: change.expected, after: change.alreadyPatched ? change.after : hash(change.patched) }))
   await writeFile(resolve(backupDirectory, 'patch-manifest.json'), JSON.stringify(result, null, 2))
   return result
 }

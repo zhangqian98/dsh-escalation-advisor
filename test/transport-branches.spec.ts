@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { advisorRunHistory } from '../src/telemetry.js'
-import { advisorScript, advisorVerdictResponse, createIntegrationHarness, deferred, textResponse, toolCallResponse, waitUntil, type IntegrationHarness } from './harness.js'
+import { advisorScript, advisorVerdictResponse, createIntegrationHarness, deferred, textResponse, toolCallResponse, toolResultRecords, waitUntil, type IntegrationHarness } from './harness.js'
 
 /**
  * The continuable transport's failure branches, each measured against the real
@@ -21,9 +21,8 @@ async function harness(...args: Parameters<typeof createIntegrationHarness>) { c
  * that carries the follow-up hint, so the JSON is the first line.
  */
 function toolResultText(h: IntegrationHarness, index = 1): string {
-  return h.adapter.forModel('weak')[index]!.request.messages
-    .flatMap(message => message.content)
-    .flatMap(block => block.type === 'tool-result' ? block.content.flatMap(inner => inner.type === 'text' ? [inner.text] : []) : [])
+  return toolResultRecords(h.adapter.forModel('weak')[index]!.request.messages)
+    .map(result => result.text)
     .join('')
 }
 

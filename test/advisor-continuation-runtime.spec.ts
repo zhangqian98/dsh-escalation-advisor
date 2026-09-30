@@ -86,6 +86,7 @@ import {
   createDeployedRuntimeHarness,
   textResponse,
   toolCallResponse,
+  toolResultRecords,
   type DeployedRuntimeHarness,
   type GenerateOptions,
   type ScriptEntry,
@@ -175,13 +176,10 @@ interface ToolResultRecord {
 }
 
 const toolResults = (events: readonly PersistedEvent[]): ToolResultRecord[] =>
-  events.filter(event => event.type === 'tool/result').map(event => {
-    const data = event.data as { message?: { content?: readonly unknown[] }; error?: unknown }
-    const block = (data.message?.content ?? [])[0] as { toolCallId?: string; content?: readonly unknown[]; isError?: boolean } | undefined
-    const text = (block?.content ?? [])
-      .flatMap(inner => (inner as { type?: string; text?: string }).type === 'text' ? [String((inner as { text?: string }).text ?? '')] : [])
-      .join('\n')
-    return { toolCallId: String(block?.toolCallId ?? ''), text, isError: data.error !== undefined || block?.isError === true }
+  events.filter(event => event.type === 'tool/result').flatMap(event => {
+    const data = event.data as { message?: unknown; error?: unknown }
+    return toolResultRecords(data.message === undefined ? [] : [data.message])
+      .map(result => ({ ...result, isError: data.error !== undefined || result.isError }))
   })
 
 const toolCallNames = (events: readonly PersistedEvent[]): { id: string; name: string }[] =>

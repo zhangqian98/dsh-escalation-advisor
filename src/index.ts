@@ -1,3 +1,4 @@
+import { advisorConfigReader, advisorMessageSource, modernRuntime, onAdvisorConfigChange, type PluginConfigInput } from './runtime-compat.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
@@ -8,7 +9,7 @@ import { defineTool, type ToolExecutionResult, type ToolRunContext } from '@deep
 import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { Config as ConfigSchema, routeConfigured, severityRank, type Config as AdvisorConfig } from './config.js'
+import { routeConfigured, severityRank, type Config as AdvisorConfig } from './config.js'
 import { coverageEnabled, subagentInScope, type AdvisorAgentRole } from './coverage.js'
 import { buildCasePacket, hasNewMaterialConclusion, narrowCoveredByVerdict, textContent } from './context.js'
 import { advisorToolSurface, callAdvisor, AdvisorUnavailableError, requesterSeq, START_REJECTED, type AdvisorRunResult, type AdvisorContinuation } from './model-runner.js'
@@ -30,9 +31,9 @@ import { advisorModelConfig, sessionProfileSelection } from './model-selection.j
 import { effectiveAllowedProfiles, intersectToolCeiling, parseAdvisorProfiles, parseProfileRoutes, profileTools, resolveProfileForNewConsultation, type AdvisorProfile } from './profiles.js'
 
 export const name = 'dsh-escalation-advisor'
-export const inject = ['tools', 'settings', 'systemPrompt', 'agents']
-export { ConfigSchema as Config }
-export type PluginConfig = AdvisorConfig
+export const inject = modernRuntime ? ['tools', 'systemPrompt', 'agents'] : ['tools', 'settings', 'systemPrompt', 'agents']
+export { PluginConfigSchema as Config } from './runtime-compat.js'
+export type PluginConfig = PluginConfigInput
 export const SETTINGS_NAMESPACE = 'escalation-advisor'
 export const ADVISOR_TOOL_NAME = 'consult_advisor'
 const INTERNAL_TOOLS = new Set(['structured_output', 'run_code', ADVISOR_VERDICT_TOOL])
@@ -79,7 +80,7 @@ function adviceMessage(verdict: AdvisorVerdict, origin: ConsultationMode, child:
   const follow = consultationId === undefined ? '' : '\n\nConsultation id: ' + consultationId + '\n要用同一段 Advisor 对话的上下文继续同一轮审查，以 consultation_id="' + consultationId + '" 再次调用 consult_advisor。'
   return createUserMessage({
     content: [{ type: 'text', text: '[Strong advisor —— ' + origin + '；severity=' + verdict.severity + '；child=' + child + ']\n' + verdict.summary + '\n\n' + verdict.diagnosis + '\n' + actions + blocker + '\n引用证据：\n' + (evidence || '未报告') + '\n验证计划：\n' + (validation || '未报告') + '\nAdvisor 的修改：\n' + (changes || '无') + follow + '\n\n请对照仓库证据和验证结果核查这份独立审阅。' }],
-    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor · ' + verdict.summary },
+    source: advisorMessageSource('Advisor · ' + verdict.summary),
   })
 }
 
@@ -103,7 +104,7 @@ function obligationMessage(detail: readonly Obligation[], unchanged: readonly Ob
     : '\n\n这只是提醒，不是阻断。对失败原因的解释不是验证见证，不能关闭验证项。'
   return createUserMessage({
     content: [{ type: 'text', text: '[Advisor 验证项 - 未完成验证。分数重置、冷却或咨询预算都不会清除它们。]\n' + lines.concat(brief).join('\n') + tail }],
-    source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Advisor - ' + (detail.length + unchanged.length) + ' 个未完成验证项' }
+    source: advisorMessageSource('Advisor - ' + (detail.length + unchanged.length) + ' 个未完成验证项')
   })
 }
 
@@ -130,12 +131,11 @@ function toolAnswer(answer: AdvisorRunResult, consultationId: string, snapshot?:
     disposition: verdict.disposition ?? 'review', evidence_used: verdict.evidenceUsed ?? [], assumptions: verdict.assumptions ?? [], recommended_next_action: verdict.recommendedNextAction ?? '', validation_plan: verdict.validationPlan ?? [], needs_more_evidence: verdict.needsMoreEvidence ?? false, changes_made: verdict.changesMade ?? [] }
 }
 
-export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<void> {
+export async function apply(ctx: Context, entryConfig: PluginConfigInput): Promise<void> {
   installAdvisorEventCompatibility(ctx)
   const verdicts = new AdvisorVerdictCollector()
   const logger = ctx.logger(name)
-  const settings = ctx.settings.register(SETTINGS_NAMESPACE, ConfigSchema, { base: entryConfig })
-  const currentConfig = (): AdvisorConfig => settings.get()
+  const currentConfig = advisorConfigReader(ctx, entryConfig)
   const configFor = (agent: Agent): AdvisorConfig => {
     const root = taskRootAgent(ctx, agent).session
     const config = advisorModelConfig(currentConfig(), root)
@@ -360,7 +360,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   ctx.on('agent/inbox/claimed', ({ agent, message }) => {
     if (registry.identity(agent)) return
     const key = String(agent.id)
-    if (message.source.kind === 'goal') goalRoundActive.add(key)
+    if (String(message.source.kind) === 'goal') goalRoundActive.add(key)
     else if (message.source.kind === 'user') goalRoundActive.delete(key)
   })
 
@@ -883,8 +883,9 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
   ctx.on('agent/created', ({ agent }) => {
     refreshTool(agent)
     if (agent.session.header.parentSession === undefined) restoreConsultations(agent)
+    return undefined
   })
-  ctx.on('settings/updated', namespace => { if (namespace === SETTINGS_NAMESPACE) { suppressed.clear(); retryableStarts.clear(); for (const agent of ctx.agents.list()) refreshTool(agent) } })
+  onAdvisorConfigChange(ctx, () => { suppressed.clear(); retryableStarts.clear(); for (const agent of ctx.agents.list()) refreshTool(agent) })
   ctx.on('agent/inbox/inserted', ({ agent, message }) => {
     if (registry.identity(agent)) return
     const key = String(agent.id)
@@ -893,7 +894,7 @@ export async function apply(ctx: Context, entryConfig: AdvisorConfig): Promise<v
     // the per-task reminder budget all stay with the task. It also has no human
     // turn to restate the open items, so injection alone is re-armed, once per
     // round, for the task the goal is running inside.
-    if (message.source.kind === 'goal') {
+    if (String(message.source.kind) === 'goal') {
       obligations.rearmInjection(key, taskStarts.get(key) ?? 0)
       return
     }

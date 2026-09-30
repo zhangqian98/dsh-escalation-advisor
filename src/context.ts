@@ -93,8 +93,8 @@ function toolResult(event: EventRecord): { callId?: string; text: string; failed
     : typeof outer?.toolCallId === 'string' ? outer.toolCallId : undefined
   return {
     ...(callId === undefined ? {} : { callId }),
-    text: blockTexts(outer?.content).join('\n'),
-    failed: data?.error !== undefined || outer?.isError === true,
+    text: blockTexts(outer?.type === 'tool-result' ? outer.content : message?.content).join('\n'),
+    failed: data?.error !== undefined || message?.isError === true || outer?.isError === true,
   }
 }
 
@@ -506,10 +506,11 @@ export function buildCasePacket(input: BuildCasePacketInput): CasePacketResult {
   const recentTail = delta.flatMap(event => {
     const seq = eventSeq(event)
     if (event.type === 'user/message') {
-      const plugin = record(messageOf(event)?.source)?.plugin
+      const source = record(messageOf(event)?.source)
+      const plugin = source?.plugin
       // The child assembles its own runtime context. Copying the requester's
       // snapshot would misstate its permissions and advertise recursive advice.
-      if (plugin === 'dsh-escalation-advisor' || plugin === '@deepseek-ai/dsh-system-prompt') return []
+      if (plugin === 'dsh-escalation-advisor' || plugin === '@deepseek-ai/dsh-system-prompt' || source?.kind === 'plugin:dsh-escalation-advisor' || source?.kind === 'runtime-context' || source?.kind === 'system-prompt') return []
       const text = messageText(event)
       return text ? [{ role: 'user', summary: boundedText(text, 1800), seq }] : []
     }

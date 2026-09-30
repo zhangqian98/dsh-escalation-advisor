@@ -7,7 +7,7 @@ const added = new Set<string>()
 let owners = 0
 
 /**
- * Compatibility bridge for the two pinned DSH builds. Their Session.append
+ * Compatibility bridge for the pinned DSH builds. Their Session.append
  * cannot write the external-event `ignorable` envelope marker. Policy and
  * identity must remain required anyway: dropping them could widen authority.
  * Extend only the owned vocabulary while the plugin can interpret it, and

@@ -794,7 +794,7 @@ describe('P1: masked exits, stale tasks, recurrence, and worker mirrors', () => 
       const child = await h.spawnWorker()
       const result = await child.result
       await child.dispose()
-      return result.output
+      return [...result.output]
     } }))
     await h.runRoot('Verify, then let the worker change a file')
     // Resolved by the passing re-run, then reopened by the worker edit that

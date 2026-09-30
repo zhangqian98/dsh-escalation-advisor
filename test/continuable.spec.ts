@@ -473,6 +473,9 @@ describe('continuable subagent children: cancellation', () => {
     expect(await claimedTurn(trace, id, acceptedId)).toBe(turn)
     expect(requestText(h.adapter.forModel('worker')[1]!.request)).toContain('STILL DELIVERED')
     expect(requestText(h.adapter.forModel('worker')[1]!.request)).not.toContain('NEVER DELIVERED')
+    // The assertion intentionally observes the earlier turn/end boundary;
+    // teardown must wait for the separate activation-settlement boundary.
+    await waitUntil(() => trace.position('subagent/end', { id }) >= 0, 3000)
   }, TIMEOUT)
 
   it('stops a running turn through interrupt, and rejects a foreign authority', async () => {
@@ -494,6 +497,10 @@ describe('continuable subagent children: cancellation', () => {
     expect(() => h.interruptChild(id, { kind: 'ancestor', agent: h.root })).not.toThrow()
     const closed = await waitForTurnEnd(child, turn)
     release.resolve()
+    // turn/end precedes activation teardown. Keep the session projections
+    // alive until the runtime publishes settlement, rather than racing the
+    // fixture's root-context disposal against its async settlement watcher.
+    await waitUntil(() => trace.position('subagent/end', { id }) >= 0, 3000)
 
     console.log('--- interrupt ---')
     console.log(trace.of(id).map(({ order, name, detail }) => `${order} ${name} ${JSON.stringify(detail)}`).join('\n'))
